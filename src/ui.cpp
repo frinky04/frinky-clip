@@ -407,7 +407,18 @@ int run_ui() {
             // of the oldest footage does not move every tile.
             if (!runs.empty()) {
                 float thumb_h = video_h - 2 * dpi, thumb_w = std::floor(thumb_h * 16 / 9);
-                std::int64_t tile_ms = std::max<std::int64_t>(500, (std::int64_t)(thumb_w / px_per_ms));
+                // The tile grid comes from the target zoom on a nested ladder
+                // of spacings, so it is fixed for the whole glide and levels
+                // share tile times: zooming in inserts tiles between existing
+                // ones, zooming out drops every other one, and nothing shifts.
+                // Within a level a tile's picture fills its time interval,
+                // scaling with the displayed zoom and cropping the excess.
+                double target_px_per_ms = track_w / (target_seconds * 1000);
+                std::int64_t tile_ms = 500; double closest = 1e9;
+                for (std::int64_t candidate = 500; candidate <= 3600000; candidate *= 2) {
+                    double misfit = std::abs(std::log(candidate * target_px_per_ms / thumb_w));
+                    if (misfit < closest) { closest = misfit; tile_ms = candidate; }
+                }
                 draw->PushClipRect(ImVec2(track_x, video_y), ImVec2(track_x + track_w, video_y + video_h), true);
                 for (auto& run : runs) {
                     if (run.second < view_start_ms || run.first > view_end_ms) continue;
@@ -415,18 +426,24 @@ int run_ui() {
                     // picture drawn in this run, so nothing blanks while the
                     // worker catches up.
                     Thumbnails::Picture carry{};
-                    auto tile = [&](std::int64_t at) {
-                        auto* s = span_at(at); if (!s) return;
-                        auto picture = thumbs.keyframe(s->path, at - s->start_ms, (int)thumb_w);
+                    auto tile = [&](std::int64_t t0, std::int64_t t1) {
+                        auto* s = span_at(t0); if (!s) return;
+                        auto picture = thumbs.keyframe(s->path, t0 - s->start_ms, (int)thumb_w);
                         if (picture.texture) carry = picture; else picture = carry;
                         if (!picture.texture) return;
-                        float x = x_of(at), x1 = std::min(x + thumb_w, x_of(run.second));
-                        float ph = std::min(thumb_h, thumb_w * picture.height / std::max(1, picture.width));
-                        draw->AddImage(picture.texture, ImVec2(x, video_y + 1 * dpi), ImVec2(x1, video_y + 1 * dpi + ph), ImVec2(0, 0), ImVec2((x1 - x) / thumb_w, 1));
+                        float x0 = x_of(t0), full_w = x_of(t1) - x0, x1 = std::min(x0 + full_w, x_of(run.second));
+                        if (full_w < 1 || x1 - x0 < 1) return;
+                        // Fill the interval at the picture's aspect, cropping the excess about the centre.
+                        float aspect = (float)picture.width / std::max(1, picture.height), natural_h = full_w / aspect;
+                        ImVec2 uv0(0, 0), uv1(1, 1);
+                        if (natural_h >= thumb_h) { float keep = thumb_h / natural_h; uv0.y = (1 - keep) / 2; uv1.y = 1 - uv0.y; }
+                        else { float keep = full_w / (thumb_h * aspect); uv0.x = (1 - keep) / 2; uv1.x = 1 - uv0.x; }
+                        uv1.x = uv0.x + (uv1.x - uv0.x) * (x1 - x0) / full_w; // Truncated at the run's end.
+                        draw->AddImage(picture.texture, ImVec2(x0, video_y + 1 * dpi), ImVec2(x1, video_y + 1 * dpi + thumb_h), uv0, uv1);
                     };
                     std::int64_t first = std::max(run.first, view_start_ms) / tile_ms * tile_ms;
-                    if (first < run.first) { tile(run.first); first += tile_ms; } // The run's leading partial tile.
-                    for (std::int64_t t = first; t < run.second && t <= view_end_ms; t += tile_ms) tile(t);
+                    if (first < run.first) { tile(run.first, first + tile_ms); first += tile_ms; } // The run's leading partial tile.
+                    for (std::int64_t t = first; t < run.second && t <= view_end_ms; t += tile_ms) tile(t, t + tile_ms);
                 }
                 draw->PopClipRect();
             }
