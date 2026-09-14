@@ -57,6 +57,7 @@ constexpr UINT PinMessage = WM_APP + 9;    // Recorder: protect footage in [wPar
 constexpr UINT ExportMessage = WM_APP + 10; // Recorder: export the clip described by export-request.json.
 constexpr UINT StatusMessage = WM_APP + 11; // Controls: status.json was just rewritten; read it now.
 constexpr UINT WakeMessage = WM_APP + 12;   // Recorder: an OBS callback fired; run the tick without waiting for the timer.
+constexpr UINT IndexMessage = WM_APP + 13;  // Controls: segments.json was just rewritten; read it now.
 void plain_write(const fs::path& path, const std::string& text); // Atomic rename without the disk flush, for transient files.
 void write_json_fast(const fs::path& path, obs_data_t* value);
 HWND recorder_window();

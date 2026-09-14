@@ -248,7 +248,8 @@ int run_ui() {
             if (!player.position() && map.last_end_ms) player.seek(std::max(map.spans.front().start_ms, map.last_end_ms - 1000));
         }
         player.set_end(map.last_end_ms);
-        if (visible && !scanning.valid() && now_ms() - last_scan > 2000) {
+        if (visible && !scanning.valid() && (app.index_changed || now_ms() - last_scan > 2000)) {
+            app.index_changed = false;
             last_scan = now_ms(); auto root = cfg.storage / "buffer";
             // The recorder's index is one small file; scanning sidecars is the
             // fallback when no recorder has published one for this folder.

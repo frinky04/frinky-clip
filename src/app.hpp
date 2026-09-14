@@ -37,6 +37,7 @@ public:
     void observe(const std::string& reported, bool busy, std::int64_t reported_ms, bool failed);
     bool start_requested = false;
     bool status_changed = false; // The recorder rewrote status.json since the last read.
+    bool index_changed = false;  // The recorder rewrote segments.json since the last read.
     std::string error;
 private:
     enum class Pending { None, Start, Stop };

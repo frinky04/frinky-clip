@@ -123,6 +123,7 @@ bool App::handle_message(UINT message, WPARAM w, LPARAM l) {
     if (message == QuitMessage || (message == WM_ENDSESSION && w)) { quit(); return true; }
     if (message == StartMessage) { if (!quitting_) start_requested = true; return true; }
     if (message == StatusMessage) { status_changed = true; return true; }
+    if (message == IndexMessage) { index_changed = true; return true; }
     if (message == taskbar_created_ && taskbar_created_) {
         if (!add_tray()) ShowWindow(window_, SW_SHOW);
         return true;
