@@ -194,6 +194,8 @@ int run_ui() {
     std::int64_t target_end_ms = now_ms(), in_ms = 0, out_ms = 0;
     double target_seconds = 240, shown_seconds = 240, shown_end_ms = (double)target_end_ms; bool animating = false;
     bool follow = true, open_settings = false, export_system = true, export_mic = false;
+    // Hover preview state persists across frames so it can fade and hold its last picture.
+    Thumbnails::Picture hover_picture{}; float hover_alpha = 0, hover_x = 0; std::int64_t hover_shown_ms = 0;
     enum class Drag { None, Press, Range, In, Out } drag = Drag::None; std::int64_t drag_anchor = 0, scrub_ms = 0; float press_x = 0; bool scrubbing = false;
     std::optional<Player> player_holder; player_holder.emplace(device, context); auto& player = *player_holder;
     const double frame_ms = 1000.0 / 60;
@@ -495,23 +497,38 @@ int run_ui() {
             if (hovered) { hover_lane = true; hover_ms = t_of(io.MousePos.x); }
             // Hover preview: the keyframe under the cursor, shown large above
             // the strip with its time, for scanning footage without seeking.
+            // The preview keeps its last picture and place until a new one is
+            // ready, fades in fast and out slow, and never drops out for a
+            // frame because a decode is still on the way.
             hover_video = hovered && io.MousePos.y >= video_y && io.MousePos.y <= video_y + video_h && drag == Drag::None && !scrubbing && !ImGui::IsAnyMouseDown();
             if (hover_video && !runs.empty()) {
                 if (auto* s = span_at(hover_ms)) {
                     float thumb_h = video_h - 2 * dpi; int decode_w = (int)(std::floor(thumb_h * 16 / 9) * 3 / 2);
                     auto picture = thumbs.keyframe(s->path, hover_ms - s->start_ms, decode_w, INT_MIN + 1);
-                    float x = io.MousePos.x; draw->AddLine(ImVec2(x, video_y), ImVec2(x, video_y + video_h), accent_u32, 1 * dpi);
-                    if (picture.texture) {
-                        float pw = (float)decode_w, ph = pw * picture.height / std::max(1, picture.width), pad = 4 * dpi, text_h = ImGui::GetTextLineHeight();
-                        float px = std::clamp(x - pw / 2, track_x, std::max(track_x, track_x + track_w - pw));
-                        float py = std::max(pad, origin.y - ph - text_h - pad * 3 - 6 * dpi);
-                        auto* fg = ImGui::GetForegroundDrawList();
-                        fg->AddRectFilled(ImVec2(px - pad, py - pad), ImVec2(px + pw + pad, py + ph + text_h + pad * 2), IM_COL32(11, 12, 14, 235));
-                        fg->AddRect(ImVec2(px - pad, py - pad), ImVec2(px + pw + pad, py + ph + text_h + pad * 2), line_u32);
-                        fg->AddImage(picture.texture, ImVec2(px, py), ImVec2(px + pw, py + ph));
-                        fg->AddText(ImVec2(px, py + ph + pad), muted_u32, local_time(hover_ms, true).c_str());
-                    }
+                    if (picture.texture) { hover_picture = picture; hover_shown_ms = hover_ms; }
+                    hover_x = io.MousePos.x;
                 }
+            }
+            {
+                float goal = hover_video && hover_picture.texture ? 1.f : 0.f;
+                double tau = goal > hover_alpha ? 0.06 : 0.25;
+                hover_alpha += (goal - hover_alpha) * (float)(1 - std::exp(-std::clamp((double)io.DeltaTime, 0.0, 0.1) / tau));
+                if (std::abs(hover_alpha - goal) < 0.02f) hover_alpha = goal;
+                if (hover_alpha != goal) fading = true;
+                if (hover_alpha == 0) hover_picture = {}; // Never hold a texture the cache may drop.
+            }
+            if (hover_alpha > 0 && hover_picture.texture) {
+                float a = hover_alpha; auto tint = [&](ImU32 colour, float scale) { return (colour & 0x00ffffff) | ((ImU32)(((colour >> 24) & 255) * a * scale) << 24); };
+                float x = std::clamp(hover_x, track_x, track_x + track_w);
+                draw->AddLine(ImVec2(x, video_y), ImVec2(x, video_y + video_h), tint(accent_u32, 1), 1 * dpi);
+                float pw = (float)hover_picture.width, ph = pw * hover_picture.height / std::max(1, hover_picture.width), pad = 4 * dpi, text_h = ImGui::GetTextLineHeight();
+                float px = std::clamp(x - pw / 2, track_x, std::max(track_x, track_x + track_w - pw));
+                float py = std::max(pad, origin.y - ph - text_h - pad * 3 - 6 * dpi);
+                auto* fg = ImGui::GetForegroundDrawList();
+                fg->AddRectFilled(ImVec2(px - pad, py - pad), ImVec2(px + pw + pad, py + ph + text_h + pad * 2), tint(IM_COL32(11, 12, 14, 235), 1));
+                fg->AddRect(ImVec2(px - pad, py - pad), ImVec2(px + pw + pad, py + ph + text_h + pad * 2), tint(line_u32, 1));
+                fg->AddImage(hover_picture.texture, ImVec2(px, py), ImVec2(px + pw, py + ph), ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, (int)(a * 255)));
+                fg->AddText(ImVec2(px, py + ph + pad), tint(muted_u32, 1), local_time(hover_shown_ms, true).c_str());
             }
             float grab = 6 * dpi;
             // A press becomes a range drag once the mouse moves; a plain click
