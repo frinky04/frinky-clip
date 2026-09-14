@@ -66,6 +66,12 @@ int main() {
         write_export_request(round_trip_dir / "r.json", request); auto back = read_export_request(round_trip_dir / "r.json");
         require(back.start_ms == 3250 && back.end_ms == 7000 && back.height == 720 && back.fps == 30 && back.codec == "av1" && back.audio, "Export request round trip");
         fs::remove_all(round_trip_dir);
+        auto index_dir = fs::temp_directory_path() / ("FrinkyClipIndex-" + unique_id());
+        BufferMap published; published.spans = {{"C:/b/session-a/s1.mkv", "session-a", 1000, 5000}, {"C:/b/session-a/s2.mkv", "session-a", 5000, 9000}}; published.last_end_ms = 9000;
+        write_index(index_dir / "segments.json", published); auto loaded_index = read_index(index_dir / "segments.json");
+        require(loaded_index && loaded_index->spans.size() == 2 && loaded_index->spans[1].start_ms == 5000 && loaded_index->last_end_ms == 9000 && loaded_index->spans[0].session == "session-a", "Segment index round trip");
+        require(!read_index(index_dir / "missing.json"), "Missing index reports absence");
+        fs::remove_all(index_dir);
         require(clip_name(0).starts_with("clip-19") && local_time(3600000 * 5 + 61234, true).ends_with(":01.234"), "Clip names and times use local wall-clock");
         std::cout << "Passed buffer retention, pinning, session boundaries, validation, Windows argument escaping, and atomic writes.\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

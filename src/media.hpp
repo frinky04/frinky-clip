@@ -4,7 +4,7 @@
 extern "C" {
 #include <libavutil/pixfmt.h>
 }
-struct AVBufferRef; struct AVCodecContext; struct AVCodec; struct AVFrame; struct ID3D11Device;
+struct AVBufferRef; struct AVCodecContext; struct AVCodec; struct AVFrame; struct AVFormatContext; struct ID3D11Device;
 namespace clip {
 struct MediaInfo { double seconds = 0; int width = 0, height = 0; bool audio = false; };
 MediaInfo inspect_media(const fs::path& path);
@@ -16,6 +16,8 @@ struct HwDevice { AVBufferRef* ref = nullptr; ~HwDevice(); };
 std::shared_ptr<HwDevice> hw_device(ID3D11Device* render_device);
 std::string adapter_name(ID3D11Device* device); // GPU description, for diagnostics.
 std::string adapter_name(const HwDevice& device);
+// Open a container, probing streams only when the headers are incomplete.
+bool open_without_probe(AVFormatContext** fmt, const fs::path& path);
 // Set as AVCodecContext::opaque with get_format = hw_get_format. The decoder
 // then runs on the device when the codec has a D3D11VA hwaccel and falls back
 // to software otherwise. extra_frames enlarges the surface pool for frames

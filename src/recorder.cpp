@@ -46,6 +46,7 @@ public:
     // Editor protection: footage in [pin_start, pin_end] stays while the pin is
     // refreshed. An export additionally hard-links its sources.
     std::int64_t pin_start = 0, pin_end = 0, pin_at = 0;
+    size_t indexed_count = (size_t)-1; std::int64_t indexed_end = -1; // Last published segment index.
     fs::path export_progress_file; std::int64_t export_duration_ms = 0; double export_fraction = -1;
 
     ~Recorder() {
@@ -422,6 +423,15 @@ public:
             shutdown_core(); status(); PostQuitMessage(exit_code); return;
         }
         if (now_ms() - last_status >= 1000) status();
+        // Publish the segment list whenever it changes; the editor reads this
+        // one file instead of every sidecar.
+        auto& segments = buffer.segments();
+        std::int64_t newest = segments.empty() ? 0 : segments.back().end_ms;
+        if (segments.size() != indexed_count || newest != indexed_end) {
+            BufferMap map; for (auto& s : spans()) map.spans.push_back(s);
+            map.last_end_ms = newest;
+            try { write_index(app_dir() / "segments.json", map); indexed_count = segments.size(); indexed_end = newest; } catch (...) {}
+        }
     }
 };
 LRESULT CALLBACK recorder_proc(HWND window, UINT msg, WPARAM w, LPARAM l) {

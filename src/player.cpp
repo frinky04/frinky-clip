@@ -138,9 +138,16 @@ std::int64_t Player::position() const {
     if (audio_) { auto ms = audio_->played_ms(); if (ms >= 0) return ms; }
     return clock_media_ + (steady_ms() - clock_wall_);
 }
+bool Player::reposition(Source& src, std::int64_t offset_ms) {
+    auto target = av_rescale_q(std::max<std::int64_t>(0, offset_ms), AVRational{1, 1000}, src.fmt->streams[src.vindex]->time_base);
+    if (av_seek_frame(src.fmt, src.vindex, target, AVSEEK_FLAG_BACKWARD) < 0) return false;
+    avcodec_flush_buffers(src.video); if (src.audio) avcodec_flush_buffers(src.audio);
+    src.eof = src.drained = src.failed = false; src.last_video_ms = -1; src.pending.clear(); src.pending_offset = 0;
+    return true;
+}
 bool Player::open(Source& src, const Span& span, std::int64_t offset_ms) {
     src.close(); src.span = span;
-    if (avformat_open_input(&src.fmt, path_text(span.path).c_str(), nullptr, nullptr) < 0 || avformat_find_stream_info(src.fmt, nullptr) < 0) return false;
+    if (!open_without_probe(&src.fmt, span.path)) return false;
     for (unsigned i = 0; i < src.fmt->nb_streams; ++i) {
         auto* par = src.fmt->streams[i]->codecpar;
         if (par->codec_type == AVMEDIA_TYPE_VIDEO && src.vindex < 0) src.vindex = (int)i;
@@ -249,8 +256,10 @@ void Player::work() {
             else {
                 index = (size_t)(it - spans.begin()); target = std::max(target, it->start_ms);
                 // Continue decoding forward when the target is just ahead; reopen otherwise.
-                bool forward = open_ok && src.span.path == it->path && src.last_video_ms >= 0 && target >= src.last_video_ms && target - src.last_video_ms < 3000;
-                if (!forward) open_ok = open(src, *it, target - it->start_ms);
+                bool same_file = open_ok && src.span.path == it->path;
+                bool forward = same_file && src.last_video_ms >= 0 && target >= src.last_video_ms && target - src.last_video_ms < 3000;
+                // Same segment: seek in place and flush; another segment: reopen.
+                if (!forward) open_ok = same_file ? reposition(src, target - it->start_ms) : open(src, *it, target - it->start_ms);
                 if (!open_ok) problem = "Cannot decode this segment.";
                 else {
                     Decoded frame; bool have = false;

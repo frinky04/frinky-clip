@@ -226,7 +226,13 @@ int run_ui() {
         player.set_end(map.last_end_ms);
         if (visible && !scanning.valid() && now_ms() - last_scan > 2000) {
             last_scan = now_ms(); auto root = cfg.storage / "buffer";
-            scanning = std::async(std::launch::async, [root] { return scan_buffer(root); });
+            // The recorder's index is one small file; scanning sidecars is the
+            // fallback when no recorder has published one for this folder.
+            auto index = app_dir() / "segments.json";
+            scanning = std::async(std::launch::async, [root, index] {
+                if (auto map = read_index(index)) if (map->spans.empty() || map->spans.front().path.parent_path().parent_path() == root) return *map;
+                return scan_buffer(root);
+            });
         }
         if (!visible) {
             if (last_pin && recorder) { PostMessageW(recorder, PinMessage, 0, 0); last_pin = 0; }

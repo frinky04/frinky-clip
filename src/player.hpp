@@ -41,6 +41,7 @@ private:
     struct Source;
     void work();
     bool open(Source& src, const Span& span, std::int64_t offset_ms);
+    bool reposition(Source& src, std::int64_t offset_ms); // Seek within the open segment.
     bool step(Source& src, Decoded* out_video, bool want_audio);
     void push_audio(Source& src, void* frame);
     bool convert_setup();

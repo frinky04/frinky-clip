@@ -26,6 +26,33 @@ BufferMap scan_buffer(const fs::path& root) {
     if (!map.spans.empty()) map.last_end_ms = map.spans.back().end_ms;
     return map;
 }
+std::optional<BufferMap> read_index(const fs::path& path) {
+    auto text = read_text(path); if (text.empty()) return std::nullopt;
+    auto d = Data(obs_data_create_from_json(text.c_str()), obs_data_release); if (!d) return std::nullopt;
+    auto* array = obs_data_get_array(d.get(), "segments"); if (!array) return std::nullopt;
+    BufferMap map; size_t count = obs_data_array_count(array);
+    for (size_t i = 0; i < count; ++i) {
+        auto item = Data(obs_data_array_item(array, i), obs_data_release);
+        Span s{fs::path(wide(obs_data_get_string(item.get(), "path"))), obs_data_get_string(item.get(), "session"),
+            obs_data_get_int(item.get(), "start_ms"), obs_data_get_int(item.get(), "end_ms")};
+        if (!s.path.empty() && s.end_ms > s.start_ms) map.spans.push_back(std::move(s));
+    }
+    obs_data_array_release(array);
+    std::sort(map.spans.begin(), map.spans.end(), [](auto& a, auto& b) { return a.end_ms != b.end_ms ? a.end_ms < b.end_ms : a.path < b.path; });
+    if (!map.spans.empty()) map.last_end_ms = map.spans.back().end_ms;
+    return map;
+}
+void write_index(const fs::path& path, const BufferMap& map) {
+    auto d = data(); auto* array = obs_data_array_create();
+    for (auto& s : map.spans) {
+        auto item = data(); obs_data_set_string(item.get(), "path", path_text(s.path).c_str()); obs_data_set_string(item.get(), "session", s.session.c_str());
+        obs_data_set_int(item.get(), "start_ms", s.start_ms); obs_data_set_int(item.get(), "end_ms", s.end_ms);
+        obs_data_array_push_back(array, item.get());
+    }
+    obs_data_set_array(d.get(), "segments", array); obs_data_array_release(array);
+    obs_data_set_int(d.get(), "updated_ms", now_ms());
+    write_json(path, d.get());
+}
 std::vector<Span> spans_in_range(const std::vector<Span>& spans, std::int64_t start_ms, std::int64_t end_ms) {
     std::vector<Span> result;
     for (auto& s : spans) if (s.end_ms > start_ms && s.start_ms < end_ms) result.push_back(s);

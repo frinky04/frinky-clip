@@ -21,15 +21,36 @@ static void check(int code, const char* context) {
     char message[AV_ERROR_MAX_STRING_SIZE]; av_strerror(code, message, sizeof(message));
     throw std::runtime_error(std::string(context) + ": " + message);
 }
+// True when every stream's header already carries what decoding needs, so the
+// expensive probe pass can be skipped. Our own MKV segments always do.
+static bool headers_complete(AVFormatContext* fmt) {
+    if (!fmt->nb_streams) return false;
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        auto* par = fmt->streams[i]->codecpar;
+        if (par->codec_id == AV_CODEC_ID_NONE || fmt->streams[i]->time_base.den <= 0) return false;
+        if (par->codec_type == AVMEDIA_TYPE_VIDEO && (par->width <= 0 || par->height <= 0)) return false;
+        if (par->codec_type == AVMEDIA_TYPE_AUDIO && (par->sample_rate <= 0 || par->ch_layout.nb_channels <= 0)) return false;
+    }
+    return true;
+}
 struct Input {
     AVFormatContext* value = nullptr;
-    explicit Input(const fs::path& p) {
+    // `probe` forces the stream-info pass, which inspect_media needs for durations.
+    explicit Input(const fs::path& p, bool probe = true) {
         check(avformat_open_input(&value, path_text(p).c_str(), nullptr, nullptr), "Open recording");
-        int result = avformat_find_stream_info(value, nullptr);
-        if (result < 0) { avformat_close_input(&value); check(result, "Read recording streams"); }
+        if (probe || !headers_complete(value)) {
+            int result = avformat_find_stream_info(value, nullptr);
+            if (result < 0) { avformat_close_input(&value); check(result, "Read recording streams"); }
+        }
     }
     ~Input() { avformat_close_input(&value); }
 };
+bool open_without_probe(AVFormatContext** fmt, const fs::path& p) {
+    if (avformat_open_input(fmt, path_text(p).c_str(), nullptr, nullptr) < 0) return false;
+    if (headers_complete(*fmt)) return true;
+    if (avformat_find_stream_info(*fmt, nullptr) < 0) { avformat_close_input(fmt); return false; }
+    return true;
+}
 MediaInfo inspect_media(const fs::path& p) {
     Input in(p); MediaInfo info;
     if (in.value->duration != AV_NOPTS_VALUE) info.seconds = double(in.value->duration) / AV_TIME_BASE;
@@ -191,7 +212,7 @@ Frame Decoder::decode(const fs::path& p, std::int64_t offset_ms, int width, bool
     }
 }
 Frame decode_with(Decoder::State* s_, const fs::path& p, std::int64_t offset_ms, int width, bool keyframe_only) {
-    Input in(p); int index = -1;
+    Input in(p, false); int index = -1;
     for (unsigned i = 0; i < in.value->nb_streams; ++i) if (in.value->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { index = (int)i; break; }
     if (index < 0) throw std::runtime_error("No video stream: " + path_text(p));
     auto* stream = in.value->streams[index];
