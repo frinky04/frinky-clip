@@ -45,7 +45,7 @@ add_executable(frinky-clip WIN32 src/main.cpp src/recorder.cpp src/ui.cpp src/ap
   "${DEPS}/imgui/imgui.cpp" "${DEPS}/imgui/imgui_draw.cpp" "${DEPS}/imgui/imgui_tables.cpp" "${DEPS}/imgui/imgui_widgets.cpp"
   "${DEPS}/imgui/backends/imgui_impl_win32.cpp" "${DEPS}/imgui/backends/imgui_impl_dx11.cpp")
 target_include_directories(frinky-clip PRIVATE "${DEPS}/imgui" "${DEPS}/imgui/backends")
-target_link_libraries(frinky-clip PRIVATE clip_core d3d11 dxgi dwmapi comctl32 dbghelp)
+target_link_libraries(frinky-clip PRIVATE clip_core d3d11 dxgi d3dcompiler dwmapi comctl32 dbghelp)
 target_compile_options(frinky-clip PRIVATE /Zi)
 target_link_options(frinky-clip PRIVATE /DEBUG)
 target_compile_options(clip_core PRIVATE /W4 /utf-8 /EHsc)

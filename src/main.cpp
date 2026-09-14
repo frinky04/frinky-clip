@@ -86,6 +86,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 began = clip::now_ms();
             }
             clip::atomic_write(clip::app_dir() / "frame-probe.txt", report);
+        } else if (!args.empty() && args[0] == L"--player-test" && args.size() >= 2) {
+            // Headless benchmark of seeking and playback over a buffer folder;
+            // writes player-test.txt. Optional second argument: seconds to play.
+            result = clip::player_test(clip::fs::path(args[1]), args.size() > 2 ? std::stoi(args[2]) : 5);
         } else if (!args.empty() && args[0] == L"--remux" && args.size() >= 3) {
             std::vector<clip::fs::path> sources; for (size_t i = 2; i < args.size(); ++i) sources.emplace_back(args[i]);
             clip::remux(sources, clip::fs::path(args[1]));

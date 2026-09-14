@@ -7,6 +7,7 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <memory>
 
 namespace clip {
 // Decoded pictures for the timeline, cached as D3D11 textures. Requests are
@@ -31,6 +32,8 @@ private:
     Picture request(const Key& key);
     void work();
     ID3D11Device* device_;
+    std::shared_ptr<HwDevice> hw_; // D3D11VA on the render device; frames are downloaded for scaling.
+    std::unique_ptr<Decoder> decoder_; // Owned by the worker thread.
     std::map<Key, Entry> cache_;
     std::deque<Key> queue_;
     mutable std::mutex mutex_;

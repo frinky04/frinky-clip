@@ -1,9 +1,19 @@
 #include "thumbs.hpp"
 #include <algorithm>
+#include <d3d11_4.h>
 #include <chrono>
 
 namespace clip {
-Thumbnails::Thumbnails(ID3D11Device* device) : device_(device), worker_([this] { work(); }) {}
+Thumbnails::Thumbnails(ID3D11Device* device) : device_(device) {
+    // Decoding submits to the immediate context from the worker thread; the
+    // device's internal lock serializes that with rendering.
+    ID3D11DeviceContext* context = nullptr; device->GetImmediateContext(&context);
+    ID3D11Multithread* multithread = nullptr;
+    if (context && SUCCEEDED(context->QueryInterface(__uuidof(ID3D11Multithread), (void**)&multithread))) { multithread->SetMultithreadProtected(TRUE); multithread->Release(); }
+    if (context) context->Release();
+    hw_ = hw_device(device);
+    worker_ = std::thread([this] { work(); });
+}
 Thumbnails::~Thumbnails() {
     { std::lock_guard lock(mutex_); stop_ = true; } wake_.notify_all(); worker_.join();
     for (auto& [key, entry] : cache_) if (entry.view) entry.view->Release();
@@ -36,7 +46,7 @@ void Thumbnails::work() {
         Key key = queue_.back(); queue_.pop_back(); ++active_;
         lock.unlock();
         Frame frame; bool failed = false; auto began = std::chrono::steady_clock::now();
-        try { frame = decode_frame(fs::path(key.path), key.exact ? key.offset : key.offset, key.width, !key.exact); }
+        try { if (!decoder_) decoder_ = std::make_unique<Decoder>(hw_); frame = decoder_->decode(fs::path(key.path), key.offset, key.width, !key.exact); }
         catch (...) { failed = true; }
         lock.lock(); --active_; last_decode_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
         auto it = cache_.find(key);

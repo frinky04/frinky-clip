@@ -1,10 +1,15 @@
 #include "media.hpp"
+#include <d3d11.h>
+#include <dxgi.h>
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/error.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_d3d11va.h>
+#include <libavutil/pixdesc.h>
 }
 #include <stdexcept>
 #include <algorithm>
@@ -97,54 +102,147 @@ void remux(const std::vector<fs::path>& segments, const fs::path& destination) {
 }
 
 namespace clip {
-Frame decode_frame(const fs::path& p, std::int64_t offset_ms, int width, bool keyframe_only) {
+HwDevice::~HwDevice() { av_buffer_unref(&ref); }
+std::shared_ptr<HwDevice> hw_device(ID3D11Device* render_device) {
+    auto result = std::make_shared<HwDevice>();
+    if (render_device) {
+        result->ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA); if (!result->ref) return {};
+        auto* hw = static_cast<AVD3D11VADeviceContext*>(reinterpret_cast<AVHWDeviceContext*>(result->ref->data)->hwctx);
+        render_device->AddRef(); hw->device = render_device;
+        if (av_hwdevice_ctx_init(result->ref) < 0) return {};
+    } else if (av_hwdevice_ctx_create(&result->ref, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0) < 0) return {};
+    return result;
+}
+std::string adapter_name(ID3D11Device* device) {
+    IDXGIDevice* dxgi = nullptr; IDXGIAdapter* adapter = nullptr; std::string name = "unknown adapter";
+    if (device && SUCCEEDED(device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgi))) {
+        DXGI_ADAPTER_DESC desc{};
+        if (SUCCEEDED(dxgi->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&desc))) name = utf8(desc.Description);
+        if (adapter) adapter->Release(); dxgi->Release();
+    }
+    return name;
+}
+std::string adapter_name(const HwDevice& device) {
+    if (!device.ref) return "none";
+    auto* hw = static_cast<AVD3D11VADeviceContext*>(reinterpret_cast<AVHWDeviceContext*>(device.ref->data)->hwctx);
+    return adapter_name(hw->device);
+}
+AVPixelFormat hw_get_format(AVCodecContext* ctx, const AVPixelFormat* formats) {
+    auto* binding = static_cast<HwBinding*>(ctx->opaque);
+    for (auto* f = formats; *f != AV_PIX_FMT_NONE; ++f) {
+        if (*f != AV_PIX_FMT_D3D11 || !binding || !binding->device) continue;
+        // A pool that already fits this stream is kept: rebuilding it means a
+        // fresh video decoder and a new array texture every time.
+        if (ctx->hw_frames_ctx) {
+            auto* have = reinterpret_cast<AVHWFramesContext*>(ctx->hw_frames_ctx->data);
+            if (have->width >= ctx->coded_width && have->height >= ctx->coded_height && have->format == AV_PIX_FMT_D3D11) return AV_PIX_FMT_D3D11;
+        }
+        AVBufferRef* frames = nullptr;
+        if (avcodec_get_hw_frames_parameters(ctx, binding->device->ref, AV_PIX_FMT_D3D11, &frames) < 0) continue;
+        auto* fc = reinterpret_cast<AVHWFramesContext*>(frames->data);
+        auto* d3d = static_cast<AVD3D11VAFramesContext*>(fc->hwctx);
+        d3d->BindFlags = D3D11_BIND_DECODER | (binding->shader_resource ? D3D11_BIND_SHADER_RESOURCE : 0);
+        fc->initial_pool_size += binding->extra_frames;
+        if (av_hwframe_ctx_init(frames) < 0) { av_buffer_unref(&frames); continue; }
+        av_buffer_unref(&ctx->hw_frames_ctx); ctx->hw_frames_ctx = frames; return AV_PIX_FMT_D3D11;
+    }
+    for (auto* f = formats; *f != AV_PIX_FMT_NONE; ++f) if (!(av_pix_fmt_desc_get(*f)->flags & AV_PIX_FMT_FLAG_HWACCEL)) return *f;
+    return formats[0];
+}
+const AVCodec* pick_decoder(int codec_id, bool hardware) {
+    if (hardware && codec_id == AV_CODEC_ID_AV1) if (auto* native = avcodec_find_decoder_by_name("av1")) return native;
+    return avcodec_find_decoder((AVCodecID)codec_id);
+}
+struct Decoder::State {
+    std::shared_ptr<HwDevice> hw; HwBinding binding; bool hw_failed = false;
+    AVCodecContext* ctx = nullptr; AVCodecID codec_id = AV_CODEC_ID_NONE; int width = 0, height = 0; std::vector<std::uint8_t> extradata;
+    AVPacket* packet = av_packet_alloc(); AVFrame* frame = av_frame_alloc(); AVFrame* best = av_frame_alloc(); AVFrame* cpu = av_frame_alloc();
+    SwsContext* sws = nullptr; int sws_w = 0, sws_h = 0, sws_src_w = 0, sws_src_h = 0, sws_fmt = -1;
+    ~State() { avcodec_free_context(&ctx); av_packet_free(&packet); av_frame_free(&frame); av_frame_free(&best); av_frame_free(&cpu); sws_freeContext(sws); }
+    // Reuse the context when the stream matches the previous one.
+    void prepare(AVStream* stream) {
+        auto* par = stream->codecpar;
+        bool same = ctx && par->codec_id == codec_id && par->width == width && par->height == height &&
+            extradata.size() == (size_t)par->extradata_size && (par->extradata_size == 0 || memcmp(extradata.data(), par->extradata, par->extradata_size) == 0);
+        if (same) { avcodec_flush_buffers(ctx); return; }
+        avcodec_free_context(&ctx);
+        bool hardware = hw && !hw_failed; const AVCodec* codec = pick_decoder(par->codec_id, hardware);
+        if (!codec) throw std::runtime_error("No decoder for the recording's video codec");
+        ctx = avcodec_alloc_context3(codec); if (!ctx) throw std::bad_alloc();
+        check(avcodec_parameters_to_context(ctx, par), "Configure decoder");
+        // Hardware decoding runs asynchronously on the GPU; frame threads only add per-thread setup.
+        ctx->thread_count = hardware ? 1 : 0;
+        if (hardware) { binding = {hw, false, 16}; ctx->opaque = &binding; ctx->get_format = hw_get_format; }
+        check(avcodec_open2(ctx, codec, nullptr), "Open decoder");
+        codec_id = par->codec_id; width = par->width; height = par->height;
+        extradata.assign(par->extradata, par->extradata + par->extradata_size);
+    }
+};
+Decoder::Decoder(std::shared_ptr<HwDevice> hw) : s_(new State) { s_->hw = std::move(hw); }
+Decoder::~Decoder() { delete s_; }
+struct HwFailure {};
+Frame decode_with(Decoder::State* s, const fs::path& p, std::int64_t offset_ms, int width, bool keyframe_only);
+Frame Decoder::decode(const fs::path& p, std::int64_t offset_ms, int width, bool keyframe_only) {
+    try { return decode_with(s_, p, offset_ms, width, keyframe_only); }
+    catch (const HwFailure&) {
+        // The native decoder could not use the device: fall back to software for good.
+        s_->hw_failed = true; avcodec_free_context(&s_->ctx);
+        return decode_with(s_, p, offset_ms, width, keyframe_only);
+    }
+}
+Frame decode_with(Decoder::State* s_, const fs::path& p, std::int64_t offset_ms, int width, bool keyframe_only) {
     Input in(p); int index = -1;
     for (unsigned i = 0; i < in.value->nb_streams; ++i) if (in.value->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { index = (int)i; break; }
     if (index < 0) throw std::runtime_error("No video stream: " + path_text(p));
     auto* stream = in.value->streams[index];
-    const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
-    if (!codec) throw std::runtime_error("No decoder for the recording's video codec");
-    AVCodecContext* ctx = avcodec_alloc_context3(codec); if (!ctx) throw std::bad_alloc();
-    AVPacket* packet = av_packet_alloc(); AVFrame* frame = av_frame_alloc(), *best = av_frame_alloc();
-    SwsContext* scaler = nullptr;
-    auto cleanup = [&] { av_packet_free(&packet); av_frame_free(&frame); av_frame_free(&best); avcodec_free_context(&ctx); sws_freeContext(scaler); };
-    try {
-        check(avcodec_parameters_to_context(ctx, stream->codecpar), "Configure decoder");
-        ctx->thread_count = 0; // Auto: libaom tile/frame threads make 1440p AV1 tolerable in software.
-        if (keyframe_only) ctx->skip_frame = AVDISCARD_NONKEY;
-        check(avcodec_open2(ctx, codec, nullptr), "Open decoder");
-        std::int64_t target = av_rescale_q(offset_ms, AVRational{1, 1000}, stream->time_base);
-        if (offset_ms > 0) av_seek_frame(in.value, index, target, AVSEEK_FLAG_BACKWARD);
-        bool have = false, done = false;
-        auto consider = [&](AVFrame* f) {
-            std::int64_t pts = f->best_effort_timestamp == AV_NOPTS_VALUE ? f->pts : f->best_effort_timestamp;
-            if (pts != AV_NOPTS_VALUE && pts > target && have) { done = true; return; }
-            av_frame_unref(best); av_frame_ref(best, f); have = true;
-            if (keyframe_only || (pts != AV_NOPTS_VALUE && pts >= target)) done = true;
-        };
+    s_->prepare(stream); auto* ctx = s_->ctx;
+    ctx->skip_frame = keyframe_only ? AVDISCARD_NONKEY : AVDISCARD_DEFAULT;
+    std::int64_t target = av_rescale_q(offset_ms, AVRational{1, 1000}, stream->time_base);
+    if (offset_ms > 0) av_seek_frame(in.value, index, target, AVSEEK_FLAG_BACKWARD);
+    bool have = false, done = false; AVFrame* frame = s_->frame; AVFrame* best = s_->best; AVPacket* packet = s_->packet;
+    av_frame_unref(best);
+    auto consider = [&](AVFrame* f) {
+        std::int64_t pts = f->best_effort_timestamp == AV_NOPTS_VALUE ? f->pts : f->best_effort_timestamp;
+        if (pts != AV_NOPTS_VALUE && pts > target && have) { done = true; return; }
+        av_frame_unref(best); av_frame_ref(best, f); have = true;
+        if (keyframe_only || (pts != AV_NOPTS_VALUE && pts >= target)) done = true;
+    };
+    bool hardware = s_->hw && !s_->hw_failed;
+    while (!done) {
+        int r = av_read_frame(in.value, packet);
+        int sent = 0;
+        if (r < 0) { avcodec_send_packet(ctx, nullptr); }
+        else if (packet->stream_index != index) { av_packet_unref(packet); continue; }
+        else { sent = avcodec_send_packet(ctx, packet); av_packet_unref(packet); }
+        if (sent < 0 && sent != AVERROR(EAGAIN) && hardware && !have) throw HwFailure{};
         while (!done) {
-            int r = av_read_frame(in.value, packet);
-            if (r < 0) { avcodec_send_packet(ctx, nullptr); }
-            else if (packet->stream_index != index) { av_packet_unref(packet); continue; }
-            else { avcodec_send_packet(ctx, packet); av_packet_unref(packet); }
-            while (!done) {
-                int rr = avcodec_receive_frame(ctx, frame);
-                if (rr == AVERROR(EAGAIN)) break;
-                if (rr == AVERROR_EOF || rr < 0) { done = true; break; }
-                consider(frame); av_frame_unref(frame);
-            }
-            if (r < 0) break;
+            int rr = avcodec_receive_frame(ctx, frame);
+            if (rr == AVERROR(EAGAIN)) break;
+            if (rr == AVERROR_EOF) { done = true; break; }
+            if (rr < 0) { if (hardware && !have) throw HwFailure{}; done = true; break; }
+            consider(frame); av_frame_unref(frame);
         }
-        if (!have) throw std::runtime_error("No decodable frame at that position");
-        int height = std::max(1, (int)std::lround((double)best->height * width / std::max(1, best->width)));
-        scaler = sws_getContext(best->width, best->height, (AVPixelFormat)best->format, width, height, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (!scaler) throw std::runtime_error("Cannot scale decoded frame");
-        Frame out; out.width = width; out.height = height; out.rgba.resize((size_t)width * height * 4);
-        std::uint8_t* planes[1] = {out.rgba.data()}; int strides[1] = {width * 4};
-        sws_scale(scaler, best->data, best->linesize, 0, best->height, planes, strides);
-        std::int64_t pts = best->best_effort_timestamp == AV_NOPTS_VALUE ? best->pts : best->best_effort_timestamp;
-        out.pts_ms = pts == AV_NOPTS_VALUE ? offset_ms : av_rescale_q(pts, stream->time_base, AVRational{1, 1000});
-        cleanup(); return out;
-    } catch (...) { cleanup(); throw; }
+        if (r < 0) break;
+    }
+    if (!have) throw std::runtime_error("No decodable frame at that position");
+    AVFrame* picture = best;
+    if (best->format == AV_PIX_FMT_D3D11) { av_frame_unref(s_->cpu); check(av_hwframe_transfer_data(s_->cpu, best, 0), "Download decoded frame"); picture = s_->cpu; }
+    int height = std::max(1, (int)std::lround((double)picture->height * width / std::max(1, picture->width)));
+    if (!s_->sws || s_->sws_w != width || s_->sws_h != height || s_->sws_src_w != picture->width || s_->sws_src_h != picture->height || s_->sws_fmt != picture->format) {
+        sws_freeContext(s_->sws);
+        s_->sws = sws_getContext(picture->width, picture->height, (AVPixelFormat)picture->format, width, height, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+        s_->sws_w = width; s_->sws_h = height; s_->sws_src_w = picture->width; s_->sws_src_h = picture->height; s_->sws_fmt = picture->format;
+    }
+    if (!s_->sws) throw std::runtime_error("Cannot scale decoded frame");
+    Frame out; out.width = width; out.height = height; out.rgba.resize((size_t)width * height * 4);
+    std::uint8_t* planes[1] = {out.rgba.data()}; int strides[1] = {width * 4};
+    sws_scale(s_->sws, picture->data, picture->linesize, 0, picture->height, planes, strides);
+    std::int64_t pts = best->best_effort_timestamp == AV_NOPTS_VALUE ? best->pts : best->best_effort_timestamp;
+    out.pts_ms = pts == AV_NOPTS_VALUE ? offset_ms : av_rescale_q(pts, stream->time_base, AVRational{1, 1000});
+    av_frame_unref(best); av_frame_unref(s_->cpu); // Release the hardware surface before the next call.
+    return out;
+}
+Frame decode_frame(const fs::path& p, std::int64_t offset_ms, int width, bool keyframe_only, std::shared_ptr<HwDevice> hw) {
+    Decoder decoder(std::move(hw)); return decoder.decode(p, offset_ms, width, keyframe_only);
 }
 }

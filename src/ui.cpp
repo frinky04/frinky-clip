@@ -309,6 +309,14 @@ int run_ui() {
             if (img_w > w) { img_w = w; img_h = std::floor(img_w * 9 / 16); }
             player.set_width((int)std::min(img_w * 2, 1920.f)); // Decode at up to 2x for crisp scaling.
             auto picture = player.tick();
+            // While scrubbing, the nearest cached keyframe follows the mouse at
+            // once; the exact frame lands when the drag ends.
+            if (scrubbing) {
+                if (auto* s = span_at(scrub_ms)) {
+                    auto key = thumbs.keyframe(s->path, scrub_ms - s->start_ms, (int)img_w);
+                    if (key.texture) picture = {key.texture, key.width, key.height, scrub_ms};
+                }
+            }
             float x = p.x + (w - img_w) / 2, y = p.y + (h - img_h) / 2;
             draw->AddRectFilled(ImVec2(x, y), ImVec2(x + img_w, y + img_h), track_u32);
             if (picture.texture) {
@@ -597,7 +605,7 @@ int run_ui() {
             }
             ImGui::TextDisabled("Missed frames: %lld render / %lld encode", obs_data_get_int(status.get(), "lagged_frames"), obs_data_get_int(status.get(), "skipped_frames"));
             help("Cumulative recorder misses for the last reported session. These do not measure the game's FPS impact.");
-            ImGui::TextDisabled("Closed segments: %zu | last thumbnail decode %.0f ms", map.spans.size(), thumbs.last_decode_ms());
+            ImGui::TextDisabled("Closed segments: %zu | last thumbnail decode %.0f ms | player decode: %s", map.spans.size(), thumbs.last_decode_ms(), player.hardware() ? "D3D11VA" : "software");
             if (!settings_error.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, rgb(0xf0a399));
                 ImGui::TextWrapped("Not saved: %s", settings_error.c_str()); ImGui::PopStyleColor();
