@@ -1,11 +1,11 @@
 cmake_minimum_required(VERSION 3.28)
-project(FrinkyClip VERSION 0.1.0 LANGUAGES CXX)
+project(FrinkyClip VERSION 0.2.0 LANGUAGES CXX)
 if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Frinky Clip requires MSVC and 64-bit Windows.")
 endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(OBS_ROOT "C:/Program Files/obs-studio" CACHE PATH "OBS 32.2.2 installation")
+set(OBS_ROOT "C:/Program Files/obs-studio" CACHE PATH "OBS 32.2.2 installation, the build-time source of the runtime files")
 set(DEPS "${CMAKE_SOURCE_DIR}/.deps")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/include/libavutil")
@@ -36,7 +36,7 @@ import_runtime(avcodec avcodec-62)
 import_runtime(avutil avutil-60)
 import_runtime(swscale swscale-9)
 import_runtime(swresample swresample-6)
-add_library(clip_core src/common.cpp src/media.cpp src/buffer.cpp src/timeline.cpp)
+add_library(clip_core src/common.cpp src/media.cpp src/buffer.cpp src/timeline.cpp src/export.cpp)
 target_include_directories(clip_core PUBLIC src "${CMAKE_BINARY_DIR}/include")
 target_include_directories(clip_core SYSTEM PUBLIC "${DEPS}/obs-src/libobs" "${DEPS}/ffmpeg-src")
 target_compile_definitions(clip_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
@@ -56,13 +56,17 @@ enable_testing()
 add_executable(clip-tests tests/core_tests.cpp)
 target_link_libraries(clip-tests PRIVATE clip_core)
 add_test(NAME clip-core COMMAND clip-tests)
-# Keep OBS unmodified. Only runtime DLLs and helper executables are copied;
-# modules and data are loaded from the configured installation.
-file(GLOB runtime_dlls "${OBS_ROOT}/bin/64bit/*.dll")
-list(FILTER runtime_dlls EXCLUDE REGEX "/(Qt6[^/]*|obs-frontend-api|obs-scripting|lua51|libobs-opengl)\\.dll$")
-foreach(target frinky-clip clip-tests)
-  add_custom_command(TARGET ${target} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${runtime_dlls} "$<TARGET_FILE_DIR:${target}>"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OBS_ROOT}/bin/64bit/obs-ffmpeg-mux.exe" "${OBS_ROOT}/bin/64bit/obs-nvenc-test.exe" "${OBS_ROOT}/bin/64bit/obs-qsv-test.exe" "${OBS_ROOT}/bin/64bit/obs-amf-test.exe" "$<TARGET_FILE_DIR:${target}>")
-endforeach()
-file(GENERATE OUTPUT "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/runtime.json" CONTENT "{\"obs_root\":\"${OBS_ROOT}\"}\n")
+# Release layout: everything the app loads at runtime is staged beside the
+# executable (see cmake/stage.cmake), so a copy of the output folder runs on a
+# machine with only the NVIDIA driver. The OBS installation is a build input.
+set(OBS_RUNTIME_DLLS obs libobs-d3d11 libobs-winrt avcodec-62 avdevice-62 avfilter-11 avformat-62 avutil-60 swresample-6 swscale-9 libx264-164 libcurl librist srt w32-pthreads zlib)
+set(OBS_RUNTIME_EXES obs-ffmpeg-mux obs-nvenc-test obs-amf-test)
+set(OBS_PLUGINS obs-ffmpeg obs-nvenc win-capture win-wasapi image-source)
+set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
+include(InstallRequiredSystemLibraries)
+# One staging step after both executables: they share an output folder, and
+# concurrent copies into it collide.
+add_custom_target(stage ALL
+  COMMAND ${CMAKE_COMMAND} "-DOBS_ROOT=${OBS_ROOT}" "-DDEST=$<TARGET_FILE_DIR:frinky-clip>" "-DDLLS=${OBS_RUNTIME_DLLS}" "-DEXES=${OBS_RUNTIME_EXES}"
+    "-DPLUGINS=${OBS_PLUGINS}" "-DCRT=${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}" -P "${CMAKE_SOURCE_DIR}/cmake/stage.cmake"
+  DEPENDS frinky-clip clip-tests COMMENT "Staging runtime files beside the executables")

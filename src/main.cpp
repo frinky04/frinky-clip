@@ -1,6 +1,7 @@
 #include "recorder.hpp"
 #include "buffer.hpp"
 #include "media.hpp"
+#include "export.hpp"
 #include "app.hpp"
 #include <shellapi.h>
 #include <objbase.h>
@@ -20,7 +21,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         if (!log) return EXCEPTION_EXECUTE_HANDLER;
         fprintf(log, "Exception %08lx at %p\n", exception->ExceptionRecord->ExceptionCode, exception->ExceptionRecord->ExceptionAddress);
         HANDLE process = GetCurrentProcess();
-        auto symbols = clip::path_text(clip::exe_dir()) + ";C:/Program Files/obs-studio/bin/64bit;C:/Program Files/obs-studio/obs-plugins/64bit";
+        auto symbols = clip::path_text(clip::exe_dir()) + ";" + clip::path_text(clip::exe_dir() / "obs-plugins");
         SymInitialize(process, symbols.c_str(), TRUE);
         CONTEXT context = *exception->ContextRecord; STACKFRAME64 frame{};
         frame.AddrPC.Offset = context.Rip; frame.AddrPC.Mode = AddrModeFlat;
@@ -66,8 +67,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             auto window = clip::recorder_window(); result = window && PostMessageW(window, clip::StopMessage, 0, 0) ? 0 : 1;
         } else if (!args.empty() && args[0] == L"--start") {
             auto window = clip::recorder_window(); result = window && PostMessageW(window, clip::ResumeMessage, 0, 0) ? 0 : 1;
-        } else if (!args.empty() && args[0] == L"--share") {
-            auto window = clip::recorder_window(); result = window && PostMessageW(window, clip::ShareMessage, 0, 0) ? 0 : 1;
+        } else if (!args.empty() && args[0] == L"--export" && args.size() >= 3) {
+            // Export [start_ms, end_ms] epoch times with the saved export defaults; the UI writes the same request file.
+            auto cfg = clip::Config::load(); clip::ExportRequest request;
+            request.start_ms = std::stoll(args[1]); request.end_ms = std::stoll(args[2]);
+            request.height = cfg.export_height; request.fps = cfg.export_fps; request.bitrate_kbps = cfg.share_bitrate; request.codec = cfg.export_codec;
+            clip::write_export_request(clip::app_dir() / "export-request.json", request);
+            auto window = clip::recorder_window(); result = window && PostMessageW(window, clip::ExportMessage, 0, 0) ? 0 : 1;
+        } else if (!args.empty() && args[0] == L"--export-test" && args.size() >= 2) {
+            // Headless check of the in-process export over a buffer folder;
+            // writes export-test.txt. Optional second argument: clip seconds.
+            result = clip::export_test(clip::fs::path(args[1]), args.size() > 2 ? std::stoi(args[2]) : 3);
         } else if (!args.empty() && args[0] == L"--recover") {
             if (clip::recorder_window()) throw std::runtime_error("Stop the recorder before standalone recovery.");
             auto cfg = clip::Config::load(); cfg.validate(); clip::Buffer buffer(cfg); buffer.recover();

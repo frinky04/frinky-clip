@@ -94,7 +94,30 @@ try {
 
     '{"record_on_launch":true}' | Set-Content -LiteralPath (Join-Path $testHome 'config.json')
     $owner = Start-Owner; $state = Wait-Recording
-    Start-Sleep -Seconds 5
+    Start-Sleep -Seconds 10
+    # Closed segments of a session must chain exactly, and an export across a
+    # seam must come back frame-accurate through the in-process encoder.
+    $index = Get-Content -LiteralPath (Join-Path $testHome 'segments.json') -Raw | ConvertFrom-Json
+    if ($index.segments.Count -lt 2) { throw 'Expected at least two closed segments before exporting.' }
+    $chained = 0
+    for ($i = 1; $i -lt $index.segments.Count; $i++) {
+        if ($index.segments[$i].session -ne $index.segments[$i - 1].session) { continue }
+        if ($index.segments[$i].start_ms -ne $index.segments[$i - 1].end_ms) { throw 'Segments of one session did not chain exactly.' }
+        $chained++
+    }
+    if ($index.segments[-1].session -ne $index.segments[-2].session -or $chained -lt 1) { throw 'Expected two closed segments of the current session.' }
+    $seam = [int64]$index.segments[-1].start_ms
+    Command "--export $($seam - 1500) $($seam + 1500)"
+    for ($attempt = 0; $attempt -lt 300; $attempt++) {
+        Start-Sleep -Milliseconds 200
+        $state = Get-Content -LiteralPath (Join-Path $testHome 'status.json') -Raw | ConvertFrom-Json
+        if ($state.error) { throw "Export failed: $($state.error)" }
+        if ($state.message -like 'Exported *') { break }
+    }
+    if ($state.message -notlike 'Exported *') { throw 'Export did not finish.' }
+    $exported = & ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 $state.last_clip
+    if ($LASTEXITCODE -or [int]$exported -ne 180) { throw "Exported clip has $exported frames; expected 180." }
+    Write-Output 'PASS: segments chain exactly and a 3 s export across a seam holds exactly 180 frames.'
     $helpers = Children $owner.Id
     Command '--save 2'; Command '--quit'
     Assert-Exited (@($owner) + @($helpers))

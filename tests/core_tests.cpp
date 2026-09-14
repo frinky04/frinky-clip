@@ -8,13 +8,15 @@ static void require(bool pass, const char* text) { if (!pass) throw std::runtime
 int main() {
     try {
         std::vector<Segment> segments{
-            {"one", "session-a", 10000, 4, 100}, {"two", "session-a", 14000, 4, 100}, {"three", "session-a", 18000, 4, 100}};
+            {"one", "session-a", 6000, 10000, 100}, {"two", "session-a", 10000, 14000, 100}, {"three", "session-a", 14000, 18000, 100}};
+        require(segments[0].seconds() == 4.0, "Segment length follows its chained extent");
+        require(chained_ms(1000, 240, 60, 1) == 5000 && chained_ms(1000, 239, 60, 1) == 4983 && chained_ms(1000, 480, 60, 1) == 9000, "Chained segment times round once from the frame count");
         require(select_recent(segments, 5) == std::vector<size_t>({1, 2}), "Save covers requested duration at segment boundaries");
         require(select_recent(segments, 60).size() == 3, "Short buffer returns available history");
         require(expired_segments(segments, 18000, 100, 200, {}) == std::vector<size_t>({0}), "Byte limit evicts oldest first");
         require(expired_segments(segments, 18000, 5, 1000, {}) == std::vector<size_t>({0}), "Time retention expires old footage");
         require(expired_segments(segments, 18000, 100, 100, {fs::path("one")}) == std::vector<size_t>({1, 2}), "Pending save protects referenced footage");
-        segments.push_back({"four", "session-b", 22000, 4, 100});
+        segments.push_back({"four", "session-b", 18000, 22000, 100});
         require(select_recent(segments, 60) == std::vector<size_t>({3}), "Never concatenate across encoder sessions");
         require(select_recent(segments, 60, "session-a").size() == 3, "Explicit session selection");
         require(select_recent({}, 60).empty(), "Empty buffer");
@@ -57,11 +59,6 @@ int main() {
         require(spans_in_range(spans, 8000, 21000).empty(), "Range across sessions is rejected");
         require(spans_in_range(spans, 10000, 15000).empty(), "Range in a gap has no footage");
         ExportRequest request; request.start_ms = 3250; request.end_ms = 7000; request.height = 720; request.fps = 30; request.bitrate_kbps = 8000; request.codec = "av1";
-        auto ffargs = export_args(request, 1000, L"C:/x/list.txt", L"C:/x/progress.txt", L"C:/x/out.mp4.partial");
-        auto has = [&](const wchar_t* a, const wchar_t* b) { for (size_t i = 0; i + 1 < ffargs.size(); ++i) if (ffargs[i] == a && ffargs[i+1] == b) return true; return false; };
-        require(has(L"-ss", L"2.250") && has(L"-t", L"3.750") && has(L"-c:v", L"av1_nvenc") && has(L"-vf", L"fps=30,scale=-2:720") && has(L"-b:v", L"8000k"), "Export arguments trim relative to the first segment");
-        auto seek = std::find(ffargs.begin(), ffargs.end(), L"-ss"); require(seek > std::find(ffargs.begin(), ffargs.end(), L"-i"), "Output-side seek keeps the cut frame-accurate");
-        require(!export_progress("frame=1\n", 4000) && *export_progress("out_time_us=2000000\nprogress=continue\n", 4000) == 0.5 && *export_progress("out_time_us=1\nprogress=end\n", 4000) == 1.0, "Progress parsing");
         auto round_trip_dir = fs::temp_directory_path() / ("FrinkyClipExport-" + unique_id());
         write_export_request(round_trip_dir / "r.json", request); auto back = read_export_request(round_trip_dir / "r.json");
         require(back.start_ms == 3250 && back.end_ms == 7000 && back.height == 720 && back.fps == 30 && back.codec == "av1" && back.audio, "Export request round trip");

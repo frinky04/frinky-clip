@@ -90,28 +90,6 @@ std::wstring quote_arg(const std::wstring& arg) {
     }
     out.append(slashes * 2, L'\\'); return out + L'\"';
 }
-static std::wstring command(const fs::path& exe, const std::vector<std::wstring>& args) {
-    auto line = quote_arg(exe.wstring()); for (auto& arg : args) line += L" " + quote_arg(arg); return line;
-}
-DWORD run_process(const fs::path& exe, const std::vector<std::wstring>& args, const fs::path& log, DWORD timeout) {
-    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
-    HANDLE out = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    HANDLE in = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
-    STARTUPINFOW si{sizeof(si)}; si.dwFlags = STARTF_USESTDHANDLES; si.hStdInput = in; si.hStdOutput = out; si.hStdError = out;
-    PROCESS_INFORMATION pi{}; auto line = command(exe, args);
-    BOOL ok = CreateProcessW(exe.c_str(), line.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    CloseHandle(in); if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
-    if (!ok) throw std::runtime_error("Cannot launch " + path_text(exe));
-    if (WaitForSingleObject(pi.hProcess, timeout) == WAIT_TIMEOUT) { TerminateProcess(pi.hProcess, 124); WaitForSingleObject(pi.hProcess, 5000); }
-    DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code); CloseHandle(pi.hThread); CloseHandle(pi.hProcess); return code;
-}
-void launch(const std::vector<std::wstring>& args) {
-    fs::path exe = exe_dir() / "frinky-clip.exe"; auto line = command(exe, args);
-    STARTUPINFOW si{sizeof(si)}; si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(exe.c_str(), line.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) throw std::runtime_error("Could not launch recorder");
-    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-}
 Config Config::load() {
     Config c; c.storage = app_dir() / "Recordings";
     auto d = read_json(app_dir() / "config.json");

@@ -1,6 +1,7 @@
 #include "recorder.hpp"
 #include "buffer.hpp"
 #include "timeline.hpp"
+#include "export.hpp"
 #include "app.hpp"
 #include <shellapi.h>
 #include <future>
@@ -49,7 +50,8 @@ public:
     std::int64_t pin_start = 0, pin_end = 0, pin_at = 0;
     size_t indexed_count = (size_t)-1; std::int64_t indexed_end = -1; // Last published segment index.
     HWND controls = nullptr; // The tray app's control window, told when status changes.
-    fs::path export_progress_file; std::int64_t export_duration_ms = 0; double export_fraction = -1;
+    // Export progress is shared with the worker; -1 while no export runs.
+    std::shared_ptr<std::atomic<double>> export_progress; double export_fraction = -1;
 
     ~Recorder() {
         if (worker.valid()) worker.wait();
@@ -58,9 +60,10 @@ public:
     }
     bool session() const { return output != nullptr; }
     bool recording() const { return output && obs_output_active(output) && !stopping; }
+    // Plugins and their data ship beside the executable; no OBS installation is consulted.
     void load_module(const fs::path& root, const char* name) {
         obs_module_t* module = nullptr;
-        auto binary = path_text(root / "obs-plugins" / "64bit" / (std::string(name) + ".dll"));
+        auto binary = path_text(root / "obs-plugins" / (std::string(name) + ".dll"));
         auto module_data = path_text(root / "data" / "obs-plugins" / name);
         if (obs_open_module(&module, binary.c_str(), module_data.c_str()) != MODULE_SUCCESS || !obs_init_module(module))
             throw std::runtime_error(std::string("Cannot load OBS module: ") + name);
@@ -93,9 +96,9 @@ public:
         cfg.validate();
         load_last_clip();
         buffer.recover(); load_pending(); buffer.prune();
-        auto runtime = read_json(exe_dir() / "runtime.json");
-        auto root = fs::path(wide(obs_data_get_string(runtime.get(), "obs_root")));
-        if (root.empty()) throw std::runtime_error("Missing runtime.json. Run scripts/build.ps1.");
+        auto root = exe_dir();
+        if (!fs::exists(root / "data" / "libobs" / "default.effect") || !fs::exists(root / "obs-plugins" / "obs-nvenc.dll"))
+            throw std::runtime_error("The OBS runtime files beside frinky-clip.exe are missing. Reinstall the release package.");
         auto core_data = path_text(root / "data" / "libobs") + "/"; obs_add_data_path(core_data.c_str());
         if (!obs_startup("en-US", path_text(app_dir() / "obs-config").c_str(), nullptr)) throw std::runtime_error("OBS initialization failed");
         initialized = true;
@@ -199,6 +202,8 @@ public:
             throw std::runtime_error(std::string("Recording failed: ") + (reason ? reason : "encoder/output initialization failed; see recorder.log"));
         }
         started = now_ms(); message = "Recording";
+        // The session's wall-clock origin: its segments chain from here by frame count.
+        buffer.anchor(path_text(session_dir.filename()), started);
         hotkey_registered = RegisterHotKey(window, 1, cfg.modifiers | MOD_NOREPEAT, cfg.hotkey) != FALSE;
     }
     // Session end: release everything the session created and go idle.
@@ -268,61 +273,36 @@ public:
         write_json(job.folder / "request.json", d.get());
         pinned.clear(); waiting_save = false; pending_last.clear(); start_job(std::move(job));
     }
-    void share() {
-        if (busy() || last_clip.empty()) { message = "Save a clip first, then export it."; return; }
-        wchar_t found[32768];
-        if (!SearchPathW(nullptr, L"ffmpeg.exe", nullptr, 32768, found, nullptr)) { message = "Share export requires ffmpeg.exe on PATH."; return; }
-        fs::path ffmpeg(found), input = fs::path(wide(last_clip));
-        auto target = input.parent_path() / (input.stem().wstring() + L"-share-" + wide(unique_id()) + L".mp4");
-        int bitrate = cfg.share_bitrate; message = "Exporting H.264 share copy...";
-        worker = std::async(std::launch::async, [ffmpeg, input, target, bitrate] {
-            auto temp = target; temp += L".partial";
-            auto log = target; log += L".log";
-            auto code = run_process(ffmpeg, {L"-nostdin", L"-hide_banner", L"-y", L"-i", input.wstring(), L"-map", L"0:v:0", L"-map", L"0:a?",
-                L"-c:v", L"h264_nvenc", L"-preset", L"p4", L"-b:v", std::to_wstring(bitrate) + L"k", L"-maxrate", std::to_wstring(bitrate * 12 / 10) + L"k",
-                L"-bufsize", std::to_wstring(bitrate * 2) + L"k", L"-c:a", L"aac", L"-b:a", L"192k", L"-movflags", L"+faststart", L"-f", L"mp4", temp.wstring()}, log);
-            if (code) throw std::runtime_error("Share export failed. See " + path_text(log));
-            inspect_media(temp);
-            if (!flush_closed(temp) || !MoveFileExW(temp.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH)) throw std::runtime_error("Cannot publish share export");
-            return path_text(target);
-        });
-    }
     void pin(std::int64_t start_ms, std::int64_t end_ms) {
         pin_start = start_ms; pin_end = end_ms; pin_at = (start_ms || end_ms) ? now_ms() : 0;
     }
     std::vector<Span> spans() const {
         std::vector<Span> result;
-        for (auto& s : buffer.segments()) result.push_back({s.path, s.session, s.end_ms - (std::int64_t)std::llround(s.seconds * 1000), s.end_ms});
+        for (auto& s : buffer.segments()) result.push_back({s.path, s.session, s.start_ms, s.end_ms});
         return result;
     }
-    // Export a range of the buffer as a re-encoded clip through ffmpeg.exe.
+    // Export a range of the buffer as a re-encoded clip through the linked
+    // FFmpeg libraries. Sources are hard-linked so expiry cannot remove them.
     void export_clip() {
         if (busy()) { message = "A save or export is already in progress."; return; }
         auto request = read_export_request(app_dir() / "export-request.json");
         if (request.end_ms - request.start_ms < 100) { message = "Mark a range of at least 0.1 s."; return; }
         auto sources = spans_in_range(spans(), request.start_ms, request.end_ms);
         if (sources.empty()) { message = "The range has no closed footage, or crosses a Stop/Record boundary."; return; }
-        wchar_t found[32768];
-        if (!SearchPathW(nullptr, L"ffmpeg.exe", nullptr, 32768, found, nullptr)) { message = "Export requires ffmpeg.exe on PATH."; return; }
-        fs::path ffmpeg(found);
         auto id = "export-" + unique_id(); auto folder = cfg.storage / "pending" / id;
         std::vector<fs::path> paths; for (auto& s : sources) paths.push_back(s.path);
         auto linked = buffer.protect(paths, folder);
-        std::string list; for (auto& p : linked) list += "file '" + path_text(p) + "'\n";
-        atomic_write(folder / "list.txt", list);
-        auto name = clip_name(request.start_ms); auto output = cfg.storage / "clips" / (name + ".mp4");
-        for (int n = 2; fs::exists(output); ++n) output = cfg.storage / "clips" / (name + "-" + std::to_string(n) + ".mp4");
-        auto temp = output; temp += L".partial"; auto log = folder / "ffmpeg.log";
-        export_progress_file = folder / "progress.txt"; export_duration_ms = request.end_ms - request.start_ms; export_fraction = 0;
-        auto args = export_args(request, sources.front().start_ms, folder / "list.txt", export_progress_file, temp);
+        for (size_t i = 0; i < sources.size(); ++i) sources[i].path = linked[i];
+        auto name = clip_name(request.start_ms); auto target = cfg.storage / "clips" / (name + ".mp4");
+        for (int n = 2; fs::exists(target); ++n) target = cfg.storage / "clips" / (name + "-" + std::to_string(n) + ".mp4");
+        export_progress = std::make_shared<std::atomic<double>>(0.0); export_fraction = 0;
         message = "Exporting clip...";
-        worker = std::async(std::launch::async, [ffmpeg, args, log, temp, output, folder] {
-            auto code = run_process(ffmpeg, args, log, 30 * 60 * 1000);
-            if (code) throw std::runtime_error("Export failed. See " + path_text(log));
-            inspect_media(temp);
-            if (!flush_closed(temp) || !MoveFileExW(temp.c_str(), output.c_str(), MOVEFILE_WRITE_THROUGH)) throw std::runtime_error("Cannot publish exported clip");
+        auto progress = export_progress;
+        worker = std::async(std::launch::async, [sources, request, target, folder, progress] {
+            auto result = clip::export_clip(sources, request, target, progress.get());
+            blog(LOG_INFO, "Frinky Clip: exported %lld frames with %s from %s", (long long)result.frames, result.video_encoder.c_str(), result.decoder.c_str());
             std::error_code ec; fs::remove_all(folder, ec);
-            return path_text(output);
+            return path_text(target);
         });
     }
     void stop() {
@@ -393,20 +373,19 @@ public:
         }
         if (waiting_save && std::any_of(buffer.segments().begin(), buffer.segments().end(), [&](auto& s) { return s.path == pending_last; })) begin_save();
         if (worker.valid() && worker.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-            try { last_clip = worker.get(); message = (export_progress_file.empty() ? "Saved " : "Exported ") + path_text(fs::path(wide(last_clip)).filename()); }
-            catch (const std::exception& e) { failure = e.what(); message = "Save failed; protected footage has been retained."; }
-            export_fraction = -1; export_progress_file.clear();
+            try { last_clip = worker.get(); message = (export_progress ? "Exported " : "Saved ") + path_text(fs::path(wide(last_clip)).filename()); }
+            catch (const std::exception& e) { failure = e.what(); message = export_progress ? "Export failed; the buffer footage is retained." : "Save failed; protected footage has been retained."; }
+            export_fraction = -1; export_progress.reset();
         }
         if (!worker.valid() && !waiting_save && !recovered_jobs.empty()) { auto job = std::move(recovered_jobs.front()); recovered_jobs.pop_front(); start_job(std::move(job)); }
-        if (worker.valid() && !export_progress_file.empty()) {
-            if (auto fraction = export_progress(read_text(export_progress_file), export_duration_ms)) {
-                export_fraction = *fraction; message = "Exporting clip... " + std::to_string((int)std::lround(*fraction * 100)) + "%";
-            }
+        if (worker.valid() && export_progress) {
+            double fraction = export_progress->load();
+            if (fraction != export_fraction) { export_fraction = fraction; message = "Exporting clip... " + std::to_string((int)std::lround(fraction * 100)) + "%"; }
         }
         std::set<fs::path> protected_set(pinned.begin(), pinned.end());
         // The editor's view and marked range stay until the pin goes stale.
         if (pin_at && now_ms() - pin_at < 15000)
-            for (auto& s : buffer.segments()) if (s.end_ms > pin_start && s.end_ms - s.seconds * 1000 < pin_end) protected_set.insert(s.path);
+            for (auto& s : buffer.segments()) if (s.end_ms > pin_start && s.start_ms < pin_end) protected_set.insert(s.path);
         buffer.prune(protected_set);
         if (recording()) {
             frame_count = obs_output_get_total_frames(output); lagged_frames = obs_get_lagged_frames();
@@ -454,7 +433,6 @@ LRESULT CALLBACK recorder_proc(HWND window, UINT msg, WPARAM w, LPARAM l) {
         if (msg == StopMessage) { r->stop(); r->status(); return 0; }
         if (msg == ResumeMessage) { r->resume(); r->status(); return 0; }
         if (msg == ExitMessage || msg == WM_CLOSE || msg == WM_ENDSESSION) { r->exit(); r->status(); return 0; }
-        if (msg == ShareMessage) { r->share(); return 0; }
         if (msg == PinMessage) { r->pin((std::int64_t)w, (std::int64_t)l); return 0; }
         if (msg == ExportMessage) { r->export_clip(); r->status(); return 0; }
         if (msg == WM_TIMER || msg == WakeMessage) { r->tick(); return 0; }

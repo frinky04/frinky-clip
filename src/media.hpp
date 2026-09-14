@@ -8,6 +8,12 @@ struct AVBufferRef; struct AVCodecContext; struct AVCodec; struct AVFrame; struc
 namespace clip {
 struct MediaInfo { double seconds = 0; int width = 0, height = 0; bool audio = false; };
 MediaInfo inspect_media(const fs::path& path);
+void av_check(int code, const char* context); // Throws with the FFmpeg error text when code < 0.
+// The video track's extent, counted from its packets without decoding: the
+// exact number of frames and the frame rate. Segment timelines chain on this
+// rather than on the container duration, which includes the audio tail.
+struct VideoExtent { std::int64_t frames = 0; int fps_num = 60, fps_den = 1; };
+VideoExtent probe_video(const fs::path& path);
 void remux(const std::vector<fs::path>& segments, const fs::path& destination);
 // A D3D11VA decode device shared by decoders. Wrapping the render device lets
 // decoded frames be sampled directly as shader resources; a private device

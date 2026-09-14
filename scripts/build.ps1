@@ -1,4 +1,4 @@
-param([string]$ObsRoot = 'C:\Program Files\obs-studio', [switch]$Launch)
+param([string]$ObsRoot = 'C:\Program Files\obs-studio', [switch]$Launch, [switch]$Package)
 $ErrorActionPreference = 'Stop'
 $clipTaskRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $clipTaskRoot
@@ -16,11 +16,26 @@ foreach ($clipTaskRepo in $clipTaskRepos) {
     if ($LASTEXITCODE) { throw 'Dependency checkout failed.' }
   }
 }
+# A package is assembled from a fresh output folder so it holds exactly what the build stages.
+if ($Package -and (Test-Path -LiteralPath 'build/bin/Release')) { Remove-Item -LiteralPath 'build/bin/Release' -Recurse -Force }
 & cmake -S . -B build -G 'Visual Studio 18 2026' -A x64 "-DOBS_ROOT=$($ObsRoot.Replace('\','/'))"
 if ($LASTEXITCODE) { throw 'CMake configuration failed.' }
 & cmake --build build --config Release --parallel
 if ($LASTEXITCODE) { throw 'Build failed.' }
 & ctest --test-dir build -C Release --output-on-failure
 if ($LASTEXITCODE) { throw 'Tests failed.' }
+if ($Package) {
+  $version = (Select-String -LiteralPath 'CMakeLists.txt' -Pattern 'project\(FrinkyClip VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+  $name = "frinky-clip-$version-win64"
+  $stage = Join-Path $clipTaskRoot "dist/$name"
+  if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+  New-Item -ItemType Directory -Path $stage | Out-Null
+  Copy-Item -Path 'build/bin/Release/*' -Destination $stage -Recurse
+  Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $_.Extension -eq '.pdb' -or $_.Name -eq 'clip-tests.exe' } | Remove-Item -Force
+  $zip = Join-Path $clipTaskRoot "dist/$name.zip"
+  if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+  Compress-Archive -Path "$stage/*" -DestinationPath $zip
+  $size = [math]::Round((Get-Item -LiteralPath $zip).Length / 1MB, 1)
+  Write-Host "Packaged $zip ($size MB)"
+}
 if ($Launch) { Start-Process -FilePath "$clipTaskRoot\build\bin\Release\frinky-clip.exe" -WindowStyle Hidden }
-

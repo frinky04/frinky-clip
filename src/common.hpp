@@ -24,8 +24,6 @@ bool flush_closed(const fs::path& path);
 Data read_json(const fs::path& path);
 void write_json(const fs::path& path, obs_data_t* value);
 std::wstring quote_arg(const std::wstring& arg);
-DWORD run_process(const fs::path& exe, const std::vector<std::wstring>& args, const fs::path& log, DWORD timeout_ms = 300000);
-void launch(const std::vector<std::wstring>& args);
 
 struct Config {
     int bitrate = 40000;
@@ -51,7 +49,6 @@ struct Config {
 constexpr wchar_t RecorderClass[] = L"FrinkyClip.Recorder.0.1";
 constexpr UINT SaveMessage = WM_APP + 1;
 constexpr UINT StopMessage = WM_APP + 2;
-constexpr UINT ShareMessage = WM_APP + 3;
 constexpr UINT TrayMessage = WM_APP + 4;
 constexpr UINT ResumeMessage = WM_APP + 7; // Recorder: start a capture session in the warm process.
 constexpr UINT ExitMessage = WM_APP + 8;   // Recorder: stop capture, finish saves, and exit.

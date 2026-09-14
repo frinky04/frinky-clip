@@ -16,7 +16,7 @@ extern "C" {
 #include <cmath>
 
 namespace clip {
-static void check(int code, const char* context) {
+void av_check(int code, const char* context) {
     if (code >= 0) return;
     char message[AV_ERROR_MAX_STRING_SIZE]; av_strerror(code, message, sizeof(message));
     throw std::runtime_error(std::string(context) + ": " + message);
@@ -37,10 +37,10 @@ struct Input {
     AVFormatContext* value = nullptr;
     // `probe` forces the stream-info pass, which inspect_media needs for durations.
     explicit Input(const fs::path& p, bool probe = true) {
-        check(avformat_open_input(&value, path_text(p).c_str(), nullptr, nullptr), "Open recording");
+        av_check(avformat_open_input(&value, path_text(p).c_str(), nullptr, nullptr), "Open recording");
         if (probe || !headers_complete(value)) {
             int result = avformat_find_stream_info(value, nullptr);
-            if (result < 0) { avformat_close_input(&value); check(result, "Read recording streams"); }
+            if (result < 0) { avformat_close_input(&value); av_check(result, "Read recording streams"); }
         }
     }
     ~Input() { avformat_close_input(&value); }
@@ -62,22 +62,48 @@ MediaInfo inspect_media(const fs::path& p) {
     if (!info.width || !std::isfinite(info.seconds) || info.seconds <= 0) throw std::runtime_error("Recording has no complete video duration: " + path_text(p));
     return info;
 }
+VideoExtent probe_video(const fs::path& p) {
+    Input in(p, false); int index = -1;
+    for (unsigned i = 0; i < in.value->nb_streams; ++i) if (in.value->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { index = (int)i; break; }
+    if (index < 0) throw std::runtime_error("No video stream: " + path_text(p));
+    auto* stream = in.value->streams[index]; VideoExtent extent;
+    AVRational rate = stream->avg_frame_rate.num > 0 ? stream->avg_frame_rate : stream->r_frame_rate;
+    AVPacket* packet = av_packet_alloc(); std::int64_t first = AV_NOPTS_VALUE, last = AV_NOPTS_VALUE;
+    int result;
+    while ((result = av_read_frame(in.value, packet)) >= 0) {
+        if (packet->stream_index == index) {
+            ++extent.frames;
+            if (packet->pts != AV_NOPTS_VALUE) { if (first == AV_NOPTS_VALUE) first = packet->pts; last = packet->pts; }
+        }
+        av_packet_unref(packet);
+    }
+    av_packet_free(&packet);
+    if (result != AVERROR_EOF) av_check(result, "Read segment");
+    if (!extent.frames) throw std::runtime_error("Recording has no video frames: " + path_text(p));
+    if (rate.num > 0 && rate.den > 0) { extent.fps_num = rate.num; extent.fps_den = rate.den; }
+    else if (extent.frames > 1 && first != AV_NOPTS_VALUE && last > first) {
+        // No declared rate: derive it from the packet spacing.
+        auto span_us = av_rescale_q(last - first, stream->time_base, AVRational{1, 1000000});
+        extent.fps_num = (int)std::lround((extent.frames - 1) * 1000000.0 / (double)span_us); extent.fps_den = 1;
+    }
+    return extent;
+}
 void remux(const std::vector<fs::path>& segments, const fs::path& destination) {
     if (segments.empty()) throw std::runtime_error("No completed footage to save");
     fs::create_directories(destination.parent_path());
     fs::path temp = destination; temp += L".partial";
     AVFormatContext* out = nullptr;
-    check(avformat_alloc_output_context2(&out, nullptr, "mp4", path_text(temp).c_str()), "Create clip");
+    av_check(avformat_alloc_output_context2(&out, nullptr, "mp4", path_text(temp).c_str()), "Create clip");
     AVPacket* packet = av_packet_alloc();
     try {
         Input first(segments.front());
         for (unsigned i = 0; i < first.value->nb_streams; ++i) {
             auto* stream = avformat_new_stream(out, nullptr); if (!stream) throw std::bad_alloc();
-            check(avcodec_parameters_copy(stream->codecpar, first.value->streams[i]->codecpar), "Copy stream settings");
+            av_check(avcodec_parameters_copy(stream->codecpar, first.value->streams[i]->codecpar), "Copy stream settings");
             stream->codecpar->codec_tag = 0; stream->time_base = first.value->streams[i]->time_base;
         }
-        check(avio_open(&out->pb, path_text(temp).c_str(), AVIO_FLAG_WRITE), "Open clip output");
-        check(avformat_write_header(out, nullptr), "Write clip header");
+        av_check(avio_open(&out->pb, path_text(temp).c_str(), AVIO_FLAG_WRITE), "Open clip output");
+        av_check(avformat_write_header(out, nullptr), "Write clip header");
         // Each OBS segment resets each track's timestamps. Continue tracks at
         // their own previous end to avoid accumulating AAC rounding gaps.
         std::vector<int64_t> next(out->nb_streams, 0);
@@ -103,12 +129,12 @@ void remux(const std::vector<fs::path>& segments, const fs::path& destination) {
                     packet->duration = av_rescale_q(1, AVRational{1, 60}, target->time_base);
                 next[index] = std::max(next[index], packet->dts + std::max<int64_t>(1, packet->duration));
                 packet->pos = -1;
-                check(av_interleaved_write_frame(out, packet), "Write clip packet");
+                av_check(av_interleaved_write_frame(out, packet), "Write clip packet");
             }
-            if (read_result != AVERROR_EOF) check(read_result, "Read segment");
+            if (read_result != AVERROR_EOF) av_check(read_result, "Read segment");
         }
-        check(av_write_trailer(out), "Finish clip");
-        check(avio_closep(&out->pb), "Close clip");
+        av_check(av_write_trailer(out), "Finish clip");
+        av_check(avio_closep(&out->pb), "Close clip");
         av_packet_free(&packet); avformat_free_context(out); out = nullptr;
         inspect_media(temp);
         if (!flush_closed(temp)) throw std::runtime_error("Could not flush completed clip to disk");
@@ -190,11 +216,11 @@ struct Decoder::State {
         bool hardware = hw && !hw_failed; const AVCodec* codec = pick_decoder(par->codec_id, hardware);
         if (!codec) throw std::runtime_error("No decoder for the recording's video codec");
         ctx = avcodec_alloc_context3(codec); if (!ctx) throw std::bad_alloc();
-        check(avcodec_parameters_to_context(ctx, par), "Configure decoder");
+        av_check(avcodec_parameters_to_context(ctx, par), "Configure decoder");
         // Hardware decoding runs asynchronously on the GPU; frame threads only add per-thread setup.
         ctx->thread_count = hardware ? 1 : 0;
         if (hardware) { binding = {hw, false, 16}; ctx->opaque = &binding; ctx->get_format = hw_get_format; }
-        check(avcodec_open2(ctx, codec, nullptr), "Open decoder");
+        av_check(avcodec_open2(ctx, codec, nullptr), "Open decoder");
         codec_id = par->codec_id; width = par->width; height = par->height;
         extradata.assign(par->extradata, par->extradata + par->extradata_size);
     }
@@ -247,7 +273,7 @@ Frame decode_with(Decoder::State* s_, const fs::path& p, std::int64_t offset_ms,
     }
     if (!have) throw std::runtime_error("No decodable frame at that position");
     AVFrame* picture = best;
-    if (best->format == AV_PIX_FMT_D3D11) { av_frame_unref(s_->cpu); check(av_hwframe_transfer_data(s_->cpu, best, 0), "Download decoded frame"); picture = s_->cpu; }
+    if (best->format == AV_PIX_FMT_D3D11) { av_frame_unref(s_->cpu); av_check(av_hwframe_transfer_data(s_->cpu, best, 0), "Download decoded frame"); picture = s_->cpu; }
     int height = std::max(1, (int)std::lround((double)picture->height * width / std::max(1, picture->width)));
     if (!s_->sws || s_->sws_w != width || s_->sws_h != height || s_->sws_src_w != picture->width || s_->sws_src_h != picture->height || s_->sws_fmt != picture->format) {
         sws_freeContext(s_->sws);

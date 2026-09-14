@@ -260,11 +260,11 @@ int run_ui() {
         view_end_ms = std::clamp(view_end_ms, oldest + (std::int64_t)(view_seconds * 1000), now);
         std::int64_t view_start_ms = view_end_ms - (std::int64_t)(view_seconds * 1000);
         bool have_range = in_ms && out_ms && out_ms > in_ms;
-        // Contiguous footage runs: consecutive segments merge across their
-        // millisecond seams so coverage and thumbnails have no hairline gaps.
+        // Contiguous footage runs: segments of a session chain exactly, so a
+        // run is a sequence of spans that meet end to start.
         std::vector<std::pair<std::int64_t, std::int64_t>> runs;
         for (auto& s : map.spans) {
-            if (!runs.empty() && s.start_ms - runs.back().second < 400 && s.start_ms >= runs.back().first) runs.back().second = std::max(runs.back().second, s.end_ms);
+            if (!runs.empty() && std::llabs(s.start_ms - runs.back().second) <= 1) runs.back().second = std::max(runs.back().second, s.end_ms);
             else runs.emplace_back(s.start_ms, s.end_ms);
         }
         auto accent_u32 = ImGui::ColorConvertFloat4ToU32(accent), muted_u32 = ImGui::ColorConvertFloat4ToU32(muted);

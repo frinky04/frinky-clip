@@ -306,7 +306,7 @@ void Player::work() {
             lock.lock(); error_ = "Cannot decode this segment."; playing_ = false; continue;
         } else if (src.pending.empty()) {
             // End of this segment: continue into the next one when contiguous.
-            if (index + 1 < spans.size() && spans[index + 1].start_ms - src.span.end_ms < 400) {
+            if (index + 1 < spans.size() && std::llabs(spans[index + 1].start_ms - src.span.end_ms) <= 1) {
                 ++index; open_ok = open(src, spans[index], 0);
                 lock.lock(); if (!open_ok) { error_ = "Cannot decode the next segment."; playing_ = false; } continue;
             }
@@ -413,7 +413,7 @@ int player_test(const fs::path& buffer_root, int play_seconds) {
         if (map.spans.empty()) { atomic_write(app_dir() / "player-test.txt", report.str() + "No closed segments\n"); return 1; }
         // Start in a segment that has a contiguous successor, a few from the end.
         size_t pick = map.spans.size() > 8 ? map.spans.size() - 8 : 0;
-        while (pick + 1 < map.spans.size() && map.spans[pick + 1].start_ms - map.spans[pick].end_ms >= 400) ++pick;
+        while (pick + 1 < map.spans.size() && std::llabs(map.spans[pick + 1].start_ms - map.spans[pick].end_ms) > 1) ++pick;
         auto& last = map.spans[pick];
         auto priv = hw_device(nullptr);
         report << "render device: " << adapter_name(device) << "\n";
