@@ -1005,7 +1005,7 @@ int run_ui(int resume_recording, bool start_hidden) {
                 ImGui::EndDisabled();
                 row("");
                 const char* action = app.updating() ? "Restarting..." : update.working ? (update.available ? "Downloading..." : "Checking...")
-                    : update.ready ? "Restart" : update.available ? "Download" : "Check for updates";
+                    : update.ready ? "Restart" : update.available ? "Download" : "Check";
                 ImGui::BeginDisabled(!update.installed || update.working || app.quitting() || (update.ready && !app.paused() && !app.recording()));
                 // Keep the same item identity and width through every update state.
                 if (ImGui::Button((std::string(action) + "###update-action").c_str(), ImVec2(152 * dpi, 0))) {
