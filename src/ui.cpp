@@ -316,12 +316,14 @@ int run_ui() {
             if (img_w > w) { img_w = w; img_h = std::floor(img_w * 9 / 16); }
             player.set_width((int)std::min(img_w * 2, 1920.f)); // Decode at up to 2x for crisp scaling.
             auto picture = player.tick();
-            // While scrubbing, the nearest cached keyframe follows the mouse at
-            // once; the exact frame lands when the drag ends.
-            if (scrubbing) {
-                if (auto* s = span_at(scrub_ms)) {
-                    auto key = thumbs.keyframe(s->path, scrub_ms - s->start_ms, (int)img_w);
-                    if (key.texture) picture = {key.texture, key.width, key.height, scrub_ms};
+            // While scrubbing or seeking, the keyframe at the target shows at
+            // once (from the cache when it has been seen); the exact frame
+            // replaces it when the decoder lands there.
+            std::int64_t preview_ms = scrubbing ? scrub_ms : (player.busy() && !player.playing()) ? player.position() : 0;
+            if (preview_ms) {
+                if (auto* s = span_at(preview_ms)) {
+                    auto key = thumbs.keyframe(s->path, preview_ms - s->start_ms, (int)img_w);
+                    if (key.texture) picture = {key.texture, key.width, key.height, preview_ms};
                 }
             }
             float x = p.x + (w - img_w) / 2, y = p.y + (h - img_h) / 2;
@@ -383,13 +385,26 @@ int run_ui() {
             }
             // Filmstrip: thumbnails tile each run of footage edge to edge, one
             // keyframe per tile, so the lane is full at every zoom level.
+            // Tiles align to absolute time, not to the run's start, so expiry
+            // of the oldest footage does not move every tile.
             if (!runs.empty()) {
                 float thumb_h = video_h - 2 * dpi, thumb_w = std::floor(thumb_h * 16 / 9);
                 std::int64_t tile_ms = std::max<std::int64_t>(500, (std::int64_t)(thumb_w / px_per_ms));
                 draw->PushClipRect(ImVec2(track_x, video_y), ImVec2(track_x + track_w, video_y + video_h), true);
                 for (auto& run : runs) {
                     if (run.second < view_start_ms || run.first > view_end_ms) continue;
-                    std::int64_t first = run.first + std::max<std::int64_t>(0, (view_start_ms - run.first) / tile_ms) * tile_ms;
+                    std::int64_t first = std::max(run.first, view_start_ms) / tile_ms * tile_ms;
+                    if (first + tile_ms <= run.first) first += tile_ms;
+                    if (first < run.first) { // The run's leading partial tile starts at the run.
+                        auto* s = span_at(run.first);
+                        auto picture = s ? thumbs.keyframe(s->path, 0, (int)thumb_w) : Thumbnails::Picture{};
+                        if (picture.texture) {
+                            float x = x_of(run.first), x1 = std::min(x_of(first + tile_ms), x_of(run.second));
+                            float ph = std::min(thumb_h, thumb_w * picture.height / std::max(1, picture.width));
+                            draw->AddImage(picture.texture, ImVec2(x, video_y + 1 * dpi), ImVec2(x1, video_y + 1 * dpi + ph), ImVec2(0, 0), ImVec2((x1 - x) / thumb_w, 1));
+                        }
+                        first += tile_ms;
+                    }
                     for (std::int64_t t = first; t < run.second && t <= view_end_ms; t += tile_ms) {
                         auto* s = span_at(t); if (!s) continue;
                         auto picture = thumbs.keyframe(s->path, t - s->start_ms, (int)thumb_w);
@@ -612,7 +627,8 @@ int run_ui() {
             }
             ImGui::TextDisabled("Missed frames: %lld render / %lld encode", obs_data_get_int(status.get(), "lagged_frames"), obs_data_get_int(status.get(), "skipped_frames"));
             help("Cumulative recorder misses for the last reported session. These do not measure the game's FPS impact.");
-            ImGui::TextDisabled("Closed segments: %zu | last thumbnail decode %.0f ms | player decode: %s", map.spans.size(), thumbs.last_decode_ms(), player.hardware() ? "D3D11VA" : "software");
+            ImGui::TextDisabled("Closed segments: %zu | thumbnails: %llu decoded, %zu cached, last %.0f ms | player decode: %s", map.spans.size(),
+                (unsigned long long)thumbs.decodes(), thumbs.cached(), thumbs.last_decode_ms(), player.hardware() ? "D3D11VA" : "software");
             if (!settings_error.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, rgb(0xf0a399));
                 ImGui::TextWrapped("Not saved: %s", settings_error.c_str()); ImGui::PopStyleColor();

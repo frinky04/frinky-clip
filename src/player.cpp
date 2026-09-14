@@ -90,9 +90,11 @@ struct Player::Source {
     HwBinding binding;
     std::vector<std::uint8_t> pending; // Converted audio not yet accepted by the device.
     size_t pending_offset = 0;
-    void close() {
+    bool video_hw = false; // Whether the kept video decoder is the hardware one.
+    void close(bool keep_video = false) {
         sws_freeContext(sws); sws = nullptr; swr_free(&swr);
-        avcodec_free_context(&video); avcodec_free_context(&audio); avformat_close_input(&fmt);
+        if (!keep_video) avcodec_free_context(&video);
+        avcodec_free_context(&audio); avformat_close_input(&fmt);
         vindex = aindex = -1; eof = drained = failed = false; last_video_ms = -1; pending.clear(); pending_offset = 0;
     }
     ~Source() { close(); av_packet_free(&packet); av_frame_free(&frame); }
@@ -146,15 +148,22 @@ bool Player::reposition(Source& src, std::int64_t offset_ms) {
     return true;
 }
 bool Player::open(Source& src, const Span& span, std::int64_t offset_ms) {
-    src.close(); src.span = span;
-    if (!open_without_probe(&src.fmt, span.path)) return false;
-    for (unsigned i = 0; i < src.fmt->nb_streams; ++i) {
-        auto* par = src.fmt->streams[i]->codecpar;
-        if (par->codec_type == AVMEDIA_TYPE_VIDEO && src.vindex < 0) src.vindex = (int)i;
-        if (par->codec_type == AVMEDIA_TYPE_AUDIO && src.aindex < 0) src.aindex = (int)i;
+    AVFormatContext* fmt = nullptr; int vindex = -1, aindex = -1;
+    if (!open_without_probe(&fmt, span.path)) { src.close(); return false; }
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        auto* par = fmt->streams[i]->codecpar;
+        if (par->codec_type == AVMEDIA_TYPE_VIDEO && vindex < 0) vindex = (int)i;
+        if (par->codec_type == AVMEDIA_TYPE_AUDIO && aindex < 0) aindex = (int)i;
     }
-    if (src.vindex < 0) return false;
+    if (vindex < 0) { avformat_close_input(&fmt); src.close(); return false; }
     bool hardware = hw_ && hw_ok_;
+    // Segments of a session share stream parameters: keep the video decoder
+    // and its surface pool, since rebuilding them costs tens of milliseconds
+    // at every seek and segment hand-off.
+    auto* vpar = fmt->streams[vindex]->codecpar;
+    bool reuse = src.video && src.video_hw == hardware && src.video->codec_id == vpar->codec_id && src.video->width == vpar->width && src.video->height == vpar->height &&
+        src.video->extradata_size == vpar->extradata_size && (vpar->extradata_size == 0 || memcmp(src.video->extradata, vpar->extradata, vpar->extradata_size) == 0);
+    src.close(reuse); src.span = span; src.fmt = fmt; src.vindex = vindex; src.aindex = aindex;
     auto make = [&](int index, AVCodecContext*& ctx, bool video) {
         auto* par = src.fmt->streams[index]->codecpar; const AVCodec* codec = pick_decoder(par->codec_id, video && hardware);
         if (!codec || !(ctx = avcodec_alloc_context3(codec)) || avcodec_parameters_to_context(ctx, par) < 0) return false;
@@ -162,7 +171,9 @@ bool Player::open(Source& src, const Span& span, std::int64_t offset_ms) {
         if (video && hardware) { src.binding = {hw_, true, (int)QueueFrames + 16}; ctx->opaque = &src.binding; ctx->get_format = hw_get_format; }
         return avcodec_open2(ctx, codec, nullptr) >= 0;
     };
-    if (!make(src.vindex, src.video, true)) return false;
+    if (reuse) avcodec_flush_buffers(src.video);
+    else if (!make(src.vindex, src.video, true)) return false;
+    src.video_hw = hardware;
     if (src.aindex >= 0 && audio_ && !make(src.aindex, src.audio, false)) { avcodec_free_context(&src.audio); src.aindex = -1; }
     if (src.audio) {
         AVChannelLayout out{}; av_channel_layout_default(&out, audio_->format->nChannels);
@@ -493,6 +504,30 @@ int player_test(const fs::path& buffer_root, int play_seconds) {
         auto [back_ms, back] = wait_seek(at - 1000);
         report << "seek back one second to " << local_time(at - 1000, true) << ": " << back_ms << " ms, frame " << (back.texture ? local_time(back.ms, true) : "none") << "\n";
         if (!stepped.texture || !back.texture) ++failures;
+        // Thumbnail cache: tiles at two spacings over three segments resolve
+        // to the same keyframes, so the second pass must decode nothing.
+        {
+            Thumbnails thumbs(device);
+            auto tiles = [&](std::int64_t tile_ms) {
+                int missing = 0;
+                for (int pass = 0; pass < 600; ++pass) {
+                    missing = 0;
+                    for (size_t i = pick; i < std::min(map.spans.size(), pick + 3); ++i)
+                        for (std::int64_t t = map.spans[i].start_ms / tile_ms * tile_ms; t < map.spans[i].end_ms; t += tile_ms) {
+                            if (t < map.spans[i].start_ms) continue;
+                            if (!thumbs.keyframe(map.spans[i].path, t - map.spans[i].start_ms, 160).texture) ++missing;
+                        }
+                    thumbs.tick(); if (!missing) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                return missing;
+            };
+            auto began = ms(); int first_missing = tiles(700); auto first_ms = ms() - began; auto first_decodes = thumbs.decodes();
+            began = ms(); int second_missing = tiles(1300); auto second_ms = ms() - began; auto second_decodes = thumbs.decodes() - first_decodes;
+            report << "thumbnails: first spacing " << first_decodes << " decodes in " << first_ms << " ms, second spacing " << second_decodes
+                << " decodes in " << second_ms << " ms, " << thumbs.cached() << " cached\n";
+            if (first_missing || second_missing || second_decodes) ++failures;
+        }
     }
     context->Release(); device->Release();
     report << (failures ? "FAIL\n" : "PASS\n");
