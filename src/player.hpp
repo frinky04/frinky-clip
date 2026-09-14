@@ -33,7 +33,8 @@ public:
     void set_width(int pixels) { width_ = pixels; }
     struct Picture { ImTextureID texture = 0; int width = 0, height = 0; std::int64_t ms = 0; };
     Picture tick(); // Main thread: present the frame due now.
-    bool busy() const { return playing_ || pending_seek_; }
+    bool busy() const { return playing_ || pending_seek_ || seeking_; }
+    bool seeking() const { return pending_seek_ || seeking_; } // Catching up to a seek target.
     bool hardware() const { return hardware_; }
     std::string error() const { std::lock_guard lock(mutex_); return error_; }
 private:
@@ -59,7 +60,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable wake_, space_;
     std::thread worker_;
-    std::atomic<bool> stop_{false}, playing_{false}, pending_seek_{false}, seek_result_{false}, resumable_{false}, hardware_{false};
+    std::atomic<bool> stop_{false}, playing_{false}, pending_seek_{false}, seeking_{false}, seek_result_{false}, resumable_{false}, hardware_{false};
     bool hw_ok_ = true; // Cleared when the native decoder cannot use the device.
     std::atomic<int> width_{640};
     std::atomic<std::int64_t> position_{0}, end_ms_{0}, seek_target_{0};

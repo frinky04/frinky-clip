@@ -119,7 +119,9 @@ Player::~Player() {
 }
 void Player::set_spans(std::vector<Span> spans) { std::lock_guard lock(mutex_); spans_ = std::move(spans); }
 void Player::seek(std::int64_t ms) {
-    seek_target_ = ms; pending_seek_ = true; playing_ = false; resumable_ = false; ++generation_;
+    // The playhead moves now; the picture catches up. Like netcode: the
+    // UI state is authoritative and the decoder converges on it.
+    seek_target_ = ms; position_ = ms; pending_seek_ = true; seeking_ = true; playing_ = false; resumable_ = false; ++generation_;
     wake_.notify_all(); space_.notify_all();
 }
 void Player::play() {
@@ -257,6 +259,7 @@ void Player::work() {
                 ready_.erase(ready_.begin(), queued); position_ = ready_.front().ms; seek_result_ = true; error_.clear();
                 if (audio_) audio_->reset();
                 if (resume) { clock_media_ = position_.load(); clock_wall_ = steady_ms(); }
+                if (generation_ == gen) seeking_ = false;
                 continue;
             }
             lock.unlock();
@@ -275,7 +278,12 @@ void Player::work() {
                 else {
                     Decoded frame; bool have = false;
                     for (int attempt = 0; attempt < 2 && !have; ++attempt) {
-                        while (!stop_ && generation_ == gen && step(src, &frame, false)) { if (frame.ms + 8 >= target) { have = true; break; } }
+                        while (!stop_ && generation_ == gen && step(src, &frame, false)) {
+                            if (frame.ms + 8 >= target) { have = true; break; }
+                            // Show the frames on the way when paused, so the
+                            // seek reads as motion toward the target.
+                            if (!resume && frame.ms >= 0) { std::lock_guard guard(mutex_); ready_.clear(); ready_.push_back(std::move(frame)); seek_result_ = true; frame = Decoded(); }
+                        }
                         // The native decoder could not use the device: reopen in software, once.
                         if (!have && src.failed && hw_ok_) { hw_ok_ = false; open_ok = open(src, *it, target - it->start_ms); if (!open_ok) break; } else break;
                     }
@@ -286,6 +294,7 @@ void Player::work() {
             lock.lock();
             if (!problem.empty()) { error_ = problem; playing_ = false; position_ = seek_target_.load(); ready_.clear(); open_ok = false; } else error_.clear();
             if (resume && generation_ == gen && problem.empty()) { clock_media_ = position_.load(); clock_wall_ = steady_ms(); }
+            if (generation_ == gen) seeking_ = false;
             continue;
         }
         if (!playing_) {
@@ -474,10 +483,11 @@ int player_test(const fs::path& buffer_root, int play_seconds) {
         auto wait_seek = [&](std::int64_t target) {
             previous_ms = player.tick().ms;
             auto t = ms(); player.seek(target); Player::Picture picture;
-            // Done when a picture for a new time is presented, or on timeout.
+            // Done when the player has landed and presented the frame, or on
+            // timeout. Frames shown on the way do not count.
             while (ms() - t < 10000) {
                 picture = player.tick();
-                if (picture.texture && picture.ms != previous_ms) break;
+                if (!player.seeking() && picture.texture && picture.ms != previous_ms) break;
                 if (!player.busy() && !player.error().empty()) { picture = {}; break; }
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }

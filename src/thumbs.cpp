@@ -68,7 +68,22 @@ Thumbnails::Picture Thumbnails::request(Key key) {
         }
         entry.queued = true; queue_.push_back({key, false}); wake_.notify_one();
     }
-    return entry.picture;
+    if (entry.picture.texture || key.exact) return entry.picture;
+    // Not decoded yet: the nearest decoded keyframe of the same segment and
+    // width stands in, so a tile never blanks while its own picture is on
+    // the way. Keys sort by path, then offset, so neighbours are adjacent.
+    Picture best{}; std::int64_t best_distance = INT64_MAX;
+    auto consider = [&](const Key& k, const Entry& e) {
+        if (k.path != key.path || k.width != key.width || k.exact || !e.picture.texture) return;
+        auto distance = std::llabs(k.offset - key.offset);
+        if (distance < best_distance) { best_distance = distance; best = e.picture; }
+    };
+    auto it = cache_.find(key);
+    auto forward = std::next(it);
+    for (int n = 0; n < 16 && forward != cache_.end() && forward->first.path == key.path; ++n, ++forward) consider(forward->first, forward->second);
+    auto backward = it;
+    for (int n = 0; n < 16 && backward != cache_.begin(); ++n) { --backward; if (backward->first.path != key.path) break; consider(backward->first, backward->second); }
+    return best;
 }
 bool Thumbnails::busy() const { std::lock_guard lock(mutex_); return !queue_.empty() || active_ > 0; }
 void Thumbnails::work() {

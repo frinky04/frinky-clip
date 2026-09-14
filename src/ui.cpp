@@ -188,8 +188,11 @@ int run_ui() {
     // edge and its length, and following keeps that edge at now.
     std::optional<Thumbnails> thumbs_holder; thumbs_holder.emplace(device); auto& thumbs = *thumbs_holder;
     BufferMap map; std::future<BufferMap> scanning; std::int64_t last_scan = 0, last_pin = 0;
-    std::int64_t view_end_ms = now_ms(), in_ms = 0, out_ms = 0;
-    double view_seconds = 240; bool follow = true, open_settings = false, export_system = true, export_mic = false;
+    // The view has a target (what the user asked for) and a displayed value
+    // that eases toward it, so pans and zooms glide instead of jumping.
+    std::int64_t target_end_ms = now_ms(), in_ms = 0, out_ms = 0;
+    double target_seconds = 240, shown_seconds = 240, shown_end_ms = (double)target_end_ms; bool animating = false;
+    bool follow = true, open_settings = false, export_system = true, export_mic = false;
     enum class Drag { None, Press, Range, In, Out } drag = Drag::None; std::int64_t drag_anchor = 0, scrub_ms = 0; float press_x = 0; bool scrubbing = false;
     std::optional<Player> player_holder; player_holder.emplace(device, context); auto& player = *player_holder;
     const double frame_ms = 1000.0 / 60;
@@ -255,9 +258,21 @@ int run_ui() {
         // shows how much of it exists yet.
         double capacity = std::max(cfg.retention_minutes * 60.0, 10.0);
         std::int64_t oldest = now - (std::int64_t)(capacity * 1000);
-        view_seconds = std::clamp(view_seconds, 10.0, capacity);
-        if (follow) view_end_ms = now;
-        view_end_ms = std::clamp(view_end_ms, oldest + (std::int64_t)(view_seconds * 1000), now);
+        target_seconds = std::clamp(target_seconds, 10.0, capacity);
+        if (follow) target_end_ms = now;
+        target_end_ms = std::clamp(target_end_ms, oldest + (std::int64_t)(target_seconds * 1000), now);
+        {
+            // Ease the displayed view toward the target. While following, the
+            // target advances with the clock; once close it is tracked exactly
+            // so the idle loop can slow down.
+            double alpha = 1 - std::exp(-std::clamp((double)io.DeltaTime, 0.0, 0.1) / 0.08);
+            shown_seconds += (target_seconds - shown_seconds) * alpha;
+            shown_end_ms += ((double)target_end_ms - shown_end_ms) * alpha;
+            if (std::abs(shown_seconds - target_seconds) < 1e-3 * target_seconds) shown_seconds = target_seconds;
+            if (std::abs(shown_end_ms - (double)target_end_ms) < (follow ? 1500.0 : 1.0)) shown_end_ms = (double)target_end_ms;
+            animating = shown_seconds != target_seconds || shown_end_ms != (double)target_end_ms;
+        }
+        double view_seconds = shown_seconds; std::int64_t view_end_ms = (std::int64_t)std::llround(shown_end_ms);
         std::int64_t view_start_ms = view_end_ms - (std::int64_t)(view_seconds * 1000);
         bool have_range = in_ms && out_ms && out_ms > in_ms;
         // Contiguous footage runs: segments of a session chain exactly, so a
@@ -295,7 +310,7 @@ int run_ui() {
             ImGui::InvisibleButton("overview", ImVec2(w, h));
             if (ImGui::IsItemActive()) {
                 std::int64_t at = oldest + (std::int64_t)(((io.MousePos.x - p.x) / w) * capacity * 1000);
-                view_end_ms = at + (std::int64_t)(view_seconds * 500); follow = view_end_ms >= now - 500;
+                target_end_ms = at + (std::int64_t)(target_seconds * 500); follow = target_end_ms >= now - 500;
             }
             help("Whole history. Drag to move the viewed window; scroll in the lanes to zoom.");
         }
@@ -320,7 +335,10 @@ int run_ui() {
             // once (from the cache when it has been seen); the exact frame
             // replaces it when the decoder lands there.
             std::int64_t preview_ms = scrubbing ? scrub_ms : (player.busy() && !player.playing()) ? player.position() : 0;
-            if (preview_ms) {
+            // Frames the decoder presents on its way to the target are kept;
+            // the keyframe only fills in until the first of them arrives.
+            bool on_the_way = !scrubbing && picture.texture && picture.ms <= preview_ms && picture.ms + 2500 >= preview_ms;
+            if (preview_ms && !on_the_way) {
                 if (auto* s = span_at(preview_ms)) {
                     auto key = thumbs.keyframe(s->path, preview_ms - s->start_ms, (int)img_w);
                     if (key.texture) picture = {key.texture, key.width, key.height, preview_ms};
@@ -393,26 +411,22 @@ int run_ui() {
                 draw->PushClipRect(ImVec2(track_x, video_y), ImVec2(track_x + track_w, video_y + video_h), true);
                 for (auto& run : runs) {
                     if (run.second < view_start_ms || run.first > view_end_ms) continue;
-                    std::int64_t first = std::max(run.first, view_start_ms) / tile_ms * tile_ms;
-                    if (first + tile_ms <= run.first) first += tile_ms;
-                    if (first < run.first) { // The run's leading partial tile starts at the run.
-                        auto* s = span_at(run.first);
-                        auto picture = s ? thumbs.keyframe(s->path, 0, (int)thumb_w) : Thumbnails::Picture{};
-                        if (picture.texture) {
-                            float x = x_of(run.first), x1 = std::min(x_of(first + tile_ms), x_of(run.second));
-                            float ph = std::min(thumb_h, thumb_w * picture.height / std::max(1, picture.width));
-                            draw->AddImage(picture.texture, ImVec2(x, video_y + 1 * dpi), ImVec2(x1, video_y + 1 * dpi + ph), ImVec2(0, 0), ImVec2((x1 - x) / thumb_w, 1));
-                        }
-                        first += tile_ms;
-                    }
-                    for (std::int64_t t = first; t < run.second && t <= view_end_ms; t += tile_ms) {
-                        auto* s = span_at(t); if (!s) continue;
-                        auto picture = thumbs.keyframe(s->path, t - s->start_ms, (int)thumb_w);
-                        if (!picture.texture) continue;
-                        float x = x_of(t), x1 = std::min(x + thumb_w, x_of(run.second));
+                    // A tile whose keyframe is not decoded yet shows the last
+                    // picture drawn in this run, so nothing blanks while the
+                    // worker catches up.
+                    Thumbnails::Picture carry{};
+                    auto tile = [&](std::int64_t at) {
+                        auto* s = span_at(at); if (!s) return;
+                        auto picture = thumbs.keyframe(s->path, at - s->start_ms, (int)thumb_w);
+                        if (picture.texture) carry = picture; else picture = carry;
+                        if (!picture.texture) return;
+                        float x = x_of(at), x1 = std::min(x + thumb_w, x_of(run.second));
                         float ph = std::min(thumb_h, thumb_w * picture.height / std::max(1, picture.width));
                         draw->AddImage(picture.texture, ImVec2(x, video_y + 1 * dpi), ImVec2(x1, video_y + 1 * dpi + ph), ImVec2(0, 0), ImVec2((x1 - x) / thumb_w, 1));
-                    }
+                    };
+                    std::int64_t first = std::max(run.first, view_start_ms) / tile_ms * tile_ms;
+                    if (first < run.first) { tile(run.first); first += tile_ms; } // The run's leading partial tile.
+                    for (std::int64_t t = first; t < run.second && t <= view_end_ms; t += tile_ms) tile(t);
                 }
                 draw->PopClipRect();
             }
@@ -455,7 +469,7 @@ int run_ui() {
                 if (drag == Drag::In) { in_ms = std::min(t, out_ms - (std::int64_t)frame_ms); }
                 if (drag == Drag::Out) { out_ms = std::max(t, in_ms + (std::int64_t)frame_ms); }
             } else if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Right) && io.MouseDelta.x != 0) {
-                view_end_ms -= (std::int64_t)(io.MouseDelta.x / px_per_ms); follow = false;
+                target_end_ms -= (std::int64_t)(io.MouseDelta.x / px_per_ms); follow = false;
             }
             if (!ImGui::IsItemActive()) {
                 if (drag == Drag::Press) player.seek(drag_anchor);
@@ -463,10 +477,13 @@ int run_ui() {
                 drag = Drag::None;
             }
             if (hovered && io.MouseWheel != 0) {
-                std::int64_t anchor = t_of(io.MousePos.x);
-                double next = std::clamp(view_seconds * std::pow(1.25, -io.MouseWheel), 10.0, capacity);
-                view_end_ms = anchor + (std::int64_t)((view_end_ms - anchor) * next / view_seconds);
-                view_seconds = next; follow = view_end_ms >= now - 500;
+                // Zoom about the cursor in target space, so the moment under
+                // the mouse is still there once the glide settles.
+                double fraction = std::clamp((io.MousePos.x - track_x) / track_w, 0.f, 1.f);
+                std::int64_t anchor = target_end_ms - (std::int64_t)(target_seconds * 1000 * (1 - fraction));
+                double next = std::clamp(target_seconds * std::pow(1.25, -io.MouseWheel), 10.0, capacity);
+                target_end_ms = anchor + (std::int64_t)((target_end_ms - anchor) * next / target_seconds);
+                target_seconds = next; follow = target_end_ms >= now - 500;
             }
             if (hovered && (drag == Drag::In || drag == Drag::Out || drag == Drag::Range)) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             else if (hovered && have_range && (std::abs(io.MousePos.x - x_of(in_ms)) <= grab || std::abs(io.MousePos.x - x_of(out_ms)) <= grab)) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
@@ -484,7 +501,7 @@ int run_ui() {
             if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) player.seek(std::min(now, playhead + stride));
         }
         // Keep a playing playhead on screen by paging the view forward.
-        if (player.playing() && !follow && playhead > view_end_ms) { view_end_ms = playhead + (std::int64_t)(view_seconds * 900); }
+        if (player.playing() && !follow && playhead > view_end_ms) { target_end_ms = playhead + (std::int64_t)(target_seconds * 900); }
         // Transport and range row.
         ImGui::AlignTextToFramePadding();
         if (ImGui::Button(player.playing() ? "Pause" : "Play", ImVec2(60 * dpi, 0))) player.toggle();
@@ -642,7 +659,7 @@ int run_ui() {
         if (changed) { dirty = true; settings_error.clear(); }
         if (dirty && settings_error.empty() && (commit || !ImGui::IsAnyItemActive())) save_settings();
         ImGui::EndDisabled();
-        bool active_input = ImGui::IsAnyItemActive() || io.WantTextInput || thumbs.busy() || drag != Drag::None || player.busy() || scrubbing;
+        bool active_input = ImGui::IsAnyItemActive() || io.WantTextInput || thumbs.busy() || drag != Drag::None || player.busy() || scrubbing || animating;
         ImGui::End(); ImGui::Render(); const float clear[4] = {background.x, background.y, background.z, 1};
         if (target) { context->OMSetRenderTargets(1, &target, nullptr); context->ClearRenderTargetView(target, clear); ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData()); swapchain->Present(1, 0); }
         // Input wakes immediately; idle controls need no fast render loop.

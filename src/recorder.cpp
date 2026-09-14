@@ -169,7 +169,9 @@ public:
         obs_encoder_set_audio(audio_encoder, obs_get_audio());
         settings = data(); obs_data_set_string(settings.get(), "rate_control", "vbr");
         obs_data_set_int(settings.get(), "bitrate", cfg.bitrate); obs_data_set_int(settings.get(), "max_bitrate", cfg.max_bitrate);
-        obs_data_set_int(settings.get(), "keyint_sec", 2); obs_data_set_string(settings.get(), "preset", "p4");
+        // A keyframe every second: a seek decodes at most a second of frames
+        // to land exactly, and the filmstrip has a picture per second.
+        obs_data_set_int(settings.get(), "keyint_sec", 1); obs_data_set_string(settings.get(), "preset", "p4");
         obs_data_set_string(settings.get(), "multipass", "disabled"); obs_data_set_bool(settings.get(), "lookahead", false);
         obs_data_set_bool(settings.get(), "adaptive_quantization", false); obs_data_set_int(settings.get(), "bf", 0);
         video_encoder = obs_video_encoder_create("obs_nvenc_av1_tex", "NVENC AV1", settings.get(), nullptr);
