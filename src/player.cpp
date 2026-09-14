@@ -19,7 +19,6 @@ extern "C" {
 
 namespace clip {
 namespace {
-std::int64_t steady_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 constexpr size_t QueueFrames = 12;       // ~200 ms of decoded video ahead of the playhead.
 constexpr REFERENCE_TIME AudioBuffer = 5000000; // 500 ms shared-mode render buffer.
 // Full-screen triangle and BT.709 limited-range NV12 to RGB.

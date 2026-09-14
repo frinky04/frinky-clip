@@ -16,7 +16,8 @@ std::wstring wide(const std::string& value);
 std::string path_text(const fs::path& path);
 fs::path exe_dir();
 fs::path app_dir();
-std::int64_t now_ms();
+std::int64_t now_ms();    // Wall clock, epoch milliseconds.
+std::int64_t steady_ms(); // Monotonic milliseconds, for durations and animation.
 std::string unique_id();
 std::string read_text(const fs::path& path);
 void atomic_write(const fs::path& path, const std::string& text);

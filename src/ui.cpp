@@ -10,6 +10,7 @@
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <algorithm>
+#include <climits>
 #include <future>
 #include <optional>
 #include <cmath>
@@ -322,7 +323,7 @@ int run_ui() {
         float audio_h = 30 * dpi, video_h = 96 * dpi, ruler_h = ImGui::GetTextLineHeight() + 4 * dpi;
         float lanes_h = ruler_h + 2 * dpi + video_h + (audio_h + 4 * dpi) * 2 + 4 * dpi + style.WindowPadding.y;
         float preview_h = std::max(96 * dpi, ImGui::GetContentRegionAvail().y - lanes_h - below_h - style.ItemSpacing.y);
-        std::int64_t hover_ms = 0; bool hover_lane = false;
+        std::int64_t hover_ms = 0; bool hover_lane = false, hover_video = false, fading = false; auto tick_ms = steady_ms();
         // Viewport: the frame at the playhead, streaming while playing.
         std::int64_t playhead = player.position();
         if (ImGui::BeginChild("preview", ImVec2(0, preview_h), ImGuiChildFlags_Borders)) {
@@ -419,33 +420,55 @@ int run_ui() {
                     double misfit = std::abs(std::log(candidate * target_px_per_ms / thumb_w));
                     if (misfit < closest) { closest = misfit; tile_ms = candidate; }
                 }
+                // Tiles draw up to 1.41x their natural width within a level;
+                // decoding wider keeps them crisp. Decodes nearest the focus
+                // (the cursor over the lanes, else the playhead) finish first.
+                int decode_w = (int)(thumb_w * 3 / 2);
+                bool mouse_in = io.MousePos.x >= track_x && io.MousePos.x <= track_x + track_w && io.MousePos.y >= origin.y && io.MousePos.y <= bottom;
+                float focus_x = mouse_in ? io.MousePos.x : (playhead >= view_start_ms && playhead <= view_end_ms) ? x_of(playhead) : track_x + track_w / 2;
                 draw->PushClipRect(ImVec2(track_x, video_y), ImVec2(track_x + track_w, video_y + video_h), true);
                 for (auto& run : runs) {
                     if (run.second < view_start_ms || run.first > view_end_ms) continue;
                     // A tile whose keyframe is not decoded yet shows the last
                     // picture drawn in this run, so nothing blanks while the
-                    // worker catches up.
+                    // worker catches up; its own picture then fades in.
                     Thumbnails::Picture carry{};
                     auto tile = [&](std::int64_t t0, std::int64_t t1) {
                         auto* s = span_at(t0); if (!s) return;
-                        auto picture = thumbs.keyframe(s->path, t0 - s->start_ms, (int)thumb_w);
-                        if (picture.texture) carry = picture; else picture = carry;
-                        if (!picture.texture) return;
                         float x0 = x_of(t0), full_w = x_of(t1) - x0, x1 = std::min(x0 + full_w, x_of(run.second));
-                        if (full_w < 1 || x1 - x0 < 1) return;
+                        auto own = thumbs.keyframe(s->path, t0 - s->start_ms, decode_w, (int)std::abs(x0 + full_w / 2 - focus_x));
+                        auto picture = own.texture ? own : carry;
+                        if (!picture.texture || full_w < 1 || x1 - x0 < 1) { if (own.texture) carry = own; return; }
                         // Fill the interval at the picture's aspect, cropping the excess about the centre.
                         float aspect = (float)picture.width / std::max(1, picture.height), natural_h = full_w / aspect;
                         ImVec2 uv0(0, 0), uv1(1, 1);
                         if (natural_h >= thumb_h) { float keep = thumb_h / natural_h; uv0.y = (1 - keep) / 2; uv1.y = 1 - uv0.y; }
                         else { float keep = full_w / (thumb_h * aspect); uv0.x = (1 - keep) / 2; uv1.x = 1 - uv0.x; }
                         uv1.x = uv0.x + (uv1.x - uv0.x) * (x1 - x0) / full_w; // Truncated at the run's end.
-                        draw->AddImage(picture.texture, ImVec2(x0, video_y + 1 * dpi), ImVec2(x1, video_y + 1 * dpi + thumb_h), uv0, uv1);
+                        ImVec2 p0(x0, video_y + 1 * dpi), p1(x1, video_y + 1 * dpi + thumb_h);
+                        float alpha = own.texture ? std::clamp((tick_ms - own.ready_ms) / 150.f, 0.f, 1.f) : 1.f;
+                        if (alpha < 1) { fading = true; if (carry.texture && carry.texture != own.texture) draw->AddImage(carry.texture, p0, p1, uv0, uv1); }
+                        draw->AddImage(picture.texture, p0, p1, uv0, uv1, IM_COL32(255, 255, 255, (int)(alpha * 255)));
+                        if (own.texture) carry = own;
                     };
                     std::int64_t first = std::max(run.first, view_start_ms) / tile_ms * tile_ms;
                     if (first < run.first) { tile(run.first, first + tile_ms); first += tile_ms; } // The run's leading partial tile.
                     for (std::int64_t t = first; t < run.second && t <= view_end_ms; t += tile_ms) tile(t, t + tile_ms);
                 }
                 draw->PopClipRect();
+                // Idle prefetch: one view width beyond each edge at this level
+                // and the midpoints of the next level in, so the pan or zoom
+                // that follows is a cache hit. Queued behind visible work.
+                if (!animating && !scrubbing && drag == Drag::None && !player.playing()) {
+                    int budget = 48; std::int64_t span_ms = view_end_ms - view_start_ms;
+                    auto ask = [&](std::int64_t t, int priority) {
+                        if (budget <= 0) return; auto* s = span_at(t); if (!s) return;
+                        thumbs.prefetch(s->path, t - s->start_ms, decode_w, 1000000 + priority); --budget;
+                    };
+                    for (std::int64_t t = view_end_ms / tile_ms * tile_ms + tile_ms; t < view_end_ms + span_ms; t += tile_ms) ask(t, (int)((t - view_end_ms) / tile_ms));
+                    for (std::int64_t t = view_start_ms / tile_ms * tile_ms; t > view_start_ms - span_ms; t -= tile_ms) ask(t, (int)((view_start_ms - t) / tile_ms));
+                    if (tile_ms > 500) for (std::int64_t t = view_start_ms / tile_ms * tile_ms + tile_ms / 2; t < view_end_ms; t += tile_ms) ask(t, 100000 + (int)std::abs(x_of(t) - focus_x));
+                }
             }
             // Live edge and the marked range.
             if (map.last_end_ms && map.last_end_ms >= view_start_ms && map.last_end_ms <= view_end_ms)
@@ -470,6 +493,26 @@ int run_ui() {
             ImGui::InvisibleButton("lane-surface", ImVec2(track_w, std::max(bottom - origin.y - ruler_h, 1.f)), ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
             bool hovered = ImGui::IsItemHovered();
             if (hovered) { hover_lane = true; hover_ms = t_of(io.MousePos.x); }
+            // Hover preview: the keyframe under the cursor, shown large above
+            // the strip with its time, for scanning footage without seeking.
+            hover_video = hovered && io.MousePos.y >= video_y && io.MousePos.y <= video_y + video_h && drag == Drag::None && !scrubbing && !ImGui::IsAnyMouseDown();
+            if (hover_video && !runs.empty()) {
+                if (auto* s = span_at(hover_ms)) {
+                    float thumb_h = video_h - 2 * dpi; int decode_w = (int)(std::floor(thumb_h * 16 / 9) * 3 / 2);
+                    auto picture = thumbs.keyframe(s->path, hover_ms - s->start_ms, decode_w, INT_MIN + 1);
+                    float x = io.MousePos.x; draw->AddLine(ImVec2(x, video_y), ImVec2(x, video_y + video_h), accent_u32, 1 * dpi);
+                    if (picture.texture) {
+                        float pw = (float)decode_w, ph = pw * picture.height / std::max(1, picture.width), pad = 4 * dpi, text_h = ImGui::GetTextLineHeight();
+                        float px = std::clamp(x - pw / 2, track_x, std::max(track_x, track_x + track_w - pw));
+                        float py = std::max(pad, origin.y - ph - text_h - pad * 3 - 6 * dpi);
+                        auto* fg = ImGui::GetForegroundDrawList();
+                        fg->AddRectFilled(ImVec2(px - pad, py - pad), ImVec2(px + pw + pad, py + ph + text_h + pad * 2), IM_COL32(11, 12, 14, 235));
+                        fg->AddRect(ImVec2(px - pad, py - pad), ImVec2(px + pw + pad, py + ph + text_h + pad * 2), line_u32);
+                        fg->AddImage(picture.texture, ImVec2(px, py), ImVec2(px + pw, py + ph));
+                        fg->AddText(ImVec2(px, py + ph + pad), muted_u32, local_time(hover_ms, true).c_str());
+                    }
+                }
+            }
             float grab = 6 * dpi;
             // A press becomes a range drag once the mouse moves; a plain click
             // places the playhead instead.
@@ -506,7 +549,7 @@ int run_ui() {
             else if (hovered && have_range && (std::abs(io.MousePos.x - x_of(in_ms)) <= grab || std::abs(io.MousePos.x - x_of(out_ms)) <= grab)) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         }
         ImGui::EndChild();
-        if (hover_lane && !have_range) help("Click to place the playhead, drag to mark a range. Scroll to zoom, right-drag to pan.");
+        if (hover_lane && !hover_video && !have_range) help("Click to place the playhead, drag to mark a range. Scroll to zoom, right-drag to pan.");
         // Keyboard transport when no field has focus: Space plays, I/O mark at
         // the playhead, arrows step a frame (a second with Shift).
         if (!io.WantTextInput && !ImGui::IsAnyItemActive()) {
@@ -676,7 +719,7 @@ int run_ui() {
         if (changed) { dirty = true; settings_error.clear(); }
         if (dirty && settings_error.empty() && (commit || !ImGui::IsAnyItemActive())) save_settings();
         ImGui::EndDisabled();
-        bool active_input = ImGui::IsAnyItemActive() || io.WantTextInput || thumbs.busy() || drag != Drag::None || player.busy() || scrubbing || animating;
+        bool active_input = ImGui::IsAnyItemActive() || io.WantTextInput || thumbs.busy() || drag != Drag::None || player.busy() || scrubbing || animating || fading || hover_video;
         ImGui::End(); ImGui::Render(); const float clear[4] = {background.x, background.y, background.z, 1};
         if (target) { context->OMSetRenderTargets(1, &target, nullptr); context->ClearRenderTargetView(target, clear); ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData()); swapchain->Present(1, 0); }
         // Input wakes immediately; idle controls need no fast render loop.

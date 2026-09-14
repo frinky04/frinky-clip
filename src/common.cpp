@@ -29,6 +29,7 @@ fs::path app_dir() {
     fs::path result = fs::path(p) / "FrinkyClip"; CoTaskMemFree(p); return result;
 }
 std::int64_t now_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
+std::int64_t steady_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 std::string unique_id() { GUID id; CoCreateGuid(&id); wchar_t s[40]; StringFromGUID2(id, s, 40); return std::to_string(now_ms()) + "-" + utf8(s).substr(1, 8); }
 std::string read_text(const fs::path& p) {
     // Share delete as well, so a writer can rename a new version into place

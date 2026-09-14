@@ -5,8 +5,10 @@ extern "C" {
 }
 #include <algorithm>
 #include <chrono>
+#include <climits>
 
 namespace clip {
+constexpr std::int64_t RetryMs = 3000; // A failed decode (a file still being flushed) is tried again after this.
 std::vector<std::int64_t> keyframe_times(const fs::path& segment) {
     std::vector<std::int64_t> result; AVFormatContext* fmt = nullptr;
     // A segment that cannot be opened (expired since the index was read)
@@ -41,13 +43,16 @@ Thumbnails::~Thumbnails() {
     { std::lock_guard lock(mutex_); stop_ = true; } wake_.notify_all(); worker_.join();
     for (auto& [key, entry] : cache_) if (entry.view) entry.view->Release();
 }
-Thumbnails::Picture Thumbnails::keyframe(const fs::path& segment, std::int64_t offset_ms, int width) {
-    return request({segment.wstring(), offset_ms, width, false});
+Thumbnails::Picture Thumbnails::keyframe(const fs::path& segment, std::int64_t offset_ms, int width, int priority) {
+    return request({segment.wstring(), offset_ms, width, false}, priority, false);
 }
 Thumbnails::Picture Thumbnails::frame(const fs::path& segment, std::int64_t offset_ms, int width) {
-    return request({segment.wstring(), offset_ms, width, true});
+    return request({segment.wstring(), offset_ms, width, true}, INT_MIN, false);
 }
-Thumbnails::Picture Thumbnails::request(Key key) {
+void Thumbnails::prefetch(const fs::path& segment, std::int64_t offset_ms, int width, int priority) {
+    request({segment.wstring(), offset_ms, width, false}, priority, true);
+}
+Thumbnails::Picture Thumbnails::request(Key key, int priority, bool prefetch) {
     std::lock_guard lock(mutex_);
     if (!key.exact) {
         // Resolve to the keyframe that will answer this request; until the
@@ -61,6 +66,8 @@ Thumbnails::Picture Thumbnails::request(Key key) {
         key.offset = index.keyframes_ms.empty() ? 0 : it == index.keyframes_ms.begin() ? index.keyframes_ms.front() : *(it - 1);
     }
     auto& entry = cache_[key]; entry.used = frame_;
+    entry.priority = entry.queued ? std::min(entry.priority, priority) : priority;
+    if (entry.picture.failed && steady_ms() - entry.failed_ms > RetryMs) { entry.picture.failed = false; entry.decoded = false; }
     if (!entry.picture.texture && !entry.picture.failed && !entry.decoded && !entry.queued) {
         // A new exact-frame request supersedes queued ones: while a handle is
         // dragged only the latest position matters, and exact decodes are slow.
@@ -70,6 +77,7 @@ Thumbnails::Picture Thumbnails::request(Key key) {
         }
         entry.queued = true; queue_.push_back({key, false}); wake_.notify_one();
     }
+    if (prefetch) return {};
     if (entry.picture.texture || key.exact) return entry.picture;
     // Not decoded yet: the nearest decoded keyframe of the same segment and
     // width stands in, so a tile never blanks while its own picture is on
@@ -92,10 +100,17 @@ void Thumbnails::work() {
     std::unique_lock lock(mutex_);
     while (!stop_) {
         if (queue_.empty()) { wake_.wait(lock); continue; }
-        // Index probes first: they unblock every tile of a segment.
-        auto probe = std::find_if(queue_.begin(), queue_.end(), [](const Job& j) { return j.probe; });
-        Job job = probe != queue_.end() ? *probe : queue_.back();
-        if (probe != queue_.end()) queue_.erase(probe); else queue_.pop_back();
+        // Index probes first: they unblock every tile of a segment. Then the
+        // pending decode nearest the focus.
+        auto pick = std::find_if(queue_.begin(), queue_.end(), [](const Job& j) { return j.probe; });
+        if (pick == queue_.end()) {
+            int best = INT_MAX;
+            for (auto it = queue_.begin(); it != queue_.end(); ++it) {
+                auto entry = cache_.find(it->key); int priority = entry == cache_.end() ? INT_MAX : entry->second.priority;
+                if (priority < best) { best = priority; pick = it; }
+            }
+        }
+        Job job = *pick; queue_.erase(pick);
         ++active_; lock.unlock();
         if (job.probe) {
             std::vector<std::int64_t> times;
@@ -109,11 +124,15 @@ void Thumbnails::work() {
         catch (...) { failed = true; }
         lock.lock(); --active_; ++decodes_; last_decode_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
         auto it = cache_.find(job.key);
-        if (it != cache_.end()) { it->second.pending = std::move(frame); it->second.decoded = true; it->second.picture.failed = failed; it->second.queued = false; }
+        if (it != cache_.end()) {
+            it->second.pending = std::move(frame); it->second.decoded = !failed; it->second.picture.failed = failed; it->second.queued = false;
+            if (failed) it->second.failed_ms = steady_ms();
+        }
     }
 }
 void Thumbnails::tick() {
     std::lock_guard lock(mutex_); ++frame_;
+    auto now = steady_ms();
     for (auto& [key, entry] : cache_) {
         if (entry.decoded && !entry.picture.failed && !entry.picture.texture) {
             D3D11_TEXTURE2D_DESC desc{}; desc.Width = entry.pending.width; desc.Height = entry.pending.height; desc.MipLevels = 1; desc.ArraySize = 1;
@@ -123,13 +142,14 @@ void Thumbnails::tick() {
             if (SUCCEEDED(device_->CreateTexture2D(&desc, &init, &texture))) {
                 device_->CreateShaderResourceView(texture, nullptr, &entry.view); texture->Release();
                 entry.picture.texture = (ImTextureID)entry.view; entry.picture.width = entry.pending.width; entry.picture.height = entry.pending.height;
-            } else entry.picture.failed = true;
+                entry.picture.ready_ms = now;
+            } else { entry.picture.failed = true; entry.failed_ms = now; }
             entry.pending = Frame();
         }
     }
     // Bounded by count only: pictures stay until the cache is full, so
     // panning back over footage seen minutes ago does not decode again.
-    constexpr size_t Capacity = 900, Keep = 700;
+    constexpr size_t Capacity = 700, Keep = 550;
     if (cache_.size() > Capacity) {
         std::vector<std::uint64_t> ages; ages.reserve(cache_.size());
         for (auto& [key, entry] : cache_) ages.push_back(entry.used);
