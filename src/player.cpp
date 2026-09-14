@@ -119,8 +119,9 @@ Player::~Player() {
 void Player::set_spans(std::vector<Span> spans) { std::lock_guard lock(mutex_); spans_ = std::move(spans); }
 void Player::seek(std::int64_t ms) {
     // The playhead moves now; the picture catches up. Like netcode: the
-    // UI state is authoritative and the decoder converges on it.
-    seek_target_ = ms; position_ = ms; pending_seek_ = true; seeking_ = true; playing_ = false; resumable_ = false; ++generation_;
+    // UI state is authoritative and the decoder converges on it. Playback
+    // continues from the new position when it was playing.
+    seek_target_ = ms; position_ = ms; pending_seek_ = true; seeking_ = true; resumable_ = false; ++generation_;
     wake_.notify_all(); space_.notify_all();
 }
 void Player::play() {
