@@ -1,56 +1,32 @@
-# Frinky Clip
+﻿# Frinky Clip
 
-Windows tray recorder: 1440p60 SDR display capture, NVENC AV1, a rolling disk buffer, and a global save hotkey. The controls use Dear ImGui with the bundled Noto Sans Mono Medium font.
+A Windows tray app that keeps your recent gameplay ready to save. Capture at 1440p60, save a clip with a hotkey, or trim a moment in the built-in editor.
+
+**[Download for Windows](https://github.com/frinky04/frinky-clip/releases/latest/download/Frinky04.FrinkyClip-win-Setup.exe)** · [All releases](https://github.com/frinky04/frinky-clip/releases) · [Report a bug](https://github.com/frinky04/frinky-clip/issues)
+
+## Requirements
+
+- 64-bit Windows and an NVIDIA GPU with AV1 encoding support.
+- A current NVIDIA driver. OBS does not need to be installed.
 
 ## Install
 
-Download the release zip, extract it anywhere, and run `frinky-clip.exe`. The only requirement is a current NVIDIA driver, for NVENC and hardware AV1 decoding. Everything else the app loads ships in the folder: the OBS runtime and the four plugins it uses, their data, the FFmpeg libraries, and the MSVC runtime. OBS Studio does not need to be installed, and nothing is written outside `%LOCALAPPDATA%/FrinkyClip` and the configured storage folder. Windows SmartScreen warns about an unsigned download on first run; choose More info, then Run anyway.
+Run the installer, then open **Frinky Clip** from the Start menu. A portable ZIP is also available on the releases page.
+
+Releases are currently unsigned, so Windows may show a SmartScreen warning. After checking that the download came from this repository, choose **More info → Run anyway**.
 
 ## Use
 
-Run `frinky-clip.exe`. Recording starts automatically. Uncheck **Record on launch** to disable this; the toggle saves immediately and can be changed during recording. It controls app launch, not Windows sign-in. Auto-record runs once when the tray app starts. Reopening its controls, including by launching the executable again, does not restart a paused recording.
+- Recording starts when you open the app. Change **Record on launch** in Settings to disable this.
+- Press **Ctrl+Shift+F8** to save the last 60 seconds.
+- Use the timeline to select a range, then **Export**. **Space** plays or pauses; **I** and **O** mark the start and end.
+- Enable your microphone in Settings to record it alongside desktop audio.
+- Closing the window keeps the app in the tray. Choose **Quit** from the tray menu to exit.
 
-- Default save hotkey: **Ctrl+Shift+F8**, preserving the last 60 seconds plus segment-boundary overlap.
-- **X** hides the controls to the tray. The tray app stays open whether recording or paused. Its menu offers Open, Start/Stop Recording, Save Clip, and **Quit**.
-- **Stop** stops capture but keeps the tray app and its recorder process open. The recorder stays warm between sessions (OBS core, graphics device, and plugins loaded, capture source and encoders released), so Record and Stop take well under a second; only app launch pays the full OBS start-up. Startup also trusts committed segment metadata instead of re-probing every buffered file, so it no longer slows down with a large buffer. **Quit** stops recording and exits the app and its worker processes. Quit allows up to 10 seconds for the current segment/save to finish; longer work is interrupted with source clips and pending footage retained.
-- Hidden controls do not render. The recorder and mux/export helpers belong to the tray app through a Windows Job Object, so an unexpected app exit also terminates them. No service or independent recorder remains after Quit.
-- `frinky-clip.exe --quit` invokes the same full exit as the tray menu. `--stop` only stops recording and `--start` resumes it. Direct desktop `--recorder` invocation is internal and requires ownership by the tray app; isolated synthetic tests are the exception.
-- The window is the clip editor over the rolling buffer. The overview bar shows the whole history with footage, the marked range, and the viewed window; drag it to move. The lanes show a wall-clock ruler, a filmstrip of keyframe thumbnails tiled across each run of footage, and a loudness waveform of the desktop audio. The recorder builds a peak file for each segment in the background after publishing the closed footage (peak and RMS per 20 ms, linear, in the sidecar) and publishes a 250 ms version in the segment index, so the zoomed-out lane draws the whole buffer at once; the fine levels load when zoomed in. Columns draw the peak as a light envelope with the RMS as a solid core, the way editors draw waveforms. Segments without a peak file are measured by the recorder in the background. Click to place the playhead, left-drag to mark a range, drag a handle to adjust it, drag the ruler to scrub, scroll to zoom, right-drag to pan, and **Now** returns to the live edge. Handles snap to source frames. The viewport above the lanes plays the buffer from the playhead with desktop audio: **Play**, Space, or a click on the picture toggles playback, I and O mark the range at the playhead, and the arrow keys step one frame (one second with Shift). With both In and Out marked, Play resumes inside the range or starts at In when the playhead is outside it. Playback stops at Out, holds the last included frame, and the next Play restarts at In. Without a complete range, playback stops at the last closed segment. Scrubbing, clicking the timeline, and stepping frames pause playback and can inspect any buffered footage. Editing the range pauses without moving the playhead; dragging a handle temporarily previews In or the last frame before Out, then restores the playhead preview on release. Clear restores normal buffer playback. Footage in view or marked stays protected from expiry while the window is open.
-- **Export** re-encodes the range in the recorder process through the bundled FFmpeg libraries: D3D11VA decode, NVENC encode at the chosen resolution, frame rate, codec (H.264 default, AV1 optional), and bitrate, AAC audio, into the clips folder as `clip-YYYYMMDD-HHMMSS.mp4`. Frames are chosen by their timeline time, so the cut is frame-accurate and audio is trimmed to the sample; H.264 falls back to libx264 if NVENC cannot open. Progress shows in the footer; the editor stays usable. A range must lie within one recording session and end in closed footage. **Save last N seconds** remains the separate quick path at recording quality. `frinky-clip.exe --export <start_ms> <end_ms>` runs the same export from a script with the saved defaults.
-- The recorder footer holds the state, buffer clock, Record/Stop, Save last N seconds with its hotkey, and the clips folder. **Settings** opens capture, buffer, hotkey, app, and diagnostics. Under Audio, **Microphone** records the selected input as a second audio track in every segment: it gets its own lane in the timeline and quick saves keep it as a separate track. The Desktop and Mic sliders on the export row set each track's level, from muted to 200%, for both playback and the export, so what you hear is what the clip gets.
-- Stop recording to edit capture settings. Checkboxes and selections save immediately; numeric fields and Storage save when you press Enter or leave the field. Hiding or quitting also saves valid pending edits. Invalid settings show a Not saved message and leave the last valid config intact.
-- **Diagnostics** at the bottom of Settings has Open Log and recorder performance counters. The log records core start-up time and how long each session took to start and stop. The recorder announces every status change to the control window and reacts to OBS callbacks immediately, so state, save, and export updates appear within a frame rather than after a poll.
-- Preferences live in `%LOCALAPPDATA%/FrinkyClip/config.json`; status and logs are alongside them. `FRINKY_CLIP_HOME` overrides this directory for isolated tests.
-- Buffer, clips, and pending saves live under the configured Storage folder. The disk budget covers the rolling buffer; saved clips, pending jobs, and quarantined interrupted files are outside it.
-- The export row's resolution, frame rate, codec, and bitrate are saved as defaults. `--probe-frame <segment.mkv> <offset_ms>` writes decode timings to `frame-probe.txt` for diagnosing thumbnails.
-- Every session has one time base. The recorder anchors a session at the wall-clock moment its output starts and places each closed segment by the video track's frame count at its frame rate, so consecutive segments meet exactly and the editor, the player, the filmstrip, and the export agree on where every frame is. Each segment's sidecar records `start_ms`, `end_ms`, and `frames`; sidecars from older builds are chained onto their predecessor once at startup.
+By default, Frinky Clip keeps up to two hours of history within a 50 GB buffer limit. Change the storage folder and limits in Settings. Saved clips are kept separately from the rolling buffer.
 
-The default history is 120 minutes with a 50 GB limit. At a sustained 40 Mbps, two hours of video is about 36 GB, plus audio and container overhead. Actual AV1 VBR size depends on content. Footage expires at whichever limit is reached first.
+## Updates
 
-## Build
+Installed copies check for updates automatically. Open **Settings → Updates** to download and restart when ready. Updates and uninstall preserve your settings and clips. Portable copies are updated manually.
 
-Requires Windows x64, Visual Studio 2026 C++ tools, CMake, Git, and OBS Studio **32.2.2** installed. Run:
-
-```powershell
-./scripts/build.ps1
-```
-
-The script fetches pinned OBS, FFmpeg, and ImGui headers/source, builds Release, runs the core tests, and stages everything the app loads beside the executable (see `cmake/stage.cmake`): the OBS runtime DLLs that libobs and the plugins actually import, the `obs-plugins` folder, the `data` folder with the libobs effects and plugin data, the mux and encoder-test helpers, and the MSVC runtime. The OBS installation is only a build input; the output folder runs on its own.
-
-`./scripts/build.ps1 -Package` rebuilds from a clean output folder and writes `dist/frinky-clip-<version>-win64.zip`, the release artifact, without debug symbols or the test executable. The version comes from `CMakeLists.txt`.
-
-The shipped OBS and FFmpeg binaries are GPL-licensed builds, so releases of this app are distributed under GPL-compatible terms with the source available.
-
-## Reliability and current limits
-
-The ring uses short MKV segments. Finished clips are remuxed to a temporary MP4, checked, flushed, and renamed into place. Pending saves protect their source segments and are retried after restart. Recovery retains unusable tails as `.interrupted`; it is not a guarantee against filesystem or hardware failure.
-
-Stitching several ranges, app-specific audio exclusion, HDR, Windows sign-in launch, and export while the recorder process is not running are future work. Thumbnails, seeking, and playback decode AV1 on the GPU through D3D11VA, with the native FFmpeg `av1` decoder selected explicitly because the default AV1 decoder in the bundled build is software-only. Playback frames stay in video memory and are converted from NV12 by a shader. Measured on an RTX 4080: about 1 ms per frame, a keyframe thumbnail in under 10 ms, a seek to an exact frame in about 100 ms, resume after pause in under 20 ms, and a forward frame step in a few milliseconds. Segment files are opened without a stream probe, seeks within the open segment reuse it, and the recorder publishes `segments.json` so the editor reads one file instead of every sidecar. If the device cannot decode, everything falls back to software. Playback is paced by a worker-published audio clock; without audio it uses the wall clock. If the output device fails, playback continues silently until the app is restarted. Thumbnail textures and pending pixels have byte budgets, and obsolete trim requests are cancelled. Same-resolution NVENC exports keep frames on the GPU, with CPU-input fallback; resized exports retain CPU scaling. `frinky-clip.exe --player-test <buffer folder> [seconds]` runs a headless benchmark of these paths and writes `player-test.txt`. `--export-test <buffer folder> [seconds]` exports a short range across a segment seam with each codec and frame rate, checks the frame count and duration, and writes `export-test.txt`; on an RTX 4080 a 3 s 720p export takes about 1.2 s. Capture and encoding remain fixed at 1440p60. The latest clip remains accessible across recorder restarts while its file and status entry still exist.
-
-Before treating this as a dependable daily recorder, complete a two-hour run under gaming load and verify A/V sync across long saves, disk-limit eviction, and interruption recovery. See [PERFORMANCE.md](PERFORMANCE.md) for the benchmark procedure.
-
-## Checks completed
-
-`scripts/test-lifecycle.ps1` exercises the tray app in isolated storage. Quit any existing app before running it. It checks X/hide and reopen, Stop keeping a warm recorder that Start resumes in the same process, paused reopen without auto-record, disabled auto-record, exact segment chaining with a 3 s export across a seam holding exactly 180 frames, Quit during a save with clip decoding, full helper cleanup, and forced owner termination. It uses `ffprobe` on PATH only to verify outputs. These lifecycle checks passed; direct unowned desktop recording is rejected.
-
-The cleanup pass verified preference round trips and old-config defaults, invalid settings leaving saved preferences intact, startup enabled/disabled across launches, changing the startup toggle while recording, latest-clip retention across recorder restarts, a decoded saved clip, and graceful recorder shutdown. A forced recorder-process interruption in isolated storage recovered two decodable segments. The resource sampler produced a valid CSV during desktop capture. These short tests do not replace the long-session and in-game checks above.
+[GPL-2.0-or-later](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.md) · [Development](DEVELOPMENT.md)

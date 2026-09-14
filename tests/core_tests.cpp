@@ -34,6 +34,9 @@ int main() {
         GetEnvironmentVariableW(L"FRINKY_CLIP_HOME", previous_home, 32768);
         require(SetEnvironmentVariableW(L"FRINKY_CLIP_HOME", dir.c_str()), "Isolate preference tests");
         auto saved = Config::load(); require(saved.record_on_launch, "Fresh install records on launch by default");
+        require(saved.auto_check_updates, "Existing and fresh configs default to automatic update checks");
+        saved.auto_check_updates = false; saved.save();
+        require(!Config::load().auto_check_updates, "Disabling automatic updates persists");
         saved.record_on_launch = false; saved.audio = false; saved.bitrate = 31000; saved.max_bitrate = 44000;
         saved.retention_minutes = 80; saved.budget_gb = 33.5; saved.save_seconds = 45; saved.share_bitrate = 12000;
         saved.hotkey = VK_F9; saved.modifiers = MOD_ALT; saved.monitor = "test display"; saved.storage = dir / L"Clips with spaces";

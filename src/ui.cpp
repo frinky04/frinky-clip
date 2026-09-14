@@ -1,5 +1,7 @@
 #include "recorder.hpp"
 #include "app.hpp"
+#include "updates.hpp"
+#include "version.h"
 #include "timeline.hpp"
 #include "thumbs.hpp"
 #include "waveform.hpp"
@@ -157,12 +159,14 @@ std::string shortcut(const Config& c) {
         (c.modifiers & MOD_ALT ? "Alt+" : "") + "F" + std::to_string(c.hotkey - VK_F1 + 1);
 }
 }
-int run_ui() {
+int run_ui(int resume_recording) {
     App app;
     if (!app.primary()) {
         if (auto existing = FindWindowW(AppWindowClass, nullptr)) { ShowWindow(existing, SW_RESTORE); SetForegroundWindow(existing); }
         return 0;
     }
+    Updates updates;
+    bool update_resume_recording = false;
     Config cfg = Config::load(); const Config defaults; auto displays = monitors(); auto microphones = capture_devices();
     char storage[2048]; strncpy_s(storage, path_text(cfg.storage).c_str(), _TRUNCATE);
     auto status = read_json(app_dir() / "status.json"); std::int64_t last_read = 0;
@@ -202,9 +206,13 @@ int run_ui() {
         if (!save_settings()) return;
         try { app.start(); error.clear(); } catch (const std::exception& e) { error = e.what(); }
     };
+    auto request_update = [&] {
+        if (!updates.status().ready || (!app.recording() && !app.paused()) || !save_settings()) return;
+        update_resume_recording = app.recording(); app.begin_update();
+    };
     // The recorder process is launched once and stays warm; without auto-record
     // it idles with the OBS core initialized so the first Record is quick.
-    if (cfg.record_on_launch) start_recording();
+    if (resume_recording < 0 ? cfg.record_on_launch : resume_recording != 0) start_recording();
     else { try { app.warm(); } catch (const std::exception& e) { error = e.what(); } }
     // Editor state. Times are epoch milliseconds; the view is the newest visible
     // edge and its length, and following keeps that edge at now.
@@ -274,7 +282,18 @@ int run_ui() {
         if (done) break;
         // Native hide/quit/focus changes can bypass ImGui's field-deactivation frame.
         if (dirty && settings_error.empty() && (app.quitting() || !IsWindowVisible(window) || GetForegroundWindow() != window)) save_settings();
-        if (app.tick()) break;
+        if (app.tick()) {
+            if (!app.updating()) break;
+            try { updates.apply(update_resume_recording); break; }
+            catch (const std::exception& e) { app.cancel_update(); error = std::string("Update could not start: ") + e.what(); }
+        }
+        updates.tick(cfg.auto_check_updates && !app.quitting());
+        if (app.update_action) {
+            const int action = app.update_action; app.update_action = 0;
+            if (action == 1) updates.check();
+            if (action == 2) updates.download();
+            if (action == 3) request_update();
+        }
         if (app.start_requested) { app.start_requested = false; start_recording(); }
         HWND recorder = app.recorder();
         // The recorder announces each rewrite; the short poll only covers a lost message.
@@ -943,6 +962,38 @@ int run_ui() {
                     } catch (const std::exception& e) { cfg.record_on_launch = !cfg.record_on_launch; error = e.what(); }
                 }
                 ImGui::EndTable();
+            }
+            section("Updates");
+            auto update = updates.status();
+            ImGui::TextDisabled("Frinky Clip %s", FRINKY_VERSION);
+            if (!update.installed) ImGui::TextDisabled("Install Frinky Clip to receive updates here.");
+            else {
+                if (ImGui::Checkbox("Automatically check for updates", &cfg.auto_check_updates)) {
+                    try {
+                        auto saved = Config::load(); saved.auto_check_updates = cfg.auto_check_updates; saved.save();
+                    } catch (const std::exception& e) { cfg.auto_check_updates = !cfg.auto_check_updates; error = e.what(); }
+                }
+                ImGui::BeginDisabled(update.working || update.ready);
+                if (ImGui::Button("Check for updates")) updates.check();
+                ImGui::EndDisabled();
+                if (!update.version.empty()) {
+                    ImGui::SameLine(); ImGui::Text("Version %s", update.version.c_str());
+                    ImGui::SameLine(); if (ImGui::SmallButton("Release notes"))
+                        open_path(window, fs::path(wide("https://github.com/frinky04/frinky-clip/releases/tag/v" + update.version)), error);
+                }
+                if (app.updating()) ImGui::TextWrapped("Finishing recording and saves before updating...");
+                else if (update.ready) {
+                    ImGui::BeginDisabled(!app.paused() && !app.recording());
+                    if (ImGui::Button("Update and restart")) request_update();
+                    ImGui::EndDisabled();
+                } else if (update.available && !update.working) {
+                    if (ImGui::Button("Download update")) updates.download();
+                }
+                if (update.working && update.available) ImGui::ProgressBar(update.progress / 100.f, ImVec2(-1, 0));
+                if (!update.message.empty()) ImGui::TextWrapped("%s", update.message.c_str());
+                if (!update.error.empty() && !update.message.empty()) {
+                    ImGui::TextWrapped("%s", update.error.c_str());
+                }
             }
             section("Diagnostics");
             if (ImGui::Button("Open log")) open_path(window, app_dir() / "recorder.log", error);

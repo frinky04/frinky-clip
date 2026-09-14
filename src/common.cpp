@@ -106,6 +106,7 @@ Config Config::load() {
     if (obs_data_has_user_value(d.get(), "mic")) c.mic = obs_data_get_bool(d.get(), "mic");
     if (obs_data_has_user_value(d.get(), "mic_device")) c.mic_device = obs_data_get_string(d.get(), "mic_device");
     if (obs_data_has_user_value(d.get(), "record_on_launch")) c.record_on_launch = obs_data_get_bool(d.get(), "record_on_launch");
+    if (obs_data_has_user_value(d.get(), "auto_check_updates")) c.auto_check_updates = obs_data_get_bool(d.get(), "auto_check_updates");
     if (obs_data_has_user_value(d.get(), "hotkey")) c.hotkey = (unsigned)obs_data_get_int(d.get(), "hotkey");
     if (obs_data_has_user_value(d.get(), "modifiers")) c.modifiers = (unsigned)obs_data_get_int(d.get(), "modifiers");
     c.monitor = obs_data_get_string(d.get(), "monitor");
@@ -133,6 +134,7 @@ void Config::save() const {
     obs_data_set_bool(d.get(), "audio", audio); obs_data_set_string(d.get(), "monitor", monitor.c_str());
     obs_data_set_bool(d.get(), "mic", mic); obs_data_set_string(d.get(), "mic_device", mic_device.c_str());
     obs_data_set_bool(d.get(), "record_on_launch", record_on_launch);
+    obs_data_set_bool(d.get(), "auto_check_updates", auto_check_updates);
     obs_data_set_string(d.get(), "storage", path_text(storage).c_str()); write_json(app_dir() / "config.json", d.get());
 }
 HWND recorder_window() { return FindWindowW(RecorderClass, nullptr); }

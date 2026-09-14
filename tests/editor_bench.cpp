@@ -33,6 +33,8 @@ void App::warm() {}
 void App::start() {}
 void App::stop() {}
 void App::quit() { quitting_ = true; }
+void App::begin_update() {}
+void App::cancel_update() {}
 void App::observe(const std::string&, bool, std::int64_t, bool) { state_ = "paused"; }
 bool App::handle_message(UINT message, WPARAM, LPARAM) {
     if (message == WM_CLOSE || message == QuitMessage) { quit(); return true; }

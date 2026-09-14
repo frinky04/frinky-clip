@@ -43,6 +43,7 @@ struct Config {
     bool mic = false;               // Microphone, as a second audio track.
     std::string mic_device = "default"; // MMDevice id, or "default".
     bool record_on_launch = true;
+    bool auto_check_updates = true;
     std::string monitor;
     fs::path storage;
     static Config load();

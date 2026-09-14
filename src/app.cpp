@@ -37,7 +37,7 @@ HWND App::recorder() const {
     return process_ && owner == pid_ ? window : nullptr;
 }
 void App::spawn(bool idle) {
-    if (active() || quitting_) return;
+    if (active() || quitting()) return;
     if (recorder_window()) throw std::runtime_error("An older recorder is still running. Stop it before starting this app's recorder.");
     Config::load().validate();
     auto exe = exe_dir() / "frinky-clip.exe";
@@ -56,7 +56,7 @@ void App::spawn(bool idle) {
 }
 void App::warm() { spawn(true); }
 void App::start() {
-    if (quitting_) return;
+    if (quitting()) return;
     if (!active()) { spawn(false); return; }
     if (!paused()) return;
     Config::load().validate();
@@ -71,28 +71,38 @@ void App::stop() {
 }
 void App::quit() {
     if (quitting_) return;
+    updating_ = false;
     quitting_ = true; quit_started_ = GetTickCount64(); pending_ = Pending::None;
     if (auto worker = recorder()) PostMessageW(worker, ExitMessage, 0, 0);
 }
+void App::begin_update() {
+    if (quitting()) return;
+    updating_ = true; pending_ = Pending::None; start_requested = false; error.clear();
+    if (auto worker = recorder()) PostMessageW(worker, ExitMessage, 0, 0);
+}
+void App::cancel_update() { updating_ = false; state_ = "paused"; }
 bool App::tick() {
     if (process_ && WaitForSingleObject(process_, 0) == WAIT_OBJECT_0) {
         DWORD code = 0; GetExitCodeProcess(process_, &code);
-        if (code && !quitting_) error = "Recorder exited unexpectedly. See Log for details.";
+        if (code && updating_) { cancel_update(); error = "Update postponed: recorder exited unexpectedly. See Log for details."; }
+        else if (code && !quitting_) error = "Recorder exited unexpectedly. See Log for details.";
         CloseHandle(process_); process_ = nullptr; pending_ = Pending::None;
         // The recorder normally waits for its mux/export helpers. Reap any
         // leftovers after an abnormal exit rather than leaving a background job.
         TerminateJobObject(job_, code);
     }
-    if (!quitting_) return false;
+    if (!quitting()) return false;
     // Repeat in case the recorder window did not exist yet when Quit was chosen.
     if (auto worker = recorder()) PostMessageW(worker, ExitMessage, 0, 0);
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
-    if (!QueryInformationJobObject(job_, JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), nullptr))
+    if (!QueryInformationJobObject(job_, JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), nullptr)) {
+        if (updating_) { error = "Could not verify recorder shutdown. Update postponed."; cancel_update(); return false; }
         return !active(); // Closing the owning job handle still kills all helpers.
-    if (accounting.ActiveProcesses == 0) return true;
+    }
+    if (accounting.ActiveProcesses == 0 && !active()) return true;
     // Allow the last segment and short saves to finish. Long exports retain
     // their source clips/partial outputs instead of keeping Quit open forever.
-    if (GetTickCount64() - quit_started_ > 10000) TerminateJobObject(job_, 0);
+    if (!updating_ && GetTickCount64() - quit_started_ > 10000) TerminateJobObject(job_, 0);
     return false;
 }
 void App::observe(const std::string& reported, bool busy, std::int64_t reported_ms, bool failed) {
@@ -106,7 +116,7 @@ void App::observe(const std::string& reported, bool busy, std::int64_t reported_
     if (pending_ == Pending::Stop && (state != "recording" || answered || expired)) pending_ = Pending::None;
     if (pending_ == Pending::Start) state = "starting";
     if (pending_ == Pending::Stop) state = "stopping";
-    if (quitting_) state = "quitting";
+    if (quitting()) state = updating_ ? "finishing work before update" : "quitting";
     state_ = state; busy_ = busy; update_tray();
 }
 void App::update_tray() {
@@ -121,7 +131,11 @@ bool App::handle_message(UINT message, WPARAM w, LPARAM l) {
         return true;
     }
     if (message == QuitMessage || (message == WM_ENDSESSION && w)) { quit(); return true; }
-    if (message == StartMessage) { if (!quitting_) start_requested = true; return true; }
+    if (message == StartMessage) { if (!quitting()) start_requested = true; return true; }
+    if (message == UpdateTestMessage && GetEnvironmentVariableW(L"FRINKY_CLIP_HOME", nullptr, 0)) {
+        if (!quitting()) update_action = (int)w;
+        return true;
+    }
     if (message == StatusMessage) { status_changed = true; return true; }
     if (message == IndexMessage) { index_changed = true; return true; }
     if (message == taskbar_created_ && taskbar_created_) {
@@ -136,8 +150,8 @@ bool App::handle_message(UINT message, WPARAM w, LPARAM l) {
         bool settled = paused() || recording();
         AppendMenuW(menu, MF_STRING, 1, L"Open");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING | ((quitting_ || !settled) ? MF_GRAYED : 0), 2, paused() ? L"Start Recording" : L"Stop Recording");
-        AppendMenuW(menu, MF_STRING | ((!recording() || busy_ || quitting_) ? MF_GRAYED : 0), 3, L"Save Clip");
+        AppendMenuW(menu, MF_STRING | ((quitting() || !settled) ? MF_GRAYED : 0), 2, paused() ? L"Start Recording" : L"Stop Recording");
+        AppendMenuW(menu, MF_STRING | ((!recording() || busy_ || quitting()) ? MF_GRAYED : 0), 3, L"Save Clip");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING | (quitting_ ? MF_GRAYED : 0), 4, quitting_ ? L"Quitting..." : L"Quit");
         POINT point; GetCursorPos(&point); SetForegroundWindow(window_);

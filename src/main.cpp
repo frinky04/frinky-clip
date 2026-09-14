@@ -3,6 +3,7 @@
 #include "media.hpp"
 #include "export.hpp"
 #include "app.hpp"
+#include "updates.hpp"
 #include <shellapi.h>
 #include <objbase.h>
 #include <dbghelp.h>
@@ -13,6 +14,7 @@ extern "C" {
 }
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    clip::update_startup();
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     SetDllDirectoryW(clip::exe_dir().c_str());
@@ -104,7 +106,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         } else if (!args.empty() && args[0] == L"--remux" && args.size() >= 3) {
             std::vector<clip::fs::path> sources; for (size_t i = 2; i < args.size(); ++i) sources.emplace_back(args[i]);
             clip::remux(sources, clip::fs::path(args[1]));
-        } else result = clip::run_ui();
+        } else if (!args.empty() && args[0] == L"--update-test" && args.size() == 2) {
+            if (!GetEnvironmentVariableW(L"FRINKY_CLIP_HOME", nullptr, 0)) throw std::runtime_error("Update tests require isolated storage.");
+            int action = args[1] == L"check" ? 1 : args[1] == L"download" ? 2 : args[1] == L"apply" ? 3 : 0;
+            auto window = FindWindowW(clip::AppWindowClass, nullptr);
+            result = action && window && PostMessageW(window, clip::UpdateTestMessage, action, 0) ? 0 : 1;
+        } else result = clip::run_ui(!args.empty() && args[0] == L"--updated-recording" ? 1 : !args.empty() && args[0] == L"--updated-paused" ? 0 : -1);
     } catch (const std::exception& e) {
         if (argc == 1) MessageBoxW(nullptr, clip::wide(e.what()).c_str(), L"Frinky Clip", MB_OK | MB_ICONERROR);
         else { try { clip::atomic_write(clip::app_dir() / "command-error.txt", e.what()); } catch (...) {} }

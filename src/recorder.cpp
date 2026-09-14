@@ -265,6 +265,7 @@ public:
     }
     bool busy() const { return waiting_save || worker.valid() || !recovered_jobs.empty(); }
     void request_save(int seconds) {
+        if (exiting) return;
         if (busy()) { message = "A save or export is already in progress."; return; }
         if (seconds <= 0 || seconds > cfg.retention_minutes * 60) seconds = cfg.save_seconds;
         pinned.clear();
@@ -307,6 +308,7 @@ public:
     // Export a range of the buffer as a re-encoded clip through the linked
     // FFmpeg libraries. Sources are hard-linked so expiry cannot remove them.
     void export_clip() {
+        if (exiting) return;
         if (busy()) { message = "A save or export is already in progress."; return; }
         auto request = read_export_request(app_dir() / "export-request.json");
         if (request.end_ms - request.start_ms < 100) { message = "Mark a range of at least 0.1 s."; return; }
