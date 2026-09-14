@@ -787,8 +787,7 @@ int run_ui(int resume_recording, bool start_hidden) {
         help("Export resolution");
         ImGui::SameLine(); ImGui::SetNextItemWidth(control_w); int fps = cfg.export_fps == 30 ? 0 : 1;
         if (ImGui::Combo("##fps", &fps, "30 fps\0" "60 fps\0")) { cfg.export_fps = fps == 0 ? 30 : 60; changed = commit = true; }
-        ImGui::SameLine(); ImGui::SetNextItemWidth(control_w); int codec = cfg.export_codec == "av1" ? 1 : 0;
-        if (ImGui::Combo("##codec", &codec, "H.264\0" "AV1\0")) { cfg.export_codec = codec ? "av1" : "h264"; changed = commit = true; }
+        ImGui::SameLine(); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("H.264");
         help("Export codec");
         ImGui::SameLine(); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 4.5f);
         { float mbps = cfg.share_bitrate / 1000.f; bool edited = ImGui::InputFloat("##export-bitrate", &mbps, 0, 0, "%.1f"); commit |= ImGui::IsItemDeactivatedAfterEdit();
@@ -1037,21 +1036,13 @@ int run_ui(int resume_recording, bool start_hidden) {
                     ImVec2(update_at.x + update_w * std::clamp(update.progress / 100.f, 0.f, 1.f), update_at.y + frame_h), accent_u32);
             ImGui::Dummy(ImVec2(update_w, frame_h));
             if (!update.error.empty()) help(update.error.c_str());
-            section("Diagnostics");
-            if (ImGui::Button("Open log")) open_path(window, app_dir() / "recorder.log", error);
-            if (recording) {
-                ImGui::SameLine(); ImGui::AlignTextToFramePadding();
-                ImGui::TextDisabled("%.1f fps | %.2f ms render", obs_data_get_double(status.get(), "fps"), obs_data_get_double(status.get(), "render_ms"));
-            }
-            ImGui::TextDisabled("Missed frames: %lld render / %lld encode", obs_data_get_int(status.get(), "lagged_frames"), obs_data_get_int(status.get(), "skipped_frames"));
-            help("Totals for the last reported session");
-            ImGui::TextDisabled("Closed segments: %zu | thumbnails: %llu decoded, %zu cached, last %.0f ms | player decode: %s", map.spans.size(),
-                (unsigned long long)thumbs.decodes(), thumbs.cached(), thumbs.last_decode_ms(), player.hardware() ? "D3D11VA" : "software");
             if (!settings_error.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, rgb(0xf0a399));
                 ImGui::TextWrapped("Not saved: %s", settings_error.c_str()); ImGui::PopStyleColor();
             }
             ImGui::Spacing();
+            if (ImGui::Button("Open log")) open_path(window, app_dir() / "recorder.log", error);
+            ImGui::SameLine();
             float close_w = ImGui::CalcTextSize("Close").x + style.FramePadding.x * 2;
             ImGui::SetCursorPosX(ImGui::GetWindowContentRegionMax().x - close_w);
             if (ImGui::Button("Close") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();

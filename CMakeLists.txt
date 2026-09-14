@@ -1,10 +1,12 @@
 cmake_minimum_required(VERSION 3.28)
-project(FrinkyClip VERSION 0.3.3 LANGUAGES CXX RC)
+project(FrinkyClip VERSION 0.3.4 LANGUAGES CXX RC)
 if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Frinky Clip requires MSVC and 64-bit Windows.")
 endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# --parallel schedules projects; /MP also compiles sources within each project.
+add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/MP>)
 set(OBS_ROOT "C:/Program Files/obs-studio" CACHE PATH "OBS 32.2.2 installation, the build-time source of the runtime files")
 set(DEPS "${CMAKE_SOURCE_DIR}/.deps")
 set(VELOPACK_ROOT "${DEPS}/velopack-1.2.0")
@@ -17,23 +19,35 @@ set_target_properties(velopack PROPERTIES
   INTERFACE_INCLUDE_DIRECTORIES "${VELOPACK_ROOT}/include")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/include/libavutil")
-file(WRITE "${CMAKE_BINARY_DIR}/include/obsconfig.h" "#pragma once\n#define OBS_RELEASE_CANDIDATE 0\n#define OBS_BETA 0\n#define OBS_DATA_PATH \"data\"\n#define OBS_INSTALL_PREFIX \"\"\n")
-file(WRITE "${CMAKE_BINARY_DIR}/include/libavutil/avconfig.h" "#ifndef AVUTIL_AVCONFIG_H\n#define AVUTIL_AVCONFIG_H\n#define AV_HAVE_BIGENDIAN 0\n#define AV_HAVE_FAST_UNALIGNED 1\n#endif\n")
+file(CONFIGURE OUTPUT "${CMAKE_BINARY_DIR}/include/obsconfig.h" CONTENT "#pragma once\n#define OBS_RELEASE_CANDIDATE 0\n#define OBS_BETA 0\n#define OBS_DATA_PATH \"data\"\n#define OBS_INSTALL_PREFIX \"\"\n" @ONLY)
+file(CONFIGURE OUTPUT "${CMAKE_BINARY_DIR}/include/libavutil/avconfig.h" CONTENT "#ifndef AVUTIL_AVCONFIG_H\n#define AVUTIL_AVCONFIG_H\n#define AV_HAVE_BIGENDIAN 0\n#define AV_HAVE_FAST_UNALIGNED 1\n#endif\n" @ONLY)
 get_filename_component(MSVC_BIN "${CMAKE_LINKER}" DIRECTORY)
 # The installed runtime has no SDK import libraries. Generate them from its
 # export tables; public headers are pinned to the matching OBS / FFmpeg ABI.
 function(import_runtime target dll)
-  execute_process(COMMAND "${MSVC_BIN}/dumpbin.exe" /exports "${OBS_ROOT}/bin/64bit/${dll}.dll"
-    OUTPUT_VARIABLE exports COMMAND_ERROR_IS_FATAL ANY)
-  string(REGEX MATCHALL "[ \t]+[0-9]+[ \t]+[0-9A-F]+[ \t]+[0-9A-F]+[ \t]+[^\r\n]+" rows "${exports}")
-  set(def "LIBRARY ${dll}.dll\nEXPORTS\n")
-  foreach(row IN LISTS rows)
-    string(REGEX REPLACE "^[ \t]+[0-9]+[ \t]+[0-9A-F]+[ \t]+[0-9A-F]+[ \t]+([^ \r\n]+).*" "\\1" symbol "${row}")
-    string(APPEND def "${symbol}\n")
-  endforeach()
-  file(WRITE "${CMAKE_BINARY_DIR}/${target}.def" "${def}")
-  execute_process(COMMAND "${MSVC_BIN}/lib.exe" /nologo /machine:x64 "/def:${CMAKE_BINARY_DIR}/${target}.def"
-    "/out:${CMAKE_BINARY_DIR}/${target}.lib" OUTPUT_QUIET COMMAND_ERROR_IS_FATAL ANY)
+  set(runtime "${OBS_ROOT}/bin/64bit/${dll}.dll")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${runtime}")
+  file(SHA256 "${runtime}" runtime_hash)
+  set(signature "${MSVC_BIN}\n${runtime_hash}")
+  set(stamp "${CMAKE_BINARY_DIR}/${target}.import-stamp")
+  set(previous "")
+  if(EXISTS "${stamp}")
+    file(READ "${stamp}" previous)
+  endif()
+  if(NOT previous STREQUAL signature OR NOT EXISTS "${CMAKE_BINARY_DIR}/${target}.lib")
+    execute_process(COMMAND "${MSVC_BIN}/dumpbin.exe" /exports "${OBS_ROOT}/bin/64bit/${dll}.dll"
+      OUTPUT_VARIABLE exports COMMAND_ERROR_IS_FATAL ANY)
+    string(REGEX MATCHALL "[ \t]+[0-9]+[ \t]+[0-9A-F]+[ \t]+[0-9A-F]+[ \t]+[^\r\n]+" rows "${exports}")
+    set(def "LIBRARY ${dll}.dll\nEXPORTS\n")
+    foreach(row IN LISTS rows)
+      string(REGEX REPLACE "^[ \t]+[0-9]+[ \t]+[0-9A-F]+[ \t]+[0-9A-F]+[ \t]+([^ \r\n]+).*" "\\1" symbol "${row}")
+      string(APPEND def "${symbol}\n")
+    endforeach()
+    file(WRITE "${CMAKE_BINARY_DIR}/${target}.def" "${def}")
+    execute_process(COMMAND "${MSVC_BIN}/lib.exe" /nologo /machine:x64 "/def:${CMAKE_BINARY_DIR}/${target}.def"
+      "/out:${CMAKE_BINARY_DIR}/${target}.lib" OUTPUT_QUIET COMMAND_ERROR_IS_FATAL ANY)
+    file(WRITE "${stamp}" "${signature}")
+  endif()
   add_library(${target} SHARED IMPORTED)
   set_target_properties(${target} PROPERTIES IMPORTED_IMPLIB "${CMAKE_BINARY_DIR}/${target}.lib"
     IMPORTED_LOCATION "${OBS_ROOT}/bin/64bit/${dll}.dll")
@@ -84,7 +98,18 @@ set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
 include(InstallRequiredSystemLibraries)
 # One staging step after both executables: they share an output folder, and
 # concurrent copies into it collide.
-add_custom_target(stage ALL
-  COMMAND ${CMAKE_COMMAND} "-DOBS_ROOT=${OBS_ROOT}" "-DDEST=$<TARGET_FILE_DIR:frinky-clip>" "-DDLLS=${OBS_RUNTIME_DLLS}" "-DEXES=${OBS_RUNTIME_EXES}"
-    "-DPLUGINS=${OBS_PLUGINS}" "-DCRT=${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}" -P "${CMAKE_SOURCE_DIR}/cmake/stage.cmake"
-  DEPENDS frinky-clip clip-tests COMMENT "Staging runtime files beside the executables")
+function(add_runtime_stage target destination)
+  add_custom_target(${target} ${ARGN}
+    COMMAND ${CMAKE_COMMAND} "-DOBS_ROOT=${OBS_ROOT}" "-DDEST=${destination}" "-DDLLS=${OBS_RUNTIME_DLLS}" "-DEXES=${OBS_RUNTIME_EXES}"
+      "-DPLUGINS=${OBS_PLUGINS}" "-DCRT=${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}" -P "${CMAKE_SOURCE_DIR}/cmake/stage.cmake"
+    DEPENDS frinky-clip clip-tests COMMENT "Staging runtime files")
+endfunction()
+add_runtime_stage(stage "$<TARGET_FILE_DIR:frinky-clip>" ALL)
+# Packaging uses the same runtime inventory in a fresh directory, retaining the
+# incremental build output without shipping tests or stale files from that folder.
+set(PACKAGE_STAGE "${CMAKE_SOURCE_DIR}/dist/frinky-clip-${PROJECT_VERSION}-win64")
+add_runtime_stage(stage-package "${PACKAGE_STAGE}")
+add_custom_command(TARGET stage-package POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:frinky-clip>" "${PACKAGE_STAGE}/frinky-clip.exe"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:velopack>" "${PACKAGE_STAGE}/velopack_libc.dll"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/NotoSansMono-Medium.ttf" "${PACKAGE_STAGE}/NotoSansMono-Medium.ttf")

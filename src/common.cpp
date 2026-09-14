@@ -136,6 +136,7 @@ Config Config::load() {
     if (obs_data_has_user_value(d.get(), "modifiers")) c.modifiers = (unsigned)obs_data_get_int(d.get(), "modifiers");
     c.monitor = obs_data_get_string(d.get(), "monitor");
     if (obs_data_has_user_value(d.get(), "export_codec")) c.export_codec = obs_data_get_string(d.get(), "export_codec");
+    if (c.export_codec == "av1") c.export_codec = "h264"; // Migrate the removed export option.
     std::string p = obs_data_get_string(d.get(), "storage"); if (!p.empty()) c.storage = fs::path(wide(p));
     return c;
 }
@@ -144,7 +145,7 @@ void Config::validate() const {
         !std::isfinite(budget_gb) || budget_gb < 0.1 || budget_gb > 10000 || save_seconds < 1 || save_seconds > retention_minutes * 60 ||
         share_bitrate < 1000 || share_bitrate > 100000 || hotkey < VK_F1 || hotkey > VK_F12 ||
         (export_height != 720 && export_height != 1080 && export_height != 1440) || (export_fps != 30 && export_fps != 60) ||
-        (export_codec != "h264" && export_codec != "av1") || desktop_gain < 0 || desktop_gain > 200 || mic_gain < 0 || mic_gain > 200 ||
+        export_codec != "h264" || desktop_gain < 0 || desktop_gain > 200 || mic_gain < 0 || mic_gain > 200 ||
         (modifiers & ~(MOD_CONTROL | MOD_SHIFT | MOD_ALT)) || !storage.is_absolute()) throw std::runtime_error("Invalid settings: check bitrate, retention, storage budget, save duration and absolute storage path.");
 }
 void Config::save() const {

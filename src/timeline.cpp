@@ -73,6 +73,7 @@ ExportRequest read_export_request(const fs::path& path) {
     r.start_ms = obs_data_get_int(d.get(), "start_ms"); r.end_ms = obs_data_get_int(d.get(), "end_ms");
     r.height = (int)obs_data_get_int(d.get(), "height"); r.fps = (int)obs_data_get_int(d.get(), "fps");
     r.bitrate_kbps = (int)obs_data_get_int(d.get(), "bitrate_kbps"); r.codec = obs_data_get_string(d.get(), "codec");
+    if (r.codec.empty() || r.codec == "av1") r.codec = "h264"; // Pending requests from older versions.
     r.audio = obs_data_get_bool(d.get(), "audio"); r.mic = obs_data_get_bool(d.get(), "mic");
     if (obs_data_has_user_value(d.get(), "desktop_gain")) r.desktop_gain = obs_data_get_double(d.get(), "desktop_gain");
     if (obs_data_has_user_value(d.get(), "mic_gain")) r.mic_gain = obs_data_get_double(d.get(), "mic_gain");

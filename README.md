@@ -6,7 +6,7 @@ A Windows tray app that keeps your recent gameplay ready to save. Capture at 144
 
 ## Requirements
 
-- 64-bit Windows and an NVIDIA GPU with AV1 encoding support.
+- 64-bit Windows and an NVIDIA GPU with H.264 NVENC encoding support.
 - A current NVIDIA driver. OBS does not need to be installed.
 
 ## Install

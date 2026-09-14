@@ -27,7 +27,7 @@ foreach ($clipLine in Get-Content "$clipReleaseDir/SHA256SUMS.txt") {
 $clipNotes = @"
 Install **Frinky04.FrinkyClip-win-Setup.exe** to get Frinky Clip and in-app updates. The portable ZIP is available for manual installation.
 
-This build is unsigned, so Windows may show a SmartScreen warning. Requires Windows x64 and an NVIDIA GPU with AV1 encoding support. OBS does not need to be installed.
+This build is unsigned, so Windows may show a SmartScreen warning. Requires Windows x64 and an NVIDIA GPU with H.264 NVENC encoding support. OBS does not need to be installed.
 
 Settings and clips are preserved across updates and uninstall. Check for updates in Settings. Updates finish accepted saves and exports before restarting.
 "@

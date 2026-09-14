@@ -37,11 +37,14 @@ function Wait-State([string]$Expected) {
 }
 function Children([int]$Parent) {
     $all = @(Get-CimInstance Win32_Process)
+    $byId = @{}; foreach ($entry in $all) { $byId[[int]$entry.ProcessId] = $entry }
     $ids = [Collections.Generic.HashSet[int]]::new(); [void]$ids.Add($Parent)
     do {
         $added = $false
         foreach ($entry in $all) {
-            if ($ids.Contains([int]$entry.ParentProcessId) -and $ids.Add([int]$entry.ProcessId)) { $added = $true }
+            # Parent IDs can refer to an exited process whose ID has been reused.
+            if ($ids.Contains([int]$entry.ParentProcessId) -and $byId.ContainsKey([int]$entry.ParentProcessId) -and
+                $entry.CreationDate -ge $byId[[int]$entry.ParentProcessId].CreationDate -and $ids.Add([int]$entry.ProcessId)) { $added = $true }
         }
     } while ($added)
     @($all | Where-Object { $ids.Contains([int]$_.ProcessId) -and $_.ProcessId -ne $Parent } |
@@ -99,6 +102,8 @@ try {
     # seam must come back frame-accurate through the in-process encoder.
     $index = Get-Content -LiteralPath (Join-Path $testHome 'segments.json') -Raw | ConvertFrom-Json
     if ($index.segments.Count -lt 2) { throw 'Expected at least two closed segments before exporting.' }
+    $recordedCodec = & ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 $index.segments[-1].path
+    if ($LASTEXITCODE -or $recordedCodec.Trim() -ne 'h264') { throw 'New recordings must use H.264.' }
     $chained = 0
     for ($i = 1; $i -lt $index.segments.Count; $i++) {
         if ($index.segments[$i].session -ne $index.segments[$i - 1].session) { continue }
@@ -117,6 +122,8 @@ try {
     if ($state.message -notlike 'Exported *') { throw 'Export did not finish.' }
     $exported = & ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 $state.last_clip
     if ($LASTEXITCODE -or [int]$exported -ne 180) { throw "Exported clip has $exported frames; expected 180." }
+    $exportedCodec = & ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 $state.last_clip
+    if ($LASTEXITCODE -or $exportedCodec.Trim() -ne 'h264') { throw 'Exports must use H.264.' }
     Write-Output 'PASS: segments chain exactly and a 3 s export across a seam holds exactly 180 frames.'
     $helpers = Children $owner.Id
     Command '--save 2'; Command '--quit'

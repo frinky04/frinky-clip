@@ -81,6 +81,10 @@ int main() {
         atomic_write(dir / "config.json", "{\"bitrate\":32000,\"audio\":false}");
         loaded = Config::load(); require(loaded.record_on_launch && loaded.bitrate == 32000 && !loaded.audio, "Old configs gain autostart without losing existing settings");
         loaded.record_on_launch = true; loaded.save(); require(Config::load().record_on_launch, "Enabled autostart persists");
+        atomic_write(dir / "config.json", "{\"export_codec\":\"av1\",\"bitrate\":32000,\"mic\":false}");
+        loaded = Config::load();
+        require(loaded.export_codec == "h264" && loaded.bitrate == 32000 && !loaded.mic, "Migrate AV1 export preference without changing other settings");
+        loaded.save(); require(Config::load().export_codec == "h264", "H.264 migration persists");
         SetEnvironmentVariableW(L"FRINKY_CLIP_HOME", *previous_home ? previous_home : nullptr);
         fs::remove(dir / "config.json"); fs::remove(file); fs::remove(dir);
         std::vector<Span> spans{{"a1", "session-a", 1000, 5000}, {"a2", "session-a", 5000, 9000}, {"b1", "session-b", 20000, 24000}};
@@ -88,10 +92,12 @@ int main() {
         require(spans_in_range(spans, 5000, 5500).size() == 1 && spans_in_range(spans, 5000, 5500)[0].path == "a2", "Touching end excludes the earlier segment");
         require(spans_in_range(spans, 8000, 21000).empty(), "Range across sessions is rejected");
         require(spans_in_range(spans, 10000, 15000).empty(), "Range in a gap has no footage");
-        ExportRequest request; request.start_ms = 3250; request.end_ms = 7000; request.height = 720; request.fps = 30; request.bitrate_kbps = 8000; request.codec = "av1"; request.mic = true;
+        ExportRequest request; request.start_ms = 3250; request.end_ms = 7000; request.height = 720; request.fps = 30; request.bitrate_kbps = 8000; request.mic = true;
         auto round_trip_dir = fs::temp_directory_path() / ("FrinkyClipExport-" + unique_id());
         write_export_request(round_trip_dir / "r.json", request); auto back = read_export_request(round_trip_dir / "r.json");
-        require(back.start_ms == 3250 && back.end_ms == 7000 && back.height == 720 && back.fps == 30 && back.codec == "av1" && back.audio && back.mic, "Export request round trip");
+        require(back.start_ms == 3250 && back.end_ms == 7000 && back.height == 720 && back.fps == 30 && back.codec == "h264" && back.audio && back.mic, "Export request round trip");
+        request.codec = "av1"; write_export_request(round_trip_dir / "r.json", request);
+        require(read_export_request(round_trip_dir / "r.json").codec == "h264", "Migrate pending AV1 export requests");
         fs::remove_all(round_trip_dir);
         auto index_dir = fs::temp_directory_path() / ("FrinkyClipIndex-" + unique_id());
         BufferMap published; published.spans = {{"C:/b/session-a/s1.mkv", "session-a", 1000, 5000}, {"C:/b/session-a/s2.mkv", "session-a", 5000, 9000}}; published.last_end_ms = 9000;

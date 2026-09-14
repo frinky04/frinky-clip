@@ -33,7 +33,7 @@ std::vector<Span> spans_in_range(const std::vector<Span>& spans, std::int64_t st
 struct ExportRequest {
     std::int64_t start_ms = 0, end_ms = 0;
     int height = 1080, fps = 60, bitrate_kbps = 20000;
-    std::string codec = "h264"; // or "av1"
+    std::string codec = "h264";
     bool audio = true; // Desktop audio track.
     bool mic = false;  // Microphone track, mixed with desktop audio when both are on.
     double desktop_gain = 1, mic_gain = 1; // Mix gains, 1 = unity.

@@ -33,7 +33,7 @@ function Invoke-App([string]$Arguments) {
     if (-not $clipCommand.WaitForExit(5000) -or $clipCommand.ExitCode -ne 0) { throw "App command failed: $Arguments" }
 }
 try {
-    $clipConfig = @{record_on_launch=$false;auto_check_updates=$false;storage=$clipStorage;save_seconds=5;export_height=720;export_codec='av1'} | ConvertTo-Json
+    $clipConfig = @{record_on_launch=$false;auto_check_updates=$false;storage=$clipStorage;save_seconds=5;export_height=720;export_codec='h264'} | ConvertTo-Json
     [IO.File]::WriteAllText((Join-Path $clipHome 'config.json'), $clipConfig)
     [IO.File]::WriteAllText((Join-Path $clipStorage 'keep.txt'), 'User recordings must survive upgrades and uninstall.')
     $clipInstaller = "$clipTestRoot/dist/releases/$FromVersion/Frinky04.FrinkyClip-win-Setup.exe"

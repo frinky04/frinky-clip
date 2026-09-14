@@ -60,7 +60,7 @@ bool supports(const AVCodecContext* ctx, const AVCodec* codec, AVPixelFormat wan
 // additionally has a software fallback so an export never depends on the GPU.
 AVCodecContext* open_video_encoder(const ExportRequest& r, int src_w, int src_h, std::string& name_out, AVFrame* input) {
     int height = r.height & ~1, width = ((int)std::lround((double)src_w * height / std::max(1, src_h)) + 1) & ~1;
-    std::vector<const char*> names = r.codec == "av1" ? std::vector<const char*>{"av1_nvenc"} : std::vector<const char*>{"h264_nvenc", "libx264"};
+    const char* names[] = {"h264_nvenc", "libx264"};
     std::string errors;
     for (auto name : names) {
         const AVCodec* codec = avcodec_find_encoder_by_name(name);
@@ -85,7 +85,7 @@ AVCodecContext* open_video_encoder(const ExportRequest& r, int src_w, int src_h,
             if (std::strstr(name, "nvenc")) { av_dict_set(&options, "preset", "p5", 0); av_dict_set(&options, "rc", "vbr", 0); }
             else { av_dict_set(&options, "preset", "fast", 0); ctx->thread_count = 0; }
             if (attempt == 0) av_dict_set_int(&options, "delay", GpuInputDelay, 0);
-            if (r.codec != "av1") av_dict_set(&options, "profile", "high", 0);
+            av_dict_set(&options, "profile", "high", 0);
             int result = avcodec_open2(ctx, codec, &options); av_dict_free(&options);
             if (result < 0) { char text[AV_ERROR_MAX_STRING_SIZE]; av_strerror(result, text, sizeof(text)); errors += std::string(name) + ": " + text + "; "; continue; }
             name_out = name; auto* raw = ctx.value; ctx.value = nullptr; return raw;
@@ -385,7 +385,7 @@ struct Exporter {
 static ExportResult export_clip_impl(const std::vector<Span>& sources, const ExportRequest& request, const fs::path& output, std::atomic<double>* progress, bool force_cpu_input) {
     if (sources.empty()) throw std::runtime_error("No footage in the marked range");
     if (request.end_ms - request.start_ms < 100) throw std::runtime_error("Mark a range of at least 0.1 s.");
-    if (request.fps <= 0 || request.height <= 0 || request.bitrate_kbps <= 0) throw std::runtime_error("Invalid export settings");
+    if (request.codec != "h264" || request.fps <= 0 || request.height <= 0 || request.bitrate_kbps <= 0) throw std::runtime_error("Invalid export settings");
     fs::create_directories(output.parent_path());
     fs::path temp = output; temp += L".partial";
     auto hw = hw_device(nullptr);
@@ -449,8 +449,8 @@ int export_test(const fs::path& buffer_root, int seconds) {
     catch (const std::exception& e) { atomic_write(app_dir() / "export-test.txt", report + e.what() + "\n"); return 1; }
     request.bitrate_kbps = 8000; request.mic = map.spans[seam].coarse.size() > 1;
     double duration = (request.end_ms - request.start_ms) / 1000.0;
-    auto run = [&](const char* codec, int fps, int height, bool force_cpu, const std::string& label) {
-        request.codec = codec; request.fps = fps; request.height = height;
+    auto run = [&](int fps, int height, bool force_cpu, const std::string& label) {
+        request.fps = fps; request.height = height;
         auto output = app_dir() / ("export-test-" + label + ".mp4");
         auto began = steady_ms();
         try {
@@ -468,11 +468,9 @@ int export_test(const fs::path& buffer_root, int seconds) {
             if (!ok) ++failures;
         } catch (const std::exception& e) { report += label + " failed: " + e.what() + "\n"; ++failures; }
     };
-    for (const char* codec : {"h264", "av1"}) {
-        for (int fps : {60, 30}) run(codec, fps, 720, false, std::string(codec) + "-" + std::to_string(fps));
-        run(codec, 60, source_info.height, false, std::string(codec) + "-same-60-gpu");
-        run(codec, 60, source_info.height, true, std::string(codec) + "-same-60-cpu");
-    }
+    for (int fps : {60, 30}) run(fps, 720, false, "h264-" + std::to_string(fps));
+    run(60, source_info.height, false, "h264-same-60-gpu");
+    run(60, source_info.height, true, "h264-same-60-cpu");
     report += failures ? "FAIL\n" : "PASS\n";
     atomic_write(app_dir() / "export-test.txt", report);
     return failures;

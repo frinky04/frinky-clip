@@ -192,8 +192,8 @@ public:
         obs_data_set_int(settings.get(), "keyint_sec", 1); obs_data_set_string(settings.get(), "preset", "p4");
         obs_data_set_string(settings.get(), "multipass", "disabled"); obs_data_set_bool(settings.get(), "lookahead", false);
         obs_data_set_bool(settings.get(), "adaptive_quantization", false); obs_data_set_int(settings.get(), "bf", 0);
-        video_encoder = obs_video_encoder_create("obs_nvenc_av1_tex", "NVENC AV1", settings.get(), nullptr);
-        if (!video_encoder) throw std::runtime_error("NVENC AV1 unavailable. Check the NVIDIA driver.");
+        video_encoder = obs_video_encoder_create("obs_nvenc_h264_tex", "NVENC H.264", settings.get(), nullptr);
+        if (!video_encoder) throw std::runtime_error("NVENC H.264 unavailable. Check the NVIDIA driver and GPU encoding support.");
         obs_encoder_set_video(video_encoder, obs_get_video());
         session_dir = buffer.root() / ("session-" + unique_id()); fs::create_directories(session_dir);
         active = session_dir / "segment-000000.mkv";

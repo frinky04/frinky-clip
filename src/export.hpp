@@ -12,7 +12,7 @@ namespace clip {
 struct ExportResult { std::string video_encoder, decoder; std::int64_t frames = 0; bool gpu_input = false; /* Actual D3D11 input to NVENC. */ };
 ExportResult export_clip(const std::vector<Span>& sources, const ExportRequest& request, const fs::path& output, std::atomic<double>* progress = nullptr);
 // Headless check: export a short range across a segment seam from a buffer
-// folder with each codec and frame rate, verify duration and frame count, and
+// folder with each frame rate and input path, verify duration and frame count, and
 // write export-test.txt in the app directory. Returns the failure count.
 int export_test(const fs::path& buffer_root, int seconds);
 }
