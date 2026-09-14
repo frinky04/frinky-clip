@@ -100,6 +100,7 @@ Config Config::load() {
     integer("bitrate", c.bitrate); integer("max_bitrate", c.max_bitrate); integer("retention_minutes", c.retention_minutes);
     integer("save_seconds", c.save_seconds); integer("share_bitrate", c.share_bitrate);
     integer("export_height", c.export_height); integer("export_fps", c.export_fps);
+    integer("desktop_gain", c.desktop_gain); integer("mic_gain", c.mic_gain);
     if (obs_data_has_user_value(d.get(), "budget_gb")) c.budget_gb = obs_data_get_double(d.get(), "budget_gb");
     if (obs_data_has_user_value(d.get(), "audio")) c.audio = obs_data_get_bool(d.get(), "audio");
     if (obs_data_has_user_value(d.get(), "mic")) c.mic = obs_data_get_bool(d.get(), "mic");
@@ -117,7 +118,7 @@ void Config::validate() const {
         !std::isfinite(budget_gb) || budget_gb < 0.1 || budget_gb > 10000 || save_seconds < 1 || save_seconds > retention_minutes * 60 ||
         share_bitrate < 1000 || share_bitrate > 100000 || hotkey < VK_F1 || hotkey > VK_F12 ||
         (export_height != 720 && export_height != 1080 && export_height != 1440) || (export_fps != 30 && export_fps != 60) ||
-        (export_codec != "h264" && export_codec != "av1") ||
+        (export_codec != "h264" && export_codec != "av1") || desktop_gain < 0 || desktop_gain > 200 || mic_gain < 0 || mic_gain > 200 ||
         (modifiers & ~(MOD_CONTROL | MOD_SHIFT | MOD_ALT)) || !storage.is_absolute()) throw std::runtime_error("Invalid settings: check bitrate, retention, storage budget, save duration and absolute storage path.");
 }
 void Config::save() const {
@@ -126,6 +127,7 @@ void Config::save() const {
     obs_data_set_int(d.get(), "retention_minutes", retention_minutes); obs_data_set_double(d.get(), "budget_gb", budget_gb);
     obs_data_set_int(d.get(), "save_seconds", save_seconds); obs_data_set_int(d.get(), "share_bitrate", share_bitrate);
     obs_data_set_int(d.get(), "export_height", export_height); obs_data_set_int(d.get(), "export_fps", export_fps);
+    obs_data_set_int(d.get(), "desktop_gain", desktop_gain); obs_data_set_int(d.get(), "mic_gain", mic_gain);
     obs_data_set_string(d.get(), "export_codec", export_codec.c_str());
     obs_data_set_int(d.get(), "hotkey", hotkey); obs_data_set_int(d.get(), "modifiers", modifiers);
     obs_data_set_bool(d.get(), "audio", audio); obs_data_set_string(d.get(), "monitor", monitor.c_str());

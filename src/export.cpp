@@ -103,13 +103,13 @@ struct Exporter {
     // has a queue of converted samples placed on the output grid; the mix
     // consumes them in step, padding a track that has fallen behind or is
     // absent from the current segment with silence.
-    struct Track { int ordinal; Fifo fifo; std::int64_t written = 0; };
+    struct Track { int ordinal; float gain; Fifo fifo; std::int64_t written = 0; };
     std::vector<Track> tracks; std::int64_t frames_out = 0, mixed_out = 0, audio_pts = 0; bool video_done = false, audio_done = false;
     std::string decoder_name, encoder_name; fs::path temp_path;
     Exporter(const ExportRequest& request, std::atomic<double>* p) : r(request), progress(p) {
         in_us = request.start_ms * 1000; out_us = request.end_ms * 1000;
         total_frames = std::max<std::int64_t>(1, (out_us - in_us) * request.fps / Million);
-        if (request.audio) tracks.push_back({0}); if (request.mic) tracks.push_back({1});
+        if (request.audio) tracks.push_back({0, (float)request.desktop_gain}); if (request.mic) tracks.push_back({1, (float)request.mic_gain});
     }
     ~Exporter() { if (out) { if (out->pb) avio_closep(&out->pb); avformat_free_context(out); } }
     std::int64_t due_us(std::int64_t n) const { return in_us + n * Million / r.fps; }
@@ -170,7 +170,7 @@ struct Exporter {
                 int got = std::max(0, av_audio_fifo_read(track.fifo, (void**)planes, n));
                 for (int c = 0; c < channels; ++c) {
                     auto* mix = reinterpret_cast<float*>(audio_frame->data[c]); auto* in = reinterpret_cast<const float*>(planes[c]);
-                    for (int i = 0; i < got; ++i) mix[i] += in[i];
+                    for (int i = 0; i < got; ++i) mix[i] += in[i] * track.gain;
                 }
                 track.written = std::max(track.written, mixed_out + n);
             }

@@ -206,7 +206,7 @@ int run_ui() {
     // that eases toward it, so pans and zooms glide instead of jumping.
     std::int64_t target_end_ms = now_ms(), in_ms = 0, out_ms = 0;
     double target_seconds = 240, shown_seconds = 240, shown_end_ms = (double)target_end_ms; bool animating = false;
-    bool follow = true, open_settings = false, export_system = true, export_mic = true;
+    bool follow = true, open_settings = false;
     // Status lives on the action that started the work: the recorder's message
     // is watched for transitions, and a result shows on its button for a while.
     std::string last_message, notice, dismissed_failure; std::int64_t exported_at = 0, saved_at = 0, notice_at = 0; bool hotkey_warning_dismissed = false;
@@ -356,6 +356,7 @@ int run_ui() {
             float img_h = h, img_w = std::floor(img_h * 16 / 9);
             if (img_w > w) { img_w = w; img_h = std::floor(img_w * 9 / 16); }
             player.set_width((int)std::min(img_w * 2, 1920.f)); // Decode at up to 2x for crisp scaling.
+            player.set_gains(cfg.desktop_gain / 100.f, cfg.mic_gain / 100.f);
             auto picture = player.tick();
             // While scrubbing or seeking, the keyframe at the target shows at
             // once (from the cache when it has been seen); the exact frame
@@ -690,9 +691,15 @@ int run_ui() {
         // The microphone option follows the footage: it is offered when every
         // segment in the marked range carries a microphone track.
         bool mic_available = !sources.empty() && std::all_of(sources.begin(), sources.end(), [](const Span& s) { return s.coarse.size() > 1; });
-        ImGui::SameLine(0, 12 * dpi); ImGui::Checkbox("Desktop audio", &export_system); help("Include desktop audio in the export.");
-        ImGui::SameLine(); ImGui::BeginDisabled(!mic_available); ImGui::Checkbox("Microphone", &export_mic); ImGui::EndDisabled();
-        help(mic_available ? "Mix the microphone into the export's audio." : "The marked range has no microphone track. Enable the microphone in Settings to record one.");
+        // Mix levels, shared by playback and export so what you hear is what
+        // you get. 0% mutes a track; the microphone slider is live whenever
+        // there is a microphone track to level.
+        ImGui::SameLine(0, 14 * dpi); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("Desktop"); ImGui::SameLine(0, style.ItemInnerSpacing.x);
+        ImGui::SetNextItemWidth(64 * dpi); if (ImGui::SliderInt("##desktop-gain", &cfg.desktop_gain, 0, 200, "%d%%", ImGuiSliderFlags_AlwaysClamp)) changed = true; commit |= ImGui::IsItemDeactivatedAfterEdit();
+        help("Desktop audio level in playback and in the export. 0% leaves it out.");
+        ImGui::SameLine(0, 10 * dpi); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("Mic"); ImGui::SameLine(0, style.ItemInnerSpacing.x);
+        ImGui::BeginDisabled(!mic_lane); ImGui::SetNextItemWidth(64 * dpi); if (ImGui::SliderInt("##mic-gain", &cfg.mic_gain, 0, 200, "%d%%", ImGuiSliderFlags_AlwaysClamp)) changed = true; commit |= ImGui::IsItemDeactivatedAfterEdit(); ImGui::EndDisabled();
+        help(mic_lane ? "Microphone level in playback and in the export. 0% leaves it out." : "No microphone track. Turn on Microphone in Settings to record one.");
         bool closed = have_range && !sources.empty() && out_ms <= map.last_end_ms + 1;
         bool can_export = closed && recorder && !busy && !app.quitting();
         // Watch the recorder's message for results and notices.
@@ -718,7 +725,8 @@ int run_ui() {
         if (pressed && !exporting) {
             try {
                 ExportRequest request; request.start_ms = in_ms; request.end_ms = out_ms; request.height = cfg.export_height; request.fps = cfg.export_fps;
-                request.bitrate_kbps = cfg.share_bitrate; request.codec = cfg.export_codec; request.audio = export_system; request.mic = export_mic && mic_available;
+                request.bitrate_kbps = cfg.share_bitrate; request.codec = cfg.export_codec; request.audio = cfg.desktop_gain > 0; request.mic = mic_available && cfg.mic_gain > 0;
+                request.desktop_gain = cfg.desktop_gain / 100.0; request.mic_gain = cfg.mic_gain / 100.0;
                 write_export_request(app_dir() / "export-request.json", request);
                 PostMessageW(recorder, ExportMessage, 0, 0); error.clear();
             } catch (const std::exception& e) { error = e.what(); }
@@ -821,11 +829,12 @@ int run_ui() {
                 if (ImGui::BeginCombo("##display", display_label.c_str())) { for (auto& d : displays) if (ImGui::Selectable(d.label.c_str(), d.id == cfg.monitor)) { cfg.monitor = d.id; changed = commit = true; } ImGui::EndCombo(); }
                 row("Audio"); if (ImGui::Checkbox("Desktop", &cfg.audio)) changed = commit = true; help("Records the default playback device as the first audio track.");
                 ImGui::SameLine(0, 12 * dpi); if (ImGui::Checkbox("Microphone", &cfg.mic)) changed = commit = true; help("Records the selected input as a second audio track, shown as its own lane and mixed into exports on request.");
-                if (cfg.mic) {
-                    row("Microphone"); std::string mic_label = "Default microphone";
-                    for (auto& d : microphones) if (d.id == cfg.mic_device) mic_label = d.label;
-                    if (ImGui::BeginCombo("##microphone", mic_label.c_str())) { for (auto& d : microphones) if (ImGui::Selectable(d.label.c_str(), d.id == cfg.mic_device)) { cfg.mic_device = d.id; changed = commit = true; } ImGui::EndCombo(); }
-                }
+                // The device row is always present, so turning the microphone on does not reflow the dialog.
+                row("Microphone"); std::string mic_label = "Default microphone";
+                for (auto& d : microphones) if (d.id == cfg.mic_device) mic_label = d.label;
+                ImGui::BeginDisabled(!cfg.mic);
+                if (ImGui::BeginCombo("##microphone", mic_label.c_str())) { for (auto& d : microphones) if (ImGui::Selectable(d.label.c_str(), d.id == cfg.mic_device)) { cfg.mic_device = d.id; changed = commit = true; } ImGui::EndCombo(); }
+                ImGui::EndDisabled(); help("The input to record when Microphone is on.");
                 changed |= bitrate_row("Bitrate", cfg.bitrate, commit); changed |= bitrate_row("Max bitrate", cfg.max_bitrate, commit);
                 ImGui::EndTable();
             }

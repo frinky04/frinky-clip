@@ -74,13 +74,16 @@ ExportRequest read_export_request(const fs::path& path) {
     r.height = (int)obs_data_get_int(d.get(), "height"); r.fps = (int)obs_data_get_int(d.get(), "fps");
     r.bitrate_kbps = (int)obs_data_get_int(d.get(), "bitrate_kbps"); r.codec = obs_data_get_string(d.get(), "codec");
     r.audio = obs_data_get_bool(d.get(), "audio"); r.mic = obs_data_get_bool(d.get(), "mic");
+    if (obs_data_has_user_value(d.get(), "desktop_gain")) r.desktop_gain = obs_data_get_double(d.get(), "desktop_gain");
+    if (obs_data_has_user_value(d.get(), "mic_gain")) r.mic_gain = obs_data_get_double(d.get(), "mic_gain");
     return r;
 }
 void write_export_request(const fs::path& path, const ExportRequest& r) {
     auto d = data(); obs_data_set_int(d.get(), "start_ms", r.start_ms); obs_data_set_int(d.get(), "end_ms", r.end_ms);
     obs_data_set_int(d.get(), "height", r.height); obs_data_set_int(d.get(), "fps", r.fps);
     obs_data_set_int(d.get(), "bitrate_kbps", r.bitrate_kbps); obs_data_set_string(d.get(), "codec", r.codec.c_str());
-    obs_data_set_bool(d.get(), "audio", r.audio); obs_data_set_bool(d.get(), "mic", r.mic); write_json(path, d.get());
+    obs_data_set_bool(d.get(), "audio", r.audio); obs_data_set_bool(d.get(), "mic", r.mic);
+    obs_data_set_double(d.get(), "desktop_gain", r.desktop_gain); obs_data_set_double(d.get(), "mic_gain", r.mic_gain); write_json(path, d.get());
 }
 static std::tm local_tm(std::int64_t epoch_ms) {
     std::time_t t = epoch_ms / 1000; std::tm tm{}; localtime_s(&tm, &t); return tm;

@@ -33,6 +33,7 @@ struct Config {
     double budget_gb = 50;
     int save_seconds = 60;
     int share_bitrate = 20000;
+    int desktop_gain = 100, mic_gain = 100; // Playback and export mix, percent; 0 mutes a track.
     int export_height = 1080; // Clip editor export defaults: 720, 1080, or 1440 lines.
     int export_fps = 60;      // 30 or 60.
     std::string export_codec = "h264"; // or "av1"

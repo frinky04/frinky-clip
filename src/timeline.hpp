@@ -36,6 +36,7 @@ struct ExportRequest {
     std::string codec = "h264"; // or "av1"
     bool audio = true; // Desktop audio track.
     bool mic = false;  // Microphone track, mixed with desktop audio when both are on.
+    double desktop_gain = 1, mic_gain = 1; // Mix gains, 1 = unity.
 };
 ExportRequest read_export_request(const fs::path& path);
 void write_export_request(const fs::path& path, const ExportRequest& request);
