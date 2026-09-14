@@ -204,7 +204,7 @@ int run_ui() {
     // that eases toward it, so pans and zooms glide instead of jumping.
     std::int64_t target_end_ms = now_ms(), in_ms = 0, out_ms = 0;
     double target_seconds = 240, shown_seconds = 240, shown_end_ms = (double)target_end_ms; bool animating = false;
-    bool follow = true, open_settings = false, export_system = true, export_mic = false;
+    bool follow = true, open_settings = false, export_system = true;
     // Hover preview state persists across frames so it can fade and hold its last picture.
     Thumbnails::Picture hover_picture{}; float hover_alpha = 0, hover_x = 0; std::int64_t hover_shown_ms = 0;
     enum class Drag { None, Press, Range, In, Out } drag = Drag::None; std::int64_t drag_anchor = 0, scrub_ms = 0; float press_x = 0; bool scrubbing = false;
@@ -331,7 +331,8 @@ int run_ui() {
 
         // Lanes: wall-clock ruler, video with thumbnails, and audio coverage for the viewed window.
         float row_h = ImGui::GetFrameHeightWithSpacing();
-        float below_h = row_h * 3 + ImGui::GetTextLineHeightWithSpacing() + style.ItemSpacing.y * 3 + 3 * dpi + style.WindowPadding.y;
+        // Two clip rows, then the recorder strip: a padded action row and one message line.
+        float below_h = 2 * dpi + style.ItemSpacing.y + row_h * 2 + 6 * dpi + style.ItemSpacing.y + 8 * dpi * 2 + ImGui::GetFrameHeight() + style.ItemSpacing.y + ImGui::GetTextLineHeight() + style.WindowPadding.y;
         // Fixed lane heights; whatever is left above them previews the cut frames.
         float audio_h = 30 * dpi, video_h = 96 * dpi, ruler_h = ImGui::GetTextLineHeight() + 4 * dpi;
         float lanes_h = ruler_h + 2 * dpi + video_h + (audio_h + 4 * dpi) + 4 * dpi + style.WindowPadding.y;
@@ -339,7 +340,7 @@ int run_ui() {
         std::int64_t hover_ms = 0; bool hover_lane = false, hover_video = false, fading = false; auto tick_ms = steady_ms();
         // Viewport: the frame at the playhead, streaming while playing.
         std::int64_t playhead = player.position();
-        if (ImGui::BeginChild("preview", ImVec2(0, preview_h), ImGuiChildFlags_Borders)) {
+        if (ImGui::BeginChild("preview", ImVec2(0, preview_h), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
             ImVec2 p = ImGui::GetCursorScreenPos(); float w = ImGui::GetContentRegionAvail().x, h = ImGui::GetContentRegionAvail().y;
             float img_h = h, img_w = std::floor(img_h * 16 / 9);
             if (img_w > w) { img_w = w; img_h = std::floor(img_w * 9 / 16); }
@@ -382,7 +383,7 @@ int run_ui() {
             help("Click or press Space to play and pause.");
         }
         ImGui::EndChild();
-        if (ImGui::BeginChild("lanes", ImVec2(0, lanes_h), ImGuiChildFlags_Borders)) {
+        if (ImGui::BeginChild("lanes", ImVec2(0, lanes_h), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
             ImVec2 origin = ImGui::GetCursorScreenPos(); float w = ImGui::GetContentRegionAvail().x, label_w = 44 * dpi;
             float track_x = origin.x + label_w, track_w = w - label_w;
             double px_per_ms = track_w / (view_seconds * 1000);
@@ -597,40 +598,44 @@ int run_ui() {
         }
         // Keep a playing playhead on screen by paging the view forward.
         if (player.playing() && !follow && playhead > view_end_ms) { target_end_ms = playhead + (std::int64_t)(target_seconds * 900); }
-        // Transport and range row.
+
+        // Clip rows: unboxed, directly under the lanes they describe. Both
+        // share the content's leading edge (Play) and trailing edge (Export).
+        ImGui::Dummy(ImVec2(0, 2 * dpi));
         ImGui::AlignTextToFramePadding();
         if (ImGui::Button(player.playing() ? "Pause" : "Play", ImVec2(60 * dpi, 0))) player.toggle();
         help("Space plays and pauses. Arrow keys step one frame; Shift+arrows step one second.");
         ImGui::SameLine(); ImGui::TextUnformatted(playhead ? local_time(playhead, true).c_str() : "--:--:--.---");
-        ImGui::SameLine(0, 12 * dpi);
+        ImGui::SameLine(0, 16 * dpi);
         if (have_range) {
             double seconds = (out_ms - in_ms) / 1000.0;
-            ImGui::SameLine(); ImGui::Text("In %s  Out %s", local_time(in_ms, true).c_str(), local_time(out_ms, true).c_str());
-            ImGui::SameLine(); ImGui::TextDisabled("%.3f s, %lld frames", seconds, (long long)std::llround(seconds * 60));
-            ImGui::SameLine(); if (ImGui::Button("Clear")) { in_ms = out_ms = 0; }
+            ImGui::TextDisabled("In"); ImGui::SameLine(); ImGui::TextUnformatted(local_time(in_ms, true).c_str());
+            ImGui::SameLine(0, 10 * dpi); ImGui::TextDisabled("Out"); ImGui::SameLine(); ImGui::TextUnformatted(local_time(out_ms, true).c_str());
+            ImGui::SameLine(0, 10 * dpi); ImGui::TextDisabled("%.3f s (%lld frames)", seconds, (long long)std::llround(seconds * 60));
+            ImGui::SameLine(0, 10 * dpi); if (ImGui::Button("Clear")) { in_ms = out_ms = 0; }
         } else {
-            ImGui::SameLine(); ImGui::TextDisabled(in_ms ? ("In " + local_time(in_ms, true) + "  press O to mark the out point").c_str() : out_ms ? ("Out " + local_time(out_ms, true) + "  press I to mark the in point").c_str() : "Drag the lane or press I and O to mark a range");
+            ImGui::TextDisabled("%s", in_ms ? ("In " + local_time(in_ms, true) + "   press O to mark the out point").c_str()
+                : out_ms ? ("Out " + local_time(out_ms, true) + "   press I to mark the in point").c_str() : "Drag the lane or press I and O to mark a range");
         }
-        // Export row.
-        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f); int res = cfg.export_height == 720 ? 0 : cfg.export_height == 1440 ? 2 : 1;
+        float control_w = ImGui::GetFontSize() * 5.5f;
+        ImGui::SetNextItemWidth(control_w); int res = cfg.export_height == 720 ? 0 : cfg.export_height == 1440 ? 2 : 1;
         if (ImGui::Combo("##res", &res, "720p\0" "1080p\0" "1440p\0")) { cfg.export_height = res == 0 ? 720 : res == 2 ? 1440 : 1080; changed = commit = true; }
         help("Export resolution. Frame-accurate re-encode with NVENC.");
-        ImGui::SameLine(); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f); int fps = cfg.export_fps == 30 ? 0 : 1;
+        ImGui::SameLine(); ImGui::SetNextItemWidth(control_w); int fps = cfg.export_fps == 30 ? 0 : 1;
         if (ImGui::Combo("##fps", &fps, "30 fps\0" "60 fps\0")) { cfg.export_fps = fps == 0 ? 30 : 60; changed = commit = true; }
-        ImGui::SameLine(); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.0f); int codec = cfg.export_codec == "av1" ? 1 : 0;
+        ImGui::SameLine(); ImGui::SetNextItemWidth(control_w); int codec = cfg.export_codec == "av1" ? 1 : 0;
         if (ImGui::Combo("##codec", &codec, "H.264\0" "AV1\0")) { cfg.export_codec = codec ? "av1" : "h264"; changed = commit = true; }
         help("H.264 plays everywhere. AV1 is smaller at the same quality but needs newer players.");
-        ImGui::SameLine(); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f);
+        ImGui::SameLine(); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 4.5f);
         { float mbps = cfg.share_bitrate / 1000.f; bool edited = ImGui::InputFloat("##export-bitrate", &mbps, 0, 0, "%.1f"); commit |= ImGui::IsItemDeactivatedAfterEdit();
           if (edited && std::isfinite(mbps) && mbps >= 0 && mbps <= 1000) { cfg.share_bitrate = (int)std::round(mbps * 1000); changed = true; } }
-        ImGui::SameLine(); ImGui::TextDisabled("Mbps"); help("Export bitrate.");
-        ImGui::SameLine(); ImGui::Checkbox("Desktop audio", &export_system); help("Include desktop audio in the export.");
-        ImGui::SameLine(); ImGui::BeginDisabled(); ImGui::Checkbox("Microphone", &export_mic); ImGui::EndDisabled();
-        help("A separate microphone track is planned. Recording currently captures desktop audio only.");
+        help("Export bitrate.");
+        ImGui::SameLine(0, style.ItemInnerSpacing.x); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("Mbps");
+        ImGui::SameLine(0, 12 * dpi); ImGui::Checkbox("Desktop audio", &export_system); help("Include desktop audio in the export. A microphone track is planned.");
         auto sources = have_range ? spans_in_range(map.spans, in_ms, out_ms) : std::vector<Span>{};
         bool closed = have_range && !sources.empty() && out_ms <= map.last_end_ms + 1;
         bool can_export = closed && recorder && !busy && !app.quitting();
-        float export_w = ImGui::CalcTextSize("Export").x + style.FramePadding.x * 2;
+        float export_w = ImGui::CalcTextSize("Export").x + style.FramePadding.x * 2 + 12 * dpi;
         ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - export_w);
         ImGui::BeginDisabled(!can_export);
         if (primary_button("Export", ImVec2(export_w, 0))) {
@@ -650,45 +655,72 @@ int run_ui() {
             PostMessageW(recorder, PinMessage, (WPARAM)a, (LPARAM)b); last_pin = now;
         }
 
-        ImGui::Separator();
-        // Recorder footer: state, buffer clock, and the quick actions.
-        auto dot = ImGui::GetCursorScreenPos(); float line_height = ImGui::GetFrameHeight();
-        draw->AddCircleFilled(ImVec2(dot.x + 4 * dpi, dot.y + line_height / 2), 3 * dpi, recording ? ImGui::ColorConvertFloat4ToU32(foreground) : muted_u32);
-        ImGui::Dummy(ImVec2(12 * dpi, line_height)); ImGui::SameLine(); ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(state == "quitting" ? "Quitting…" : state == "stopping" ? "Stopping…" : recording ? "Recording" : state == "starting" ? "Starting…" : "Paused");
-        ImGui::SameLine(); ImGui::PushFont(regular, 19); ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(duration(buffered).c_str()); ImGui::PopFont();
-        ImGui::SameLine(); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("buffered");
-        char summary[64]; snprintf(summary, sizeof(summary), "%.2f / %.0f GB", used, cfg.budget_gb);
-        ImGui::SameLine(); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("%s", summary);
-        help("Oldest footage expires at the history or disk limit. Saved clips and pending exports are stored separately.");
-        auto save_label = "Save last " + std::to_string(cfg.save_seconds) + "s"; auto keys = shortcut(cfg);
-        float button_w = 90 * dpi, save_w = ImGui::CalcTextSize(save_label.c_str()).x + style.FramePadding.x * 2;
-        float folder_w = ImGui::CalcTextSize("Folder").x + style.FramePadding.x * 2, keys_w = ImGui::CalcTextSize(keys.c_str()).x;
-        ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - (button_w + save_w + keys_w + folder_w + style.ItemSpacing.x * 3));
-        if (paused) {
-            if (ImGui::Button("Record", ImVec2(button_w, 0))) start_recording();
-        } else {
-            ImGui::BeginDisabled(!recording); if (ImGui::Button("Stop", ImVec2(button_w, 0))) app.stop(); ImGui::EndDisabled();
+        // Recorder strip: a filled surface running edge to edge along the
+        // bottom of the window, a different surface for a different subject.
+        // State and buffer on the leading side, actions on the trailing side,
+        // one message line beneath. Its height never changes.
+        {
+            float pad = 8 * dpi, frame_h = ImGui::GetFrameHeight(), text_h = ImGui::GetTextLineHeight();
+            ImGui::Dummy(ImVec2(0, 6 * dpi));
+            ImVec2 top = ImGui::GetCursorScreenPos(), win = ImGui::GetWindowPos(), win_size = ImGui::GetWindowSize();
+            draw->AddRectFilled(ImVec2(win.x, top.y), ImVec2(win.x + win_size.x, win.y + win_size.y), track_u32);
+            draw->AddLine(ImVec2(win.x, top.y), ImVec2(win.x + win_size.x, top.y), line_u32);
+            ImGui::SetCursorScreenPos(ImVec2(top.x, top.y + pad));
+            auto dot = ImGui::GetCursorScreenPos();
+            draw->AddCircleFilled(ImVec2(dot.x + 4 * dpi, dot.y + frame_h / 2), 3.5f * dpi, recording ? ImGui::ColorConvertFloat4ToU32(foreground) : muted_u32);
+            ImGui::Dummy(ImVec2(12 * dpi, frame_h)); ImGui::SameLine(); ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(state == "quitting" ? "Quitting…" : state == "stopping" ? "Stopping…" : recording ? "Recording" : state == "starting" ? "Starting…" : "Paused");
+            ImGui::SameLine(0, 10 * dpi); ImGui::PushFont(regular, 19); ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(duration(buffered).c_str()); ImGui::PopFont();
+            help("Footage in the buffer. Oldest footage expires at the history or disk limit.");
+            char summary[64]; snprintf(summary, sizeof(summary), "%.1f / %.0f GB", used, cfg.budget_gb);
+            ImGui::SameLine(0, 14 * dpi); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("%s", summary);
+            // Disk gauge; while a clip is exporting it shows that progress in the accent.
+            ImGui::SameLine(0, 8 * dpi);
+            {
+                ImVec2 g = ImGui::GetCursorScreenPos(); float gw = 64 * dpi, gh = 5 * dpi, gy = g.y + (frame_h - gh) / 2;
+                float fill = export_fraction >= 0 ? (float)export_fraction : (float)std::clamp(used / std::max(.1, cfg.budget_gb), 0., 1.);
+                draw->AddRectFilled(ImVec2(g.x, gy), ImVec2(g.x + gw, gy + gh), line_u32, 1 * dpi);
+                draw->AddRectFilled(ImVec2(g.x, gy), ImVec2(g.x + gw * fill, gy + gh), export_fraction >= 0 ? accent_u32 : ImGui::ColorConvertFloat4ToU32(rgb(0x5b6470)), 1 * dpi);
+                ImGui::Dummy(ImVec2(gw, frame_h));
+                help(export_fraction >= 0 ? "Export progress." : "Disk budget used by the buffer. Saved clips are stored separately.");
+            }
+            auto save_label = "Save last " + std::to_string(cfg.save_seconds) + " s"; auto keys = shortcut(cfg);
+            float button_w = 90 * dpi, save_w = ImGui::CalcTextSize(save_label.c_str()).x + style.FramePadding.x * 2;
+            float folder_w = ImGui::CalcTextSize("Folder").x + style.FramePadding.x * 2, keys_w = ImGui::CalcTextSize(keys.c_str()).x;
+            float cluster_w = button_w + style.ItemSpacing.x + save_w + style.ItemInnerSpacing.x + keys_w + 16 * dpi + folder_w;
+            ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - cluster_w);
+            if (paused) {
+                if (ImGui::Button("Record", ImVec2(button_w, 0))) start_recording();
+            } else {
+                ImGui::BeginDisabled(!recording); if (ImGui::Button("Stop", ImVec2(button_w, 0))) app.stop(); ImGui::EndDisabled();
+            }
+            ImGui::SameLine(); ImGui::BeginDisabled(!recording || busy);
+            if (ImGui::Button(save_label.c_str())) PostMessageW(recorder, SaveMessage, cfg.save_seconds, 0);
+            help("Quick clip of the most recent footage at recording quality. Saves whole segments, so it may include a few extra seconds."); ImGui::EndDisabled();
+            ImGui::SameLine(0, style.ItemInnerSpacing.x); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("%s", keys.c_str());
+            ImGui::SameLine(0, 16 * dpi); if (ImGui::Button("Folder")) open_path(window, cfg.storage / "clips", error, true);
+            help("Open the clips folder.");
+            // Message line: errors first, then the recorder's non-routine
+            // status, then the last save or export. One line, clipped to the
+            // strip; the full text is in a tooltip when it does not fit.
+            if (error.empty() && !app.error.empty()) error = app.error;
+            auto message = std::string(obs_data_get_string(status.get(), "message"));
+            bool routine = message.empty() || message == "Recording" || message == "Paused";
+            std::string line; ImU32 line_colour = muted_u32;
+            if (!error.empty() || !failure.empty()) { line = !error.empty() ? error : failure; line_colour = ImGui::ColorConvertFloat4ToU32(rgb(0xf0a399)); }
+            else if (app.active() && current && !routine && !message.starts_with("Saved ") && !message.starts_with("Exported ")) { line = message; line_colour = ImGui::ColorConvertFloat4ToU32(foreground); }
+            else if (recording && !obs_data_get_bool(status.get(), "hotkey_registered")) line = "Save hotkey unavailable. Stop and choose another shortcut.";
+            else if (!settings_error.empty()) { line = "Not saved: " + settings_error; line_colour = ImGui::ColorConvertFloat4ToU32(rgb(0xf0a399)); }
+            else if (message.starts_with("Saved ") || message.starts_with("Exported ")) line = message;
+            ImVec2 at = ImGui::GetCursorScreenPos(); float line_w = ImGui::GetContentRegionAvail().x;
+            if (!line.empty()) {
+                ImVec4 clip(at.x, at.y, at.x + line_w, at.y + text_h);
+                draw->AddText(nullptr, 0, at, line_colour, line.c_str(), nullptr, 0, &clip);
+            }
+            ImGui::Dummy(ImVec2(line_w, text_h));
+            if (!line.empty() && ImGui::CalcTextSize(line.c_str()).x > line_w) help(line.c_str());
         }
-        ImGui::SameLine(); ImGui::BeginDisabled(!recording || busy);
-        if (ImGui::Button(save_label.c_str())) PostMessageW(recorder, SaveMessage, cfg.save_seconds, 0);
-        help("Quick clip of the most recent footage at recording quality. Saves whole segments, so it may include a few extra seconds."); ImGui::EndDisabled();
-        ImGui::SameLine(); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("%s", keys.c_str());
-        ImGui::SameLine(); if (ImGui::Button("Folder")) open_path(window, cfg.storage / "clips", error, true);
-        help("Open the clips folder.");
-        if (error.empty() && !app.error.empty()) error = app.error;
-        auto message = std::string(obs_data_get_string(status.get(), "message"));
-        bool routine = message.empty() || message == "Recording" || message == "Paused" || message.starts_with("Saved ") || message.starts_with("Exported ");
-        if (!error.empty() || !failure.empty()) { ImGui::PushStyleColor(ImGuiCol_Text, rgb(0xf0a399)); ImGui::TextWrapped("%s", (!error.empty() ? error : failure).c_str()); ImGui::PopStyleColor(); }
-        else if (app.active() && current && !routine) ImGui::TextWrapped("%s", message.c_str());
-        else if (recording && !obs_data_get_bool(status.get(), "hotkey_registered")) ImGui::TextWrapped("Save hotkey unavailable. Stop and choose another shortcut.");
-        else if (!settings_error.empty()) { ImGui::PushStyleColor(ImGuiCol_Text, rgb(0xf0a399)); ImGui::TextWrapped("Not saved: %s", settings_error.c_str()); ImGui::PopStyleColor(); }
-        else if (message.starts_with("Saved ") || message.starts_with("Exported ")) ImGui::TextDisabled("%s", message.c_str());
-        else ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight())); // Keep the footer height stable.
-        // Disk usage normally; export progress while a clip is being written.
-        if (export_fraction >= 0) ImGui::ProgressBar((float)export_fraction, ImVec2(-1, 3 * dpi), "");
-        else { ImGui::PushStyleColor(ImGuiCol_PlotHistogram, rgb(0x464e59)); ImGui::ProgressBar((float)std::clamp(used / std::max(.1, cfg.budget_gb), 0., 1.), ImVec2(-1, 3 * dpi), ""); ImGui::PopStyleColor(); }
 
         // Settings overlay. Capture fields stay locked while a session is active.
         if (open_settings) { ImGui::OpenPopup("Settings"); open_settings = false; }
