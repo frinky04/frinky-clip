@@ -35,6 +35,8 @@ if ($Package) {
   if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
   New-Item -ItemType Directory -Path $stage | Out-Null
   Copy-Item -Path "$clipOutputPath/*" -Destination $stage -Recurse
+  Copy-Item LICENSE,THIRD_PARTY_NOTICES.md,SOURCES.md -Destination $stage
+  Copy-Item licenses -Destination $stage -Recurse
   Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $_.Extension -eq '.pdb' -or $_.Name -eq 'clip-tests.exe' } | Remove-Item -Force
   $zip = Join-Path $clipTaskRoot "dist/$name.zip"
   if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }

@@ -2,6 +2,7 @@
 #include "app.hpp"
 #include "updates.hpp"
 #include "version.h"
+#include "resource.h"
 #include "timeline.hpp"
 #include "thumbs.hpp"
 #include "waveform.hpp"
@@ -172,7 +173,7 @@ int run_ui(int resume_recording) {
     auto status = read_json(app_dir() / "status.json"); std::int64_t last_read = 0;
     std::string error, settings_error; bool dirty = false;
     WNDCLASSW wc{}; wc.style = CS_CLASSDC; wc.lpfnWndProc = ui_proc; wc.hInstance = GetModuleHandleW(nullptr);
-    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION); wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.lpszClassName = AppWindowClass; RegisterClassW(&wc);
+    wc.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_FRINKY_CLIP)); wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.lpszClassName = AppWindowClass; RegisterClassW(&wc);
     auto initial = window_rect(DefaultClientWidth, (DefaultClientWidth - 2 * SidePadding) * 9 / 16 + ChromeHeight, GetDpiForSystem());
     HWND window = CreateWindowW(AppWindowClass, L"Frinky Clip", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         initial.right - initial.left, initial.bottom - initial.top, nullptr, nullptr, wc.hInstance, &app);

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(FrinkyClip VERSION 0.3.0 LANGUAGES CXX RC)
+project(FrinkyClip VERSION 0.3.1 LANGUAGES CXX RC)
 if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Frinky Clip requires MSVC and 64-bit Windows.")
 endif()
@@ -66,7 +66,7 @@ add_executable(clip-tests tests/core_tests.cpp src/waveform.cpp)
 target_link_libraries(clip-tests PRIVATE clip_core)
 add_test(NAME clip-core COMMAND clip-tests)
 # Opt-in real editor benchmark. Its test-only App never owns a recorder or tray.
-add_executable(editor-bench EXCLUDE_FROM_ALL WIN32 tests/editor_bench.cpp src/ui.cpp src/updates.cpp src/player.cpp src/thumbs.cpp src/waveform.cpp
+add_executable(editor-bench EXCLUDE_FROM_ALL WIN32 tests/editor_bench.cpp src/ui.cpp src/updates.cpp src/player.cpp src/thumbs.cpp src/waveform.cpp "${CMAKE_BINARY_DIR}/version.rc"
   "${DEPS}/imgui/imgui.cpp" "${DEPS}/imgui/imgui_draw.cpp" "${DEPS}/imgui/imgui_tables.cpp" "${DEPS}/imgui/imgui_widgets.cpp"
   "${DEPS}/imgui/backends/imgui_impl_win32.cpp" "${DEPS}/imgui/backends/imgui_impl_dx11.cpp")
 target_include_directories(editor-bench PRIVATE "${DEPS}/imgui" "${DEPS}/imgui/backends")

@@ -19,13 +19,11 @@ if (Test-Path $clipPackageOut) {
     Remove-Item -LiteralPath $clipResolved -Recurse -Force
 }
 New-Item -ItemType Directory -Force $clipPackageOut | Out-Null
-Copy-Item LICENSE,THIRD_PARTY_NOTICES.md,SOURCES.md -Destination $clipStage
-Copy-Item licenses -Destination $clipStage -Recurse
-& dotnet tool run vpk -- pack --packId Frinky04.FrinkyClip --packTitle 'Frinky Clip' --packAuthors Frinky04 --packVersion $clipVersion --mainExe frinky-clip.exe --packDir $clipStage --outputDir $clipPackageOut --runtime win-x64 --channel win --delta None --noPortable --shortcuts StartMenuRoot --skip-updates
+& dotnet tool run vpk -- pack --packId Frinky04.FrinkyClip --packTitle 'Frinky Clip' --packAuthors Frinky04 --packVersion $clipVersion --mainExe frinky-clip.exe --packDir $clipStage --outputDir $clipPackageOut --runtime win-x64 --channel win --icon "$clipPackageRoot/icon.ico" --delta None --noPortable --shortcuts StartMenuRoot --skip-updates
 if ($LASTEXITCODE) { throw 'Velopack packaging failed.' }
-# Refresh the portable ZIP with the same notices as the installer.
+# Both formats use the same staged runtime and notices.
 $clipPortable = Join-Path $clipPackageOut "frinky-clip-$clipVersion-win64.zip"
-Compress-Archive -Path "$clipStage/*" -DestinationPath $clipPortable
+Copy-Item (Join-Path $clipPackageRoot "dist/frinky-clip-$clipVersion-win64.zip") $clipPortable
 $clipFeed = Get-Content "$clipPackageOut/releases.win.json" -Raw | ConvertFrom-Json
 $clipFull = @($clipFeed.Assets | Where-Object Type -eq 'Full')
 if ($clipFull.Count -ne 1 -or $clipFull[0].Version -ne $clipVersion -or $clipFull[0].PackageId -ne 'Frinky04.FrinkyClip') { throw 'Unexpected release feed identity.' }
@@ -33,6 +31,6 @@ foreach ($clipEntry in $clipFeed.Assets) {
     $clipFile = Join-Path $clipPackageOut $clipEntry.FileName
     if (-not (Test-Path $clipFile) -or (Get-Item $clipFile).Length -ne $clipEntry.Size) { throw 'Release feed references a missing or incomplete package.' }
 }
-$clipHashes = Get-ChildItem $clipPackageOut -File | Sort-Object Name | ForEach-Object { "$( (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)" }
+$clipHashes = Get-ChildItem $clipPackageOut -File | Where-Object Name -ne 'assets.win.json' | Sort-Object Name | ForEach-Object { "$( (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)" }
 [IO.File]::WriteAllLines((Join-Path $clipPackageOut 'SHA256SUMS.txt'), $clipHashes)
 Write-Host "Installer and update feed: $clipPackageOut"

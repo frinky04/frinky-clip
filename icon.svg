@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1B1E22"/>
+      <stop offset="1" stop-color="#0B0C0E"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="44" fill="url(#bg)"/>
+  <rect x="9" y="9" width="238" height="238" rx="43" fill="none" stroke="#2A2E34" stroke-width="2"/>
+
+  <!-- buffer ring, 30 px deep -->
+  <circle cx="128" cy="128" r="70" fill="none" stroke="#33383F" stroke-width="30"/>
+
+  <!-- last 60 s: 120 degrees before now, trailing end rounded, leading end cut by the tick -->
+  <path d="M 67.38 163 A 70 70 0 0 1 128 58" fill="none" stroke="#7FA7CF" stroke-width="30"/>
+  <circle cx="67.38" cy="163" r="15" fill="#7FA7CF"/>
+
+  <!-- now tick, centred on the ring, 10 px wide -->
+  <rect x="123" y="32" width="10" height="52" rx="2" fill="#E2E4E8"/>
+</svg>

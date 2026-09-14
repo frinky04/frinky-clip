@@ -1,4 +1,5 @@
 #include "app.hpp"
+#include "resource.h"
 #include <stdexcept>
 
 namespace clip {
@@ -27,7 +28,9 @@ void App::attach(HWND window) {
         throw std::runtime_error("Cannot bind recording lifetime to the app");
     taskbar_created_ = RegisterWindowMessageW(L"TaskbarCreated");
     tray_.hWnd = window; tray_.uID = 1; tray_.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-    tray_.uCallbackMessage = TrayMessage; tray_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    tray_.uCallbackMessage = TrayMessage;
+    tray_.hIcon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_FRINKY_CLIP),
+        IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
     wcscpy_s(tray_.szTip, L"Frinky Clip - paused");
     if (!add_tray()) throw std::runtime_error("Cannot create the tray icon. Recording has not started.");
 }

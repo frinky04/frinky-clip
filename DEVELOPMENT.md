@@ -19,6 +19,8 @@ To obtain the checksum-verified CI runtime input:
 
 ## Package and publish
 
+`icon.svg` is the source artwork; `icon.ico` contains nine raster sizes for Windows and the installer. To regenerate it, run `npm install --prefix .deps/icon-tools --no-audit --no-fund @resvg/resvg-js@2.6.2`, then `node scripts/rasterize-icon.cjs`. The ICO is checked in, so builds do not require Node.js.
+
 Install the .NET 10 SDK on the build machine for the pinned Velopack tool:
 
 ```powershell

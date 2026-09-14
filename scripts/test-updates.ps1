@@ -31,8 +31,12 @@ function Invoke-App([string]$Arguments) {
 try {
     @{record_on_launch=$false;auto_check_updates=$false;storage=$clipStorage;save_seconds=5;export_height=720;export_codec='av1'} | ConvertTo-Json | Set-Content "$clipHome/config.json"
     [IO.File]::WriteAllText((Join-Path $clipStorage 'keep.txt'), 'User recordings must survive upgrades and uninstall.')
-    if (-not $GitHub) { Copy-Item "$clipTestRoot/dist/releases/$ToVersion/*" $clipFeed }
-    $clipSetup = Start-Process "$clipTestRoot/dist/releases/$FromVersion/Frinky04.FrinkyClip-win-Setup.exe" -ArgumentList @('--silent','--installto',('"'+$clipInstall+'"'),'--log',('"'+"$clipRun/install.log"+'"')) -WindowStyle Hidden -PassThru
+    $clipInstaller = "$clipTestRoot/dist/releases/$FromVersion/Frinky04.FrinkyClip-win-Setup.exe"
+    if ($GitHub) {
+        $clipInstaller = Join-Path $clipRun 'Setup.exe'
+        Invoke-WebRequest "https://github.com/frinky04/frinky-clip/releases/download/v$FromVersion/Frinky04.FrinkyClip-win-Setup.exe" -OutFile $clipInstaller -UseBasicParsing
+    } else { Copy-Item "$clipTestRoot/dist/releases/$ToVersion/*" $clipFeed }
+    $clipSetup = Start-Process $clipInstaller -ArgumentList @('--silent','--installto',('"'+$clipInstall+'"'),'--log',('"'+"$clipRun/install.log"+'"')) -WindowStyle Hidden -PassThru
     if (-not $clipSetup.WaitForExit(45000) -or $clipSetup.ExitCode -ne 0) { throw 'Installation failed.' }
     if (-not (Test-Path "$clipInstall/current/velopack_libc.dll")) { throw 'Native updater DLL is missing.' }
     $clipOwner = Start-Process $clipExe -WindowStyle Hidden -PassThru
