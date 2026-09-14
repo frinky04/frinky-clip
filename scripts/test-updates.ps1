@@ -109,7 +109,7 @@ try {
     Wait-For { -not (Get-Process frinky-clip -ErrorAction SilentlyContinue) } 'full shutdown on uninstall'
     if ((Test-Path $clipExe) -or -not (Test-Path "$clipHome/config.json") -or -not (Test-Path "$clipStorage/keep.txt")) { throw 'Uninstall did not preserve user data or remove the app.' }
     if ([version]$ToVersion -ge [version]'0.3.2') {
-        $clipStartup = Get-ItemPropertyValue 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Run' -Name 'Frinky Clip' -ErrorAction SilentlyContinue
+        $clipStartup = (Get-ItemProperty 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Run').'Frinky Clip'
         if ($clipStartup -eq $clipStartupCommand) { throw 'Uninstall left its Windows startup entry behind.' }
     }
     [IO.File]::WriteAllText((Join-Path $clipRun 'passed.txt'), "$FromVersion -> $ToVersion; installed, reinstalled while open, checked, downloaded, restored recording state, saved clip, preserved preferences, uninstalled while open; Unicode/spaced paths. GitHub=$GitHub; Paused=$Paused; LongExport=$LongExport")
