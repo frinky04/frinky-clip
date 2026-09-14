@@ -117,6 +117,13 @@ void help(const char* text) {
         ImGui::BeginTooltip(); ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26); ImGui::TextUnformatted(text); ImGui::PopTextWrapPos(); ImGui::EndTooltip();
     }
 }
+// The app's reset convention: a right-click on an adjustable value returns
+// it to its default. Every control that honours it says so in its tooltip.
+template <class T> bool reset_to(T& value, T fallback) {
+    if (!(ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) || value == fallback) return false;
+    value = fallback; return true;
+}
+void help_reset(const char* text) { std::string full = std::string(text) + (*text ? " " : "") + "Right-click resets."; help(full.c_str()); }
 void section(const char* title) { ImGui::PushStyleColor(ImGuiCol_Text, muted); ImGui::SeparatorText(title); ImGui::PopStyleColor(); }
 bool properties(const char* id) {
     if (!ImGui::BeginTable(id, 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) return false;
@@ -127,16 +134,21 @@ void row(const char* label) {
     ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(label);
     ImGui::TableSetColumnIndex(1); ImGui::SetNextItemWidth(-1);
 }
-bool bitrate_row(const char* name, int& kbps, bool& commit) {
+bool bitrate_row(const char* name, int& kbps, bool& commit, int fallback, const char* tip) {
     row(name); ImGui::PushID(name); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f);
     float mbps = kbps / 1000.f; bool changed = ImGui::InputFloat("##value", &mbps, 0, 0, "%.1f");
     commit |= ImGui::IsItemDeactivatedAfterEdit();
     if (changed && std::isfinite(mbps) && mbps >= 0 && mbps <= 1000) kbps = (int)std::round(mbps * 1000);
+    if (reset_to(kbps, fallback)) changed = commit = true;
+    help_reset(tip);
     ImGui::SameLine(); ImGui::TextDisabled("Mbps"); ImGui::PopID(); return changed;
 }
-bool int_row(const char* label, const char* id, int& value, const char* unit, bool& commit) {
+bool int_row(const char* label, const char* id, int& value, const char* unit, bool& commit, int fallback, const char* tip) {
     row(label); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f);
-    bool changed = ImGui::InputInt(id, &value, 0, 0); commit |= ImGui::IsItemDeactivatedAfterEdit(); ImGui::SameLine(); ImGui::TextDisabled("%s", unit); return changed;
+    bool changed = ImGui::InputInt(id, &value, 0, 0); commit |= ImGui::IsItemDeactivatedAfterEdit();
+    if (reset_to(value, fallback)) changed = commit = true;
+    help_reset(tip);
+    ImGui::SameLine(); ImGui::TextDisabled("%s", unit); return changed;
 }
 bool primary_button(const char* label, ImVec2 size) {
     ImGui::PushStyleColor(ImGuiCol_Button, accent); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, rgb(0x9cbbdc));
@@ -154,7 +166,7 @@ int run_ui() {
         if (auto existing = FindWindowW(AppWindowClass, nullptr)) { ShowWindow(existing, SW_RESTORE); SetForegroundWindow(existing); }
         return 0;
     }
-    Config cfg = Config::load(); auto displays = monitors(); auto microphones = capture_devices();
+    Config cfg = Config::load(); const Config defaults; auto displays = monitors(); auto microphones = capture_devices();
     char storage[2048]; strncpy_s(storage, path_text(cfg.storage).c_str(), _TRUNCATE);
     auto status = read_json(app_dir() / "status.json"); std::int64_t last_read = 0;
     std::string error, settings_error; bool dirty = false;
@@ -214,6 +226,7 @@ int run_ui() {
     // Hover preview state persists across frames so it can fade and hold its last picture.
     Thumbnails::Picture hover_picture{}; float hover_alpha = 0, hover_x = 0; std::int64_t hover_shown_ms = 0;
     enum class Drag { None, Press, Range, In, Out } drag = Drag::None; std::int64_t drag_anchor = 0, scrub_ms = 0; float press_x = 0; bool scrubbing = false;
+    bool right_press = false, right_moved = false; float right_x = 0; // A right-click without a drag resets the view.
     std::optional<Player> player_holder; player_holder.emplace(device, context); auto& player = *player_holder;
     const double frame_ms = 1000.0 / 60;
     auto span_at = [&](std::int64_t t) -> const Span* { for (auto& s : map.spans) if (t >= s.start_ms && t < s.end_ms) return &s; return nullptr; };
@@ -614,6 +627,14 @@ int run_ui() {
                 else if (have_range && std::abs(mx - x_of(out_ms)) <= grab) drag = Drag::Out;
                 else { drag = Drag::Press; drag_anchor = snap(t_of(mx)); }
             }
+            // Right button: a drag pans; a click on a handle clears the range;
+            // a click anywhere else resets the view to its default, the same
+            // convention as right-clicking a slider.
+            if (ImGui::IsItemActivated() && ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
+                right_press = true; right_moved = false; right_x = io.MousePos.x;
+                if (have_range && (std::abs(right_x - x_of(in_ms)) <= grab || std::abs(right_x - x_of(out_ms)) <= grab)) { in_ms = out_ms = 0; right_press = false; }
+            }
+            if (right_press && std::abs(io.MousePos.x - right_x) > 4 * dpi) right_moved = true;
             if (ImGui::IsItemActive() && drag != Drag::None) {
                 std::int64_t t = snap(std::clamp(t_of(io.MousePos.x), oldest, now));
                 if (drag == Drag::Press && std::abs(io.MousePos.x - press_x) > 4 * dpi) { drag = Drag::Range; in_ms = out_ms = 0; }
@@ -627,6 +648,8 @@ int run_ui() {
                 if (drag == Drag::Press) player.seek(drag_anchor);
                 if (drag == Drag::Range && in_ms == out_ms) in_ms = out_ms = 0;
                 drag = Drag::None;
+                if (right_press && !right_moved) { target_seconds = 240; follow = true; }
+                right_press = false;
             }
             if (hovered && io.MouseWheel != 0) {
                 // Zoom about the cursor in target space, so the moment under
@@ -641,7 +664,7 @@ int run_ui() {
             else if (hovered && have_range && (std::abs(io.MousePos.x - x_of(in_ms)) <= grab || std::abs(io.MousePos.x - x_of(out_ms)) <= grab)) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         }
         ImGui::EndChild();
-        if (hover_lane && !hover_video && !have_range) help("Click to place the playhead, drag to mark a range. Scroll to zoom, right-drag to pan.");
+        if (hover_lane && !hover_video && !have_range) help("Click to place the playhead, drag to mark a range. Scroll to zoom, right-drag to pan. Right-click resets the view.");
         // Keyboard transport when no field has focus: Space plays, I/O mark at
         // the playhead, arrows step a frame (a second with Shift).
         if (!io.WantTextInput && !ImGui::IsAnyItemActive()) {
@@ -685,7 +708,8 @@ int run_ui() {
         ImGui::SameLine(); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 4.5f);
         { float mbps = cfg.share_bitrate / 1000.f; bool edited = ImGui::InputFloat("##export-bitrate", &mbps, 0, 0, "%.1f"); commit |= ImGui::IsItemDeactivatedAfterEdit();
           if (edited && std::isfinite(mbps) && mbps >= 0 && mbps <= 1000) { cfg.share_bitrate = (int)std::round(mbps * 1000); changed = true; } }
-        help("Export bitrate.");
+        if (reset_to(cfg.share_bitrate, defaults.share_bitrate)) changed = commit = true;
+        help_reset("Export bitrate.");
         ImGui::SameLine(0, style.ItemInnerSpacing.x); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("Mbps");
         auto sources = have_range ? spans_in_range(map.spans, in_ms, out_ms) : std::vector<Span>{};
         // The microphone option follows the footage: it is offered when every
@@ -696,10 +720,12 @@ int run_ui() {
         // there is a microphone track to level.
         ImGui::SameLine(0, 14 * dpi); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("Desktop"); ImGui::SameLine(0, style.ItemInnerSpacing.x);
         ImGui::SetNextItemWidth(64 * dpi); if (ImGui::SliderInt("##desktop-gain", &cfg.desktop_gain, 0, 200, "%d%%", ImGuiSliderFlags_AlwaysClamp)) changed = true; commit |= ImGui::IsItemDeactivatedAfterEdit();
-        help("Desktop audio level in playback and in the export. 0% leaves it out.");
+        if (reset_to(cfg.desktop_gain, defaults.desktop_gain)) changed = commit = true;
+        help_reset("Desktop audio level in playback and in the export. 0% leaves it out.");
         ImGui::SameLine(0, 10 * dpi); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("Mic"); ImGui::SameLine(0, style.ItemInnerSpacing.x);
         ImGui::BeginDisabled(!mic_lane); ImGui::SetNextItemWidth(64 * dpi); if (ImGui::SliderInt("##mic-gain", &cfg.mic_gain, 0, 200, "%d%%", ImGuiSliderFlags_AlwaysClamp)) changed = true; commit |= ImGui::IsItemDeactivatedAfterEdit(); ImGui::EndDisabled();
-        help(mic_lane ? "Microphone level in playback and in the export. 0% leaves it out." : "No microphone track. Turn on Microphone in Settings to record one.");
+        if (reset_to(cfg.mic_gain, defaults.mic_gain)) changed = commit = true;
+        if (mic_lane) help_reset("Microphone level in playback and in the export. 0% leaves it out."); else help("No microphone track. Turn on Microphone in Settings to record one.");
         bool closed = have_range && !sources.empty() && out_ms <= map.last_end_ms + 1;
         bool can_export = closed && recorder && !busy && !app.quitting();
         // Watch the recorder's message for results and notices.
@@ -835,14 +861,17 @@ int run_ui() {
                 ImGui::BeginDisabled(!cfg.mic);
                 if (ImGui::BeginCombo("##microphone", mic_label.c_str())) { for (auto& d : microphones) if (ImGui::Selectable(d.label.c_str(), d.id == cfg.mic_device)) { cfg.mic_device = d.id; changed = commit = true; } ImGui::EndCombo(); }
                 ImGui::EndDisabled(); help("The input to record when Microphone is on.");
-                changed |= bitrate_row("Bitrate", cfg.bitrate, commit); changed |= bitrate_row("Max bitrate", cfg.max_bitrate, commit);
+                changed |= bitrate_row("Bitrate", cfg.bitrate, commit, defaults.bitrate, "Target video bitrate for the recording.");
+                changed |= bitrate_row("Max bitrate", cfg.max_bitrate, commit, defaults.max_bitrate, "Ceiling for the encoder's peaks.");
                 ImGui::EndTable();
             }
             section("Buffer & hotkey");
             if (properties("retention")) {
-                changed |= int_row("History", "##history", cfg.retention_minutes, "min", commit);
-                row("Disk budget"); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f); changed |= ImGui::InputDouble("##budget", &cfg.budget_gb, 0, 0, "%.1f"); commit |= ImGui::IsItemDeactivatedAfterEdit(); ImGui::SameLine(); ImGui::TextDisabled("GB");
-                changed |= int_row("Save duration", "##seconds", cfg.save_seconds, "sec", commit);
+                changed |= int_row("History", "##history", cfg.retention_minutes, "min", commit, defaults.retention_minutes, "Minutes of footage the buffer keeps.");
+                row("Disk budget"); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f); changed |= ImGui::InputDouble("##budget", &cfg.budget_gb, 0, 0, "%.1f"); commit |= ImGui::IsItemDeactivatedAfterEdit();
+                if (reset_to(cfg.budget_gb, defaults.budget_gb)) changed = commit = true;
+                help_reset("Disk space the buffer may use."); ImGui::SameLine(); ImGui::TextDisabled("GB");
+                changed |= int_row("Save duration", "##seconds", cfg.save_seconds, "sec", commit, defaults.save_seconds, "Seconds the save hotkey keeps.");
                 row("Save hotkey"); ImGui::SetNextItemWidth(64 * dpi); int key = (int)cfg.hotkey - VK_F1;
                 if (ImGui::Combo("##hotkey", &key, "F1\0F2\0F3\0F4\0F5\0F6\0F7\0F8\0F9\0F10\0F11\0F12\0")) { cfg.hotkey = VK_F1 + key; changed = commit = true; }
                 ImGui::SameLine(); bool ctrl = cfg.modifiers & MOD_CONTROL, shift = cfg.modifiers & MOD_SHIFT, alt = cfg.modifiers & MOD_ALT;

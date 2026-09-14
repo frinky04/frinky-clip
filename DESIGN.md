@@ -30,6 +30,8 @@ Interaction thesis: immediate hover and keyboard-focus feedback; direct numeric 
 
 - Hide optional explanations in tooltips. Do not add marketing copy to this operating surface.
 
+- Right-click resets. A right-click on any adjustable value returns it to its default: the level sliders, every numeric field, and the timeline view (default zoom at the live edge; a right-click on a range handle clears the range). Every control that honours it ends its tooltip with "Right-click resets"; a control without that line has nothing to reset. Combos, checkboxes, and the playhead are left alone.
+
 - Scale fonts and spacing together on DPI changes. The minimum window size fits the whole layout, so the main window never scrolls.
 
 ## References
