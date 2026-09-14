@@ -16,7 +16,7 @@ Interaction thesis: immediate hover and keyboard-focus feedback; direct numeric 
 
 - Use a two-column property table with stable widget IDs inside the Settings overlay rather than a stack of wide cards. Export resolution, frame rate, and bitrate sit on the editor's export row because they are chosen per clip.
 
-- Put startup behavior in an App property row: label on the shared left edge, checkbox on the shared value edge. Keep it editable during recording and explain automatic saving in the tooltip.
+- Put startup behavior in an App property row: label on the shared left edge, checkbox on the shared value edge. Keep it editable during recording.
 
 - Use the supplied Noto Sans Mono Medium throughout the app at 16 px at 100% scaling, with a 19 px buffer clock. Bundle the font beside the executable; the native title bar retains the Windows system font.
 
@@ -28,9 +28,9 @@ Interaction thesis: immediate hover and keyboard-focus feedback; direct numeric 
 
 - Keep all actions, input fields, tooltips, and status output code-native. No image assets or new UI framework.
 
-- Hide optional explanations in tooltips. Do not add marketing copy to this operating surface.
+- Use tooltips for unlabeled controls, keyboard shortcuts, non-obvious scope, and unavailable states. Prefer a short label or reason. Omit them when the visible label is sufficient. Do not append usage lessons, obvious consequences such as zero volume muting audio, codec advice, or instructions for other controls. Keep gesture guides and longer explanations in the README.
 
-- Right-click resets. A right-click on any adjustable value returns it to its default: the level sliders, every numeric field and every numeric field. The lanes are exempt: the right button pans there. Every control that honours it ends its tooltip with "Right-click resets"; a control without that line has nothing to reset. Combos, checkboxes, the playhead, and the timeline view are left alone.
+- Right-click restores defaults on level sliders and numeric fields. In the lanes, it pans. Combos, checkboxes, the playhead, and the timeline view are left alone. Do not append reset instructions to tooltips.
 
 - Scale fonts and spacing together on DPI changes. The minimum window size fits the whole layout, so the main window never scrolls.
 

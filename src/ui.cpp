@@ -117,13 +117,11 @@ void help(const char* text) {
         ImGui::BeginTooltip(); ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26); ImGui::TextUnformatted(text); ImGui::PopTextWrapPos(); ImGui::EndTooltip();
     }
 }
-// The app's reset convention: a right-click on an adjustable value returns
-// it to its default. Every control that honours it says so in its tooltip.
+// Right-click an adjustable value to restore its default.
 template <class T> bool reset_to(T& value, T fallback) {
     if (!(ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) || value == fallback) return false;
     value = fallback; return true;
 }
-void help_reset(const char* text) { std::string full = std::string(text) + (*text ? " " : "") + "Right-click resets."; help(full.c_str()); }
 void section(const char* title) { ImGui::PushStyleColor(ImGuiCol_Text, muted); ImGui::SeparatorText(title); ImGui::PopStyleColor(); }
 bool properties(const char* id) {
     if (!ImGui::BeginTable(id, 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) return false;
@@ -134,20 +132,18 @@ void row(const char* label) {
     ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(label);
     ImGui::TableSetColumnIndex(1); ImGui::SetNextItemWidth(-1);
 }
-bool bitrate_row(const char* name, int& kbps, bool& commit, int fallback, const char* tip) {
+bool bitrate_row(const char* name, int& kbps, bool& commit, int fallback) {
     row(name); ImGui::PushID(name); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f);
     float mbps = kbps / 1000.f; bool changed = ImGui::InputFloat("##value", &mbps, 0, 0, "%.1f");
     commit |= ImGui::IsItemDeactivatedAfterEdit();
     if (changed && std::isfinite(mbps) && mbps >= 0 && mbps <= 1000) kbps = (int)std::round(mbps * 1000);
     if (reset_to(kbps, fallback)) changed = commit = true;
-    help_reset(tip);
     ImGui::SameLine(); ImGui::TextDisabled("Mbps"); ImGui::PopID(); return changed;
 }
-bool int_row(const char* label, const char* id, int& value, const char* unit, bool& commit, int fallback, const char* tip) {
+bool int_row(const char* label, const char* id, int& value, const char* unit, bool& commit, int fallback) {
     row(label); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f);
     bool changed = ImGui::InputInt(id, &value, 0, 0); commit |= ImGui::IsItemDeactivatedAfterEdit();
     if (reset_to(value, fallback)) changed = commit = true;
-    help_reset(tip);
     ImGui::SameLine(); ImGui::TextDisabled("%s", unit); return changed;
 }
 bool primary_button(const char* label, ImVec2 size) {
@@ -324,11 +320,10 @@ int run_ui() {
         ImGui::SameLine();
         if (map.spans.empty()) ImGui::TextDisabled("empty");
         else ImGui::TextDisabled("%s to now", local_time(map.spans.front().start_ms).c_str());
-        if (!follow) { ImGui::SameLine(); if (ImGui::Button("Now")) follow = true; help("Return to the live edge."); }
+        if (!follow) { ImGui::SameLine(); if (ImGui::Button("Now")) follow = true; help("Follow latest footage"); }
         float settings_w = ImGui::CalcTextSize("Settings").x + style.FramePadding.x * 2;
         ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - settings_w);
         if (ImGui::Button("Settings")) open_settings = true;
-        help("Capture, buffer, hotkey, app, and diagnostics.");
 
         // Overview bar: full history, newest at the right, footage, range, and the viewed window.
         {
@@ -345,7 +340,6 @@ int run_ui() {
                 std::int64_t at = oldest + (std::int64_t)(((io.MousePos.x - p.x) / w) * capacity * 1000);
                 target_end_ms = at + (std::int64_t)(target_seconds * 500); follow = target_end_ms >= now - 500;
             }
-            help("Whole history. Drag to move the viewed window; scroll in the lanes to zoom.");
         }
 
         // Lanes: wall-clock ruler, video with thumbnails, and audio coverage for the viewed window.
@@ -404,7 +398,7 @@ int run_ui() {
             }
             ImGui::SetCursorScreenPos(ImVec2(x, y)); ImGui::InvisibleButton("viewport", ImVec2(std::max(img_w, 1.f), std::max(img_h, 1.f)));
             if (ImGui::IsItemClicked()) player.toggle();
-            help("Click or press Space to play and pause.");
+            help(player.playing() ? "Pause (Space)" : "Play (Space)");
         }
         ImGui::EndChild();
         if (ImGui::BeginChild("lanes", ImVec2(0, lanes_h), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
@@ -431,7 +425,6 @@ int run_ui() {
             ImGui::SetCursorScreenPos(ImVec2(track_x, origin.y)); ImGui::InvisibleButton("ruler", ImVec2(track_w, ruler_h));
             if (ImGui::IsItemActive()) { scrub_ms = snap(std::clamp(t_of(io.MousePos.x), oldest, now)); scrubbing = true; }
             else if (scrubbing) { scrubbing = false; player.seek(scrub_ms); }
-            help("Click or drag to move the playhead. Scroll to zoom, right-drag to pan.");
             for (auto& lane : lanes) {
                 draw->AddText(ImVec2(origin.x, y + (lane.height - ImGui::GetTextLineHeight()) / 2), muted_u32, lane.name);
                 draw->AddRectFilled(ImVec2(track_x, y), ImVec2(track_x + track_w, y + lane.height), track_u32);
@@ -653,7 +646,6 @@ int run_ui() {
             else if (hovered && have_range && (std::abs(io.MousePos.x - x_of(in_ms)) <= grab || std::abs(io.MousePos.x - x_of(out_ms)) <= grab)) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         }
         ImGui::EndChild();
-        if (hover_lane && !hover_video && !have_range) help("Click to place the playhead, drag to mark a range. Scroll to zoom, right-drag to pan.");
         // Keyboard transport when no field has focus: Space plays, I/O mark at
         // the playhead, arrows step a frame (a second with Shift).
         if (!io.WantTextInput && !ImGui::IsAnyItemActive()) {
@@ -672,7 +664,7 @@ int run_ui() {
         ImGui::Dummy(ImVec2(0, 2 * dpi));
         ImGui::AlignTextToFramePadding();
         if (ImGui::Button(player.playing() ? "Pause" : "Play", ImVec2(60 * dpi, 0))) player.toggle();
-        help("Space plays and pauses. Arrow keys step one frame; Shift+arrows step one second.");
+        help(player.playing() ? "Pause (Space)" : "Play (Space)");
         ImGui::SameLine(); ImGui::TextUnformatted(playhead ? local_time(playhead, true).c_str() : "--:--:--.---");
         ImGui::SameLine(0, 16 * dpi);
         if (have_range) {
@@ -688,17 +680,17 @@ int run_ui() {
         float control_w = ImGui::GetFontSize() * 5.5f;
         ImGui::SetNextItemWidth(control_w); int res = cfg.export_height == 720 ? 0 : cfg.export_height == 1440 ? 2 : 1;
         if (ImGui::Combo("##res", &res, "720p\0" "1080p\0" "1440p\0")) { cfg.export_height = res == 0 ? 720 : res == 2 ? 1440 : 1080; changed = commit = true; }
-        help("Export resolution. Frame-accurate re-encode with NVENC.");
+        help("Export resolution");
         ImGui::SameLine(); ImGui::SetNextItemWidth(control_w); int fps = cfg.export_fps == 30 ? 0 : 1;
         if (ImGui::Combo("##fps", &fps, "30 fps\0" "60 fps\0")) { cfg.export_fps = fps == 0 ? 30 : 60; changed = commit = true; }
         ImGui::SameLine(); ImGui::SetNextItemWidth(control_w); int codec = cfg.export_codec == "av1" ? 1 : 0;
         if (ImGui::Combo("##codec", &codec, "H.264\0" "AV1\0")) { cfg.export_codec = codec ? "av1" : "h264"; changed = commit = true; }
-        help("H.264 plays everywhere. AV1 is smaller at the same quality but needs newer players.");
+        help("Export codec");
         ImGui::SameLine(); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 4.5f);
         { float mbps = cfg.share_bitrate / 1000.f; bool edited = ImGui::InputFloat("##export-bitrate", &mbps, 0, 0, "%.1f"); commit |= ImGui::IsItemDeactivatedAfterEdit();
           if (edited && std::isfinite(mbps) && mbps >= 0 && mbps <= 1000) { cfg.share_bitrate = (int)std::round(mbps * 1000); changed = true; } }
         if (reset_to(cfg.share_bitrate, defaults.share_bitrate)) changed = commit = true;
-        help_reset("Export bitrate.");
+        help("Export bitrate");
         ImGui::SameLine(0, style.ItemInnerSpacing.x); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("Mbps");
         auto sources = have_range ? spans_in_range(map.spans, in_ms, out_ms) : std::vector<Span>{};
         // The microphone option follows the footage: it is offered when every
@@ -710,11 +702,11 @@ int run_ui() {
         ImGui::SameLine(0, 14 * dpi); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("Desktop"); ImGui::SameLine(0, style.ItemInnerSpacing.x);
         ImGui::SetNextItemWidth(64 * dpi); if (ImGui::SliderInt("##desktop-gain", &cfg.desktop_gain, 0, 200, "%d%%", ImGuiSliderFlags_AlwaysClamp)) changed = true; commit |= ImGui::IsItemDeactivatedAfterEdit();
         if (reset_to(cfg.desktop_gain, defaults.desktop_gain)) changed = commit = true;
-        help_reset("Desktop audio level in playback and in the export. 0% leaves it out.");
+        help("Playback and export volume");
         ImGui::SameLine(0, 10 * dpi); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("Mic"); ImGui::SameLine(0, style.ItemInnerSpacing.x);
         ImGui::BeginDisabled(!mic_lane); ImGui::SetNextItemWidth(64 * dpi); if (ImGui::SliderInt("##mic-gain", &cfg.mic_gain, 0, 200, "%d%%", ImGuiSliderFlags_AlwaysClamp)) changed = true; commit |= ImGui::IsItemDeactivatedAfterEdit(); ImGui::EndDisabled();
         if (reset_to(cfg.mic_gain, defaults.mic_gain)) changed = commit = true;
-        if (mic_lane) help_reset("Microphone level in playback and in the export. 0% leaves it out."); else help("No microphone track. Turn on Microphone in Settings to record one.");
+        help(mic_lane ? "Playback and export volume" : "No microphone track");
         bool closed = have_range && !sources.empty() && out_ms <= map.last_end_ms + 1;
         bool can_export = closed && recorder && !busy && !app.quitting();
         // Watch the recorder's message for results and notices.
@@ -747,8 +739,12 @@ int run_ui() {
             } catch (const std::exception& e) { error = e.what(); }
         }
         ImGui::EndDisabled();
-        help(exporting ? "Exporting the clip." : exported ? message.c_str() : !have_range ? "Mark a range first." : !closed ? (sources.empty() ? "The range crosses a Stop/Record boundary or has no footage." : "Wait for the last segment to close.")
-            : busy ? "A save or export is in progress." : "Re-encode the range to the clips folder.");
+        if (exported) help(message.c_str());
+        else if (!exporting) {
+            if (!have_range) help("No range selected");
+            else if (!closed) help(sources.empty() ? "Range must contain footage from a single recording session" : "Selected footage is still buffering");
+            else if (busy) help("Save or export in progress");
+        }
         // Keep the viewed and marked footage from expiring while the editor shows it.
         if (recorder && now - last_pin > 2000) {
             std::int64_t a = have_range ? std::min(in_ms, view_start_ms) : view_start_ms, b = have_range ? std::max(out_ms, view_end_ms) : view_end_ms;
@@ -772,7 +768,7 @@ int run_ui() {
             ImGui::TextUnformatted(state == "quitting" ? "Quitting…" : state == "stopping" ? "Stopping…" : recording ? "Recording" : state == "starting" ? "Starting…" : "Paused");
             ImGui::SameLine(0, 10 * dpi); ImGui::PushFont(regular, 19); ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted(duration(buffered).c_str()); ImGui::PopFont();
-            help("Footage in the buffer. Oldest footage expires at the history or disk limit.");
+            help("Buffered duration");
             char summary[64]; snprintf(summary, sizeof(summary), "%.1f / %.0f GB", used, cfg.budget_gb);
             ImGui::SameLine(0, 14 * dpi); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("%s", summary);
             // Disk gauge.
@@ -783,7 +779,7 @@ int run_ui() {
                 draw->AddRectFilled(ImVec2(g.x, gy), ImVec2(g.x + gw, gy + gh), line_u32, 1 * dpi);
                 draw->AddRectFilled(ImVec2(g.x, gy), ImVec2(g.x + gw * fill, gy + gh), ImGui::ColorConvertFloat4ToU32(rgb(0x5b6470)), 1 * dpi);
                 ImGui::Dummy(ImVec2(gw, frame_h));
-                help("Disk budget used by the buffer. Saved clips are stored separately.");
+                help("Buffer disk usage");
             }
             // Save shows its own progress and result, like Export.
             bool saving = busy && message.starts_with("Saving"), saved = now - saved_at < ResultMs;
@@ -799,10 +795,11 @@ int run_ui() {
             }
             ImGui::SameLine(); ImGui::BeginDisabled(!recording || busy);
             if (ImGui::Button(save_label.c_str(), ImVec2(save_w, 0))) PostMessageW(recorder, SaveMessage, cfg.save_seconds, 0);
-            help(saved ? message.c_str() : "Quick clip of the most recent footage at recording quality. Saves whole segments, so it may include a few extra seconds."); ImGui::EndDisabled();
+            if (saved) help(message.c_str());
+            ImGui::EndDisabled();
             ImGui::SameLine(0, style.ItemInnerSpacing.x); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("%s", keys.c_str());
             ImGui::SameLine(0, 16 * dpi); if (ImGui::Button("Folder")) open_path(window, cfg.storage / "clips", error, true);
-            help("Open the clips folder.");
+            help("Open clips folder");
             // Errors and notices are rare, so they earn a line of their own:
             // the strip grows by one row while one exists and shrinks back
             // when it is dismissed or, for a notice, after a few seconds.
@@ -842,25 +839,25 @@ int run_ui() {
                 row("Display"); std::string display_label = displays.empty() ? "No monitor" : displays.front().label;
                 for (auto& d : displays) if (d.id == cfg.monitor) display_label = d.label;
                 if (ImGui::BeginCombo("##display", display_label.c_str())) { for (auto& d : displays) if (ImGui::Selectable(d.label.c_str(), d.id == cfg.monitor)) { cfg.monitor = d.id; changed = commit = true; } ImGui::EndCombo(); }
-                row("Audio"); if (ImGui::Checkbox("Desktop", &cfg.audio)) changed = commit = true; help("Records the default playback device as the first audio track.");
-                ImGui::SameLine(0, 12 * dpi); if (ImGui::Checkbox("Microphone", &cfg.mic)) changed = commit = true; help("Records the selected input as a second audio track, shown as its own lane and mixed into exports on request.");
+                row("Audio"); if (ImGui::Checkbox("Desktop", &cfg.audio)) changed = commit = true; help("Audio from the default playback device");
+                ImGui::SameLine(0, 12 * dpi); if (ImGui::Checkbox("Microphone", &cfg.mic)) changed = commit = true;
                 // The device row is always present, so turning the microphone on does not reflow the dialog.
                 row("Microphone"); std::string mic_label = "Default microphone";
                 for (auto& d : microphones) if (d.id == cfg.mic_device) mic_label = d.label;
                 ImGui::BeginDisabled(!cfg.mic);
                 if (ImGui::BeginCombo("##microphone", mic_label.c_str())) { for (auto& d : microphones) if (ImGui::Selectable(d.label.c_str(), d.id == cfg.mic_device)) { cfg.mic_device = d.id; changed = commit = true; } ImGui::EndCombo(); }
-                ImGui::EndDisabled(); help("The input to record when Microphone is on.");
-                changed |= bitrate_row("Bitrate", cfg.bitrate, commit, defaults.bitrate, "Target video bitrate for the recording.");
-                changed |= bitrate_row("Max bitrate", cfg.max_bitrate, commit, defaults.max_bitrate, "Ceiling for the encoder's peaks.");
+                ImGui::EndDisabled();
+                changed |= bitrate_row("Bitrate", cfg.bitrate, commit, defaults.bitrate);
+                changed |= bitrate_row("Max bitrate", cfg.max_bitrate, commit, defaults.max_bitrate);
                 ImGui::EndTable();
             }
             section("Buffer & hotkey");
             if (properties("retention")) {
-                changed |= int_row("History", "##history", cfg.retention_minutes, "min", commit, defaults.retention_minutes, "Minutes of footage the buffer keeps.");
+                changed |= int_row("History", "##history", cfg.retention_minutes, "min", commit, defaults.retention_minutes);
                 row("Disk budget"); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f); changed |= ImGui::InputDouble("##budget", &cfg.budget_gb, 0, 0, "%.1f"); commit |= ImGui::IsItemDeactivatedAfterEdit();
                 if (reset_to(cfg.budget_gb, defaults.budget_gb)) changed = commit = true;
-                help_reset("Disk space the buffer may use."); ImGui::SameLine(); ImGui::TextDisabled("GB");
-                changed |= int_row("Save duration", "##seconds", cfg.save_seconds, "sec", commit, defaults.save_seconds, "Seconds the save hotkey keeps.");
+                help("Excludes saved clips"); ImGui::SameLine(); ImGui::TextDisabled("GB");
+                changed |= int_row("Save duration", "##seconds", cfg.save_seconds, "sec", commit, defaults.save_seconds);
                 row("Save hotkey"); ImGui::SetNextItemWidth(64 * dpi); int key = (int)cfg.hotkey - VK_F1;
                 if (ImGui::Combo("##hotkey", &key, "F1\0F2\0F3\0F4\0F5\0F6\0F7\0F8\0F9\0F10\0F11\0F12\0")) { cfg.hotkey = VK_F1 + key; changed = commit = true; }
                 ImGui::SameLine(); bool ctrl = cfg.modifiers & MOD_CONTROL, shift = cfg.modifiers & MOD_SHIFT, alt = cfg.modifiers & MOD_ALT;
@@ -879,7 +876,6 @@ int run_ui() {
                         error.clear();
                     } catch (const std::exception& e) { cfg.record_on_launch = !cfg.record_on_launch; error = e.what(); }
                 }
-                help("Saved immediately. Starts recording when the tray app starts, not when the controls reopen. Does not launch with Windows.");
                 ImGui::EndTable();
             }
             section("Diagnostics");
@@ -889,7 +885,7 @@ int run_ui() {
                 ImGui::TextDisabled("%.1f fps | %.2f ms render", obs_data_get_double(status.get(), "fps"), obs_data_get_double(status.get(), "render_ms"));
             }
             ImGui::TextDisabled("Missed frames: %lld render / %lld encode", obs_data_get_int(status.get(), "lagged_frames"), obs_data_get_int(status.get(), "skipped_frames"));
-            help("Cumulative recorder misses for the last reported session. These do not measure the game's FPS impact.");
+            help("Totals for the last reported session");
             ImGui::TextDisabled("Closed segments: %zu | thumbnails: %llu decoded, %zu cached, last %.0f ms | player decode: %s", map.spans.size(),
                 (unsigned long long)thumbs.decodes(), thumbs.cached(), thumbs.last_decode_ms(), player.hardware() ? "D3D11VA" : "software");
             if (!settings_error.empty()) {
