@@ -6,3 +6,9 @@ test-output/
 *.user
 
 dist/
+
+# Local development notes
+/DESIGN.md
+/DEVELOPMENT.md
+/PERFORMANCE.md
+/VELOPACK_PLAN.md

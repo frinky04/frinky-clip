@@ -9,6 +9,30 @@
 #include <algorithm>
 
 namespace clip {
+namespace {
+constexpr wchar_t StartupKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr wchar_t StartupName[] = L"Frinky Clip";
+std::wstring startup_command() { return quote_arg((exe_dir() / L"frinky-clip.exe").wstring()) + L" --startup"; }
+}
+bool starts_with_windows() {
+    wchar_t command[32768]{}; DWORD size = sizeof(command);
+    return RegGetValueW(HKEY_CURRENT_USER, StartupKey, StartupName, RRF_RT_REG_SZ, nullptr, command, &size) == ERROR_SUCCESS &&
+        startup_command() == command;
+}
+void set_starts_with_windows(bool enabled) {
+    // An isolated or older installation must not remove another copy's entry.
+    if (!enabled && !starts_with_windows()) return;
+    HKEY key = nullptr;
+    auto result = RegCreateKeyExW(HKEY_CURRENT_USER, StartupKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (result == ERROR_SUCCESS) {
+        const auto command = startup_command();
+        result = enabled ? RegSetValueExW(key, StartupName, 0, REG_SZ, reinterpret_cast<const BYTE*>(command.c_str()),
+            static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t))) : RegDeleteValueW(key, StartupName);
+        RegCloseKey(key);
+    }
+    if (result != ERROR_SUCCESS && !(result == ERROR_FILE_NOT_FOUND && !enabled))
+        throw std::runtime_error("Could not change Windows startup (error " + std::to_string(result) + ").");
+}
 std::string utf8(const std::wstring& s) {
     if (s.empty()) return {};
     int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, s.data(), (int)s.size(), nullptr, 0, nullptr, nullptr);
@@ -106,6 +130,7 @@ Config Config::load() {
     if (obs_data_has_user_value(d.get(), "mic")) c.mic = obs_data_get_bool(d.get(), "mic");
     if (obs_data_has_user_value(d.get(), "mic_device")) c.mic_device = obs_data_get_string(d.get(), "mic_device");
     if (obs_data_has_user_value(d.get(), "record_on_launch")) c.record_on_launch = obs_data_get_bool(d.get(), "record_on_launch");
+    c.windows_startup_initialized = obs_data_get_bool(d.get(), "windows_startup_initialized");
     if (obs_data_has_user_value(d.get(), "auto_check_updates")) c.auto_check_updates = obs_data_get_bool(d.get(), "auto_check_updates");
     if (obs_data_has_user_value(d.get(), "hotkey")) c.hotkey = (unsigned)obs_data_get_int(d.get(), "hotkey");
     if (obs_data_has_user_value(d.get(), "modifiers")) c.modifiers = (unsigned)obs_data_get_int(d.get(), "modifiers");
@@ -134,6 +159,7 @@ void Config::save() const {
     obs_data_set_bool(d.get(), "audio", audio); obs_data_set_string(d.get(), "monitor", monitor.c_str());
     obs_data_set_bool(d.get(), "mic", mic); obs_data_set_string(d.get(), "mic_device", mic_device.c_str());
     obs_data_set_bool(d.get(), "record_on_launch", record_on_launch);
+    obs_data_set_bool(d.get(), "windows_startup_initialized", windows_startup_initialized);
     obs_data_set_bool(d.get(), "auto_check_updates", auto_check_updates);
     obs_data_set_string(d.get(), "storage", path_text(storage).c_str()); write_json(app_dir() / "config.json", d.get());
 }

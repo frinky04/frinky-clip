@@ -28,7 +28,10 @@ std::unique_ptr<Velopack::UpdateManager> manager() {
 }
 void update_startup() {
     Velopack::VelopackApp::Build().SetAutoApplyOnStartup(false)
-        .OnBeforeUninstall(close_for_installer).OnBeforeUpdate(close_for_installer).Run();
+        .OnBeforeUninstall([](void* context, const char* version) {
+            close_for_installer(context, version);
+            try { set_starts_with_windows(false); } catch (...) { /* Uninstall must still remove the app. */ }
+        }).OnBeforeUpdate(close_for_installer).Run();
 }
 struct Updates::Work {
     std::mutex mutex;

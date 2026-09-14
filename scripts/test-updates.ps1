@@ -94,6 +94,11 @@ try {
     if ($LongExport -and $clipSaved.Count -lt 2) { throw 'Long export was interrupted by update.' }
     $clipPrefs = Get-Content "$clipHome/config.json" -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($clipPrefs.record_on_launch -or $clipPrefs.auto_check_updates -or $clipPrefs.storage.Replace('\','/') -ne $clipStorage.Replace('\','/')) { throw 'Upgrade changed saved preferences.' }
+    $clipStartupCommand = '"' + $clipExe.Replace('/','\') + '" --startup'
+    if ([version]$ToVersion -ge [version]'0.3.2') {
+        $clipStartup = Get-ItemPropertyValue 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Run' -Name 'Frinky Clip'
+        if (-not $clipPrefs.windows_startup_initialized -or $clipStartup -ne $clipStartupCommand) { throw 'First installed launch did not enable Windows startup.' }
+    }
     # Every non-system media DLL must load from the installed app, not OBS.
     $clipAppProcess = Get-Process frinky-clip | Where-Object { $_.Path -eq $clipExe } | Select-Object -First 1
     $clipBadModules = @($clipAppProcess.Modules | Where-Object { $_.FileName -like '*obs-studio*' })
@@ -103,6 +108,10 @@ try {
     if (-not $clipUninstall.WaitForExit(30000) -or $clipUninstall.ExitCode -ne 0) { throw 'Uninstall failed.' }
     Wait-For { -not (Get-Process frinky-clip -ErrorAction SilentlyContinue) } 'full shutdown on uninstall'
     if ((Test-Path $clipExe) -or -not (Test-Path "$clipHome/config.json") -or -not (Test-Path "$clipStorage/keep.txt")) { throw 'Uninstall did not preserve user data or remove the app.' }
+    if ([version]$ToVersion -ge [version]'0.3.2') {
+        $clipStartup = Get-ItemPropertyValue 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Run' -Name 'Frinky Clip' -ErrorAction SilentlyContinue
+        if ($clipStartup -eq $clipStartupCommand) { throw 'Uninstall left its Windows startup entry behind.' }
+    }
     [IO.File]::WriteAllText((Join-Path $clipRun 'passed.txt'), "$FromVersion -> $ToVersion; installed, reinstalled while open, checked, downloaded, restored recording state, saved clip, preserved preferences, uninstalled while open; Unicode/spaced paths. GitHub=$GitHub; Paused=$Paused; LongExport=$LongExport")
     Write-Host "Update integration passed: $clipRun"
 } finally {

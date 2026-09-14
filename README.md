@@ -20,7 +20,8 @@ Releases are currently unsigned, so Windows may show a SmartScreen warning. Afte
 - Recording starts when you open the app. Change **Record on launch** in Settings to disable this.
 - Press **Ctrl+Shift+F8** to save the last 60 seconds.
 - Use the timeline to select a range, then **Export**. **Space** plays or pauses; **I** and **O** mark the start and end.
-- Enable your microphone in Settings to record it alongside desktop audio.
+- Desktop audio and your default microphone are recorded. Change either in Settings.
+- After your first launch, Frinky Clip starts quietly in the tray when you sign in. Turn off **Start with Windows** in Settings to disable this.
 - Closing the window keeps the app in the tray. Choose **Quit** from the tray menu to exit.
 
 By default, Frinky Clip keeps up to two hours of history within a 50 GB buffer limit. Change the storage folder and limits in Settings. Saved clips are kept separately from the rolling buffer.
@@ -29,4 +30,4 @@ By default, Frinky Clip keeps up to two hours of history within a 50 GB buffer l
 
 Installed copies check for updates automatically. Open **Settings → Updates** to download and restart when ready. Updates and uninstall preserve your settings and clips. Portable copies are updated manually.
 
-[GPL-2.0-or-later](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.md) · [Development](DEVELOPMENT.md)
+[GPL-2.0-or-later](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.md)

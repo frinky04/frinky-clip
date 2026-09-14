@@ -6,8 +6,28 @@
 #include <stdexcept>
 using namespace clip;
 static void require(bool pass, const char* text) { if (!pass) throw std::runtime_error(text); }
+// Redirect only this test process's HKCU; never touch the user's startup entries.
+struct StartupRegistryTest {
+    std::wstring path = L"Software\\FrinkyClipTests\\" + wide(unique_id());
+    HKEY key = nullptr;
+    StartupRegistryTest() {
+        require(RegCreateKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &key, nullptr) == ERROR_SUCCESS, "Create isolated registry");
+        require(RegOverridePredefKey(HKEY_CURRENT_USER, key) == ERROR_SUCCESS, "Isolate startup registration");
+    }
+    ~StartupRegistryTest() {
+        RegOverridePredefKey(HKEY_CURRENT_USER, nullptr); RegCloseKey(key);
+        RegDeleteTreeW(HKEY_CURRENT_USER, path.c_str());
+    }
+};
 int main() {
     try {
+        {
+            StartupRegistryTest registry;
+            require(!starts_with_windows(), "No startup entry before first launch");
+            set_starts_with_windows(true); require(starts_with_windows(), "Enable startup with this executable");
+            set_starts_with_windows(false); require(!starts_with_windows(), "Disable startup");
+            set_starts_with_windows(false); require(!starts_with_windows(), "Disabling an absent entry is harmless");
+        }
         std::vector<Segment> segments{
             {"one", "session-a", 6000, 10000, 100}, {"two", "session-a", 10000, 14000, 100}, {"three", "session-a", 14000, 18000, 100}};
         require(segments[0].seconds() == 4.0, "Segment length follows its chained extent");
@@ -34,6 +54,12 @@ int main() {
         GetEnvironmentVariableW(L"FRINKY_CLIP_HOME", previous_home, 32768);
         require(SetEnvironmentVariableW(L"FRINKY_CLIP_HOME", dir.c_str()), "Isolate preference tests");
         auto saved = Config::load(); require(saved.record_on_launch, "Fresh install records on launch by default");
+        require(saved.mic && saved.mic_device == "default", "Fresh install uses the default microphone");
+        require(!saved.windows_startup_initialized, "Startup registration waits for the first installed launch");
+        saved.windows_startup_initialized = true;
+        saved.mic = false; saved.save();
+        require(!Config::load().mic, "An explicit microphone opt-out survives upgrades");
+        require(Config::load().windows_startup_initialized, "Later launches remember that Windows startup was configured");
         require(saved.auto_check_updates, "Existing and fresh configs default to automatic update checks");
         saved.auto_check_updates = false; saved.save();
         require(!Config::load().auto_check_updates, "Disabling automatic updates persists");

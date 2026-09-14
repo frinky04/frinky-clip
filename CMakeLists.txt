@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(FrinkyClip VERSION 0.3.1 LANGUAGES CXX RC)
+project(FrinkyClip VERSION 0.3.2 LANGUAGES CXX RC)
 if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Frinky Clip requires MSVC and 64-bit Windows.")
 endif()
@@ -48,7 +48,7 @@ add_library(clip_core src/common.cpp src/media.cpp src/buffer.cpp src/timeline.c
 target_include_directories(clip_core PUBLIC src "${CMAKE_BINARY_DIR}/include")
 target_include_directories(clip_core SYSTEM PUBLIC "${DEPS}/obs-src/libobs" "${DEPS}/ffmpeg-src")
 target_compile_definitions(clip_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
-target_link_libraries(clip_core PUBLIC obs avformat avcodec avutil swscale swresample shell32 ole32)
+target_link_libraries(clip_core PUBLIC obs avformat avcodec avutil swscale swresample shell32 ole32 advapi32)
 add_executable(frinky-clip WIN32 src/main.cpp src/recorder.cpp src/ui.cpp src/app.cpp src/updates.cpp src/thumbs.cpp src/waveform.cpp src/player.cpp "${CMAKE_BINARY_DIR}/version.rc"
   "${DEPS}/imgui/imgui.cpp" "${DEPS}/imgui/imgui_draw.cpp" "${DEPS}/imgui/imgui_tables.cpp" "${DEPS}/imgui/imgui_widgets.cpp"
   "${DEPS}/imgui/backends/imgui_impl_win32.cpp" "${DEPS}/imgui/backends/imgui_impl_dx11.cpp")

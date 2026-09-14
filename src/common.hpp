@@ -40,9 +40,10 @@ struct Config {
     unsigned hotkey = VK_F8;
     unsigned modifiers = MOD_CONTROL | MOD_SHIFT;
     bool audio = true;              // Desktop audio.
-    bool mic = false;               // Microphone, as a second audio track.
+    bool mic = true;                // Default microphone, as a second audio track.
     std::string mic_device = "default"; // MMDevice id, or "default".
     bool record_on_launch = true;
+    bool windows_startup_initialized = false; // Set once, on the first installed GUI launch.
     bool auto_check_updates = true;
     std::string monitor;
     fs::path storage;
@@ -67,6 +68,8 @@ void write_json_fast(const fs::path& path, obs_data_t* value);
 HWND recorder_window();
 struct Monitor { std::string id, label; int width, height; bool primary; };
 struct AudioDevice { std::string id, label; };
+bool starts_with_windows();
+void set_starts_with_windows(bool enabled);
 std::vector<AudioDevice> capture_devices(); // Microphones and other inputs, default first.
 std::vector<Monitor> monitors();
 }

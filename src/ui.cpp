@@ -160,10 +160,10 @@ std::string shortcut(const Config& c) {
         (c.modifiers & MOD_ALT ? "Alt+" : "") + "F" + std::to_string(c.hotkey - VK_F1 + 1);
 }
 }
-int run_ui(int resume_recording) {
+int run_ui(int resume_recording, bool start_hidden) {
     App app;
     if (!app.primary()) {
-        if (auto existing = FindWindowW(AppWindowClass, nullptr)) { ShowWindow(existing, SW_RESTORE); SetForegroundWindow(existing); }
+        if (!start_hidden) if (auto existing = FindWindowW(AppWindowClass, nullptr)) { ShowWindow(existing, SW_RESTORE); SetForegroundWindow(existing); }
         return 0;
     }
     Updates updates;
@@ -172,6 +172,12 @@ int run_ui(int resume_recording) {
     char storage[2048]; strncpy_s(storage, path_text(cfg.storage).c_str(), _TRUNCATE);
     auto status = read_json(app_dir() / "status.json"); std::int64_t last_read = 0;
     std::string error, settings_error; bool dirty = false;
+    if (updates.status().installed && !cfg.windows_startup_initialized) {
+        try {
+            set_starts_with_windows(true);
+            cfg.windows_startup_initialized = true; cfg.save();
+        } catch (const std::exception& e) { error = e.what(); }
+    }
     WNDCLASSW wc{}; wc.style = CS_CLASSDC; wc.lpfnWndProc = ui_proc; wc.hInstance = GetModuleHandleW(nullptr);
     wc.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_FRINKY_CLIP)); wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.lpszClassName = AppWindowClass; RegisterClassW(&wc);
     auto initial = window_rect(DefaultClientWidth, (DefaultClientWidth - 2 * SidePadding) * 9 / 16 + ChromeHeight, GetDpiForSystem());
@@ -196,7 +202,9 @@ int run_ui(int resume_recording) {
     io.FontDefault = regular;
     float dpi = GetDpiForWindow(window) / 96.f; theme(dpi);
     ImGui_ImplWin32_Init(window); ImGui_ImplDX11_Init(device, context);
-    ShowWindow(window, SW_SHOW); SetWindowPos(window, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW); UpdateWindow(window);
+    if (!start_hidden) {
+        ShowWindow(window, SW_SHOW); SetWindowPos(window, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW); UpdateWindow(window);
+    }
     auto save_settings = [&] {
         try {
             cfg.storage = fs::path(wide(storage)); cfg.save(); dirty = false; settings_error.clear();
@@ -237,6 +245,8 @@ int run_ui(int resume_recording) {
     Thumbnails::Picture hover_picture{}; float hover_alpha = 0, hover_x = 0; std::int64_t hover_shown_ms = 0;
     enum class Drag { None, Press, Range, In, Out } drag = Drag::None; std::int64_t drag_anchor = 0, scrub_ms = 0; float press_x = 0; bool scrubbing = false;
     std::optional<Player> player_holder; player_holder.emplace(device, context); auto& player = *player_holder;
+    bool right_clear = false;
+    auto clear_range = [&] { in_ms = out_ms = 0; player.set_range(0, 0); };
     auto inspect = [&](std::int64_t ms) { player.pause(); player.seek(ms); };
     const double frame_ms = 1000.0 / 60;
     auto span_at = [&](std::int64_t t) -> const Span* {
@@ -694,6 +704,14 @@ int run_ui(int resume_recording) {
                 fg->AddText(ImVec2(px, py + ph + pad), tint(muted_u32, 1), local_time(hover_shown_ms, true).c_str());
             }
             float grab = 6 * dpi;
+            if (ImGui::IsItemActivated() && ImGui::IsMouseDown(ImGuiMouseButton_Right))
+                right_clear = (in_ms && std::abs(io.MousePos.x - x_of(in_ms)) <= grab) ||
+                    (out_ms && std::abs(io.MousePos.x - x_of(out_ms)) <= grab);
+            if (ImGui::IsMouseDragging(ImGuiMouseButton_Right)) right_clear = false;
+            if (ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
+                if (right_clear && hovered) { clear_range(); have_range = false; }
+                right_clear = false;
+            }
             // A press becomes a range drag once the mouse moves; a plain click
             // places the playhead instead.
             if (ImGui::IsItemActivated() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
@@ -709,7 +727,7 @@ int run_ui(int resume_recording) {
                 if (drag == Drag::Range) { in_ms = std::min(drag_anchor, t); out_ms = std::max(drag_anchor, t); }
                 if (drag == Drag::In) { in_ms = std::min(t, out_ms - (std::int64_t)frame_ms); }
                 if (drag == Drag::Out) { out_ms = std::max(t, in_ms + (std::int64_t)frame_ms); }
-            } else if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Right) && io.MouseDelta.x != 0) {
+            } else if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Right) && !right_clear && io.MouseDelta.x != 0) {
                 target_end_ms -= (std::int64_t)(io.MouseDelta.x / px_per_ms); follow = false;
             }
             if (!ImGui::IsItemActive()) {
@@ -758,7 +776,7 @@ int run_ui(int resume_recording) {
             ImGui::TextDisabled("In"); ImGui::SameLine(); ImGui::TextUnformatted(local_time(in_ms, true).c_str());
             ImGui::SameLine(0, 10 * dpi); ImGui::TextDisabled("Out"); ImGui::SameLine(); ImGui::TextUnformatted(local_time(out_ms, true).c_str());
             ImGui::SameLine(0, 10 * dpi); ImGui::TextDisabled("%.3f s (%lld frames)", seconds, (long long)std::llround(seconds * 60));
-            ImGui::SameLine(0, 10 * dpi); if (ImGui::Button("Clear")) { in_ms = out_ms = 0; have_range = false; player.set_range(0, 0); }
+            ImGui::SameLine(0, 10 * dpi); if (ImGui::Button("Clear")) { clear_range(); have_range = false; }
         } else {
             ImGui::TextDisabled("%s", in_ms ? ("In " + local_time(in_ms, true) + "   press O to mark the out point").c_str()
                 : out_ms ? ("Out " + local_time(out_ms, true) + "   press I to mark the in point").c_str() : "Drag the lane or press I and O to mark a range");
@@ -955,6 +973,15 @@ int run_ui(int resume_recording) {
             section("App");
             if (properties("app")) {
                 row("Startup");
+                bool windows_startup = starts_with_windows();
+                ImGui::BeginDisabled(!updates.status().installed);
+                if (ImGui::Checkbox("Start with Windows", &windows_startup)) {
+                    try { set_starts_with_windows(windows_startup); error.clear(); }
+                    catch (const std::exception& e) { error = e.what(); }
+                }
+                ImGui::EndDisabled();
+                help(updates.status().installed ? "Open in the tray when you sign in" : "Install Frinky Clip to enable Windows startup");
+                row("");
                 if (ImGui::Checkbox("Record on launch", &cfg.record_on_launch)) {
                     try {
                         // Persist this independent preference without applying draft capture settings.
@@ -966,36 +993,50 @@ int run_ui(int resume_recording) {
             }
             section("Updates");
             auto update = updates.status();
-            ImGui::TextDisabled("Frinky Clip %s", FRINKY_VERSION);
-            if (!update.installed) ImGui::TextDisabled("Install Frinky Clip to receive updates here.");
-            else {
-                if (ImGui::Checkbox("Automatically check for updates", &cfg.auto_check_updates)) {
+            if (properties("updates")) {
+                row("Version"); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(FRINKY_VERSION);
+                row("Updates");
+                ImGui::BeginDisabled(!update.installed);
+                if (ImGui::Checkbox("Check automatically", &cfg.auto_check_updates)) {
                     try {
                         auto saved = Config::load(); saved.auto_check_updates = cfg.auto_check_updates; saved.save();
                     } catch (const std::exception& e) { cfg.auto_check_updates = !cfg.auto_check_updates; error = e.what(); }
                 }
-                ImGui::BeginDisabled(update.working || update.ready);
-                if (ImGui::Button("Check for updates")) updates.check();
                 ImGui::EndDisabled();
-                if (!update.version.empty()) {
-                    ImGui::SameLine(); ImGui::Text("Version %s", update.version.c_str());
-                    ImGui::SameLine(); if (ImGui::SmallButton("Release notes"))
-                        open_path(window, fs::path(wide("https://github.com/frinky04/frinky-clip/releases/tag/v" + update.version)), error);
+                row("");
+                const char* action = app.updating() ? "Restarting..." : update.working ? (update.available ? "Downloading..." : "Checking...")
+                    : update.ready ? "Restart" : update.available ? "Download" : "Check for updates";
+                ImGui::BeginDisabled(!update.installed || update.working || app.quitting() || (update.ready && !app.paused() && !app.recording()));
+                // Keep the same item identity and width through every update state.
+                if (ImGui::Button((std::string(action) + "###update-action").c_str(), ImVec2(152 * dpi, 0))) {
+                    if (update.ready) request_update();
+                    else if (update.available) updates.download();
+                    else updates.check();
                 }
-                if (app.updating()) ImGui::TextWrapped("Finishing recording and saves before updating...");
-                else if (update.ready) {
-                    ImGui::BeginDisabled(!app.paused() && !app.recording());
-                    if (ImGui::Button("Update and restart")) request_update();
-                    ImGui::EndDisabled();
-                } else if (update.available && !update.working) {
-                    if (ImGui::Button("Download update")) updates.download();
-                }
-                if (update.working && update.available) ImGui::ProgressBar(update.progress / 100.f, ImVec2(-1, 0));
-                if (!update.message.empty()) ImGui::TextWrapped("%s", update.message.c_str());
-                if (!update.error.empty() && !update.message.empty()) {
-                    ImGui::TextWrapped("%s", update.error.c_str());
-                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (ImGui::Button("Release notes")) open_path(window,
+                    fs::path(wide("https://github.com/frinky04/frinky-clip/releases/tag/v" + (update.version.empty() ? std::string(FRINKY_VERSION) : update.version))), error);
+                ImGui::EndTable();
             }
+            std::string update_status = !update.installed ? "Install Frinky Clip to enable updates."
+                : app.updating() ? "Finishing saves and exports..."
+                : !update.error.empty() ? (update.available ? "Download failed. Try again." : "Could not check for updates. Try again.")
+                : update.working ? (update.available ? "Downloading " + std::to_string(update.progress) + "%" : "Checking for updates...")
+                : update.ready ? "Version " + update.version + " ready to install"
+                : update.available ? "Version " + update.version + " available"
+                : update.message.empty() ? "" : "You're up to date";
+            // One reserved line, including progress. Errors never resize the dialog.
+            ImVec2 update_at = ImGui::GetCursorScreenPos();
+            float update_w = ImGui::GetContentRegionAvail().x, frame_h = ImGui::GetFrameHeight();
+            ImVec4 update_clip(update_at.x, update_at.y, update_at.x + update_w, update_at.y + frame_h);
+            ImGui::GetWindowDrawList()->AddText(nullptr, 0, ImVec2(update_at.x, update_at.y + style.FramePadding.y),
+                update.error.empty() ? muted_u32 : ImGui::ColorConvertFloat4ToU32(rgb(0xf0a399)), update_status.c_str(), nullptr, 0, &update_clip);
+            if (update.working && update.available)
+                ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(update_at.x, update_at.y + frame_h - 2 * dpi),
+                    ImVec2(update_at.x + update_w * std::clamp(update.progress / 100.f, 0.f, 1.f), update_at.y + frame_h), accent_u32);
+            ImGui::Dummy(ImVec2(update_w, frame_h));
+            if (!update.error.empty()) help(update.error.c_str());
             section("Diagnostics");
             if (ImGui::Button("Open log")) open_path(window, app_dir() / "recorder.log", error);
             if (recording) {
