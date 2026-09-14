@@ -14,6 +14,9 @@ $clipOldHome = $env:FRINKY_CLIP_HOME; $clipOldFeed = $env:FRINKY_CLIP_UPDATE_FEE
 $env:FRINKY_CLIP_HOME = $clipHome
 $env:FRINKY_CLIP_UPDATE_FEED = if ($GitHub) { $null } else { $clipFeed }
 $clipExe = Join-Path $clipInstall 'current/frinky-clip.exe'
+$clipStartupCommand = '"' + $clipExe.Replace('/','\') + '" --startup'
+$clipStartupKey = 'HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run'
+$clipOldStartup = [Microsoft.Win32.Registry]::GetValue($clipStartupKey, 'Frinky Clip', $null)
 function Read-Update { Get-Content "$clipHome/update-status.json" -Raw -Encoding UTF8 | ConvertFrom-Json }
 function Read-Recorder { Get-Content "$clipHome/status.json" -Raw -Encoding UTF8 | ConvertFrom-Json }
 function Wait-For([scriptblock]$Condition, [string]$Description, [int]$Seconds = 45) {
@@ -94,7 +97,6 @@ try {
     if ($LongExport -and $clipSaved.Count -lt 2) { throw 'Long export was interrupted by update.' }
     $clipPrefs = Get-Content "$clipHome/config.json" -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($clipPrefs.record_on_launch -or $clipPrefs.auto_check_updates -or $clipPrefs.storage.Replace('\','/') -ne $clipStorage.Replace('\','/')) { throw 'Upgrade changed saved preferences.' }
-    $clipStartupCommand = '"' + $clipExe.Replace('/','\') + '" --startup'
     if ([version]$ToVersion -ge [version]'0.3.2') {
         $clipStartup = Get-ItemPropertyValue 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Run' -Name 'Frinky Clip'
         if (-not $clipPrefs.windows_startup_initialized -or $clipStartup -ne $clipStartupCommand) { throw 'First installed launch did not enable Windows startup.' }
@@ -121,4 +123,11 @@ try {
         if ($clipStillRunning) { Invoke-App '--quit'; foreach ($clipProcess in $clipStillRunning) { [void]$clipProcess.WaitForExit(15000) } }
     }
     $env:FRINKY_CLIP_HOME = $clipOldHome; $env:FRINKY_CLIP_UPDATE_FEED = $clipOldFeed
+    # First-launch tests temporarily register their own path. Restore the user's entry.
+    $clipRemainingStartup = [Microsoft.Win32.Registry]::GetValue($clipStartupKey, 'Frinky Clip', $null)
+    if ($clipOldStartup -and (-not $clipRemainingStartup -or $clipRemainingStartup -eq $clipStartupCommand)) {
+        [Microsoft.Win32.Registry]::SetValue($clipStartupKey, 'Frinky Clip', $clipOldStartup)
+    } elseif (-not $clipOldStartup -and $clipRemainingStartup -eq $clipStartupCommand) {
+        Remove-ItemProperty 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Run' -Name 'Frinky Clip'
+    }
 }
