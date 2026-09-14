@@ -1,4 +1,5 @@
 #include "buffer.hpp"
+#include "timeline.hpp"
 #include <shellapi.h>
 #include <iostream>
 #include <stdexcept>
@@ -50,6 +51,22 @@ int main() {
         loaded.record_on_launch = true; loaded.save(); require(Config::load().record_on_launch, "Enabled autostart persists");
         SetEnvironmentVariableW(L"FRINKY_CLIP_HOME", *previous_home ? previous_home : nullptr);
         fs::remove(dir / "config.json"); fs::remove(file); fs::remove(dir);
+        std::vector<Span> spans{{"a1", "session-a", 1000, 5000}, {"a2", "session-a", 5000, 9000}, {"b1", "session-b", 20000, 24000}};
+        require(spans_in_range(spans, 4000, 6000).size() == 2, "Range selects every overlapping segment");
+        require(spans_in_range(spans, 5000, 5500).size() == 1 && spans_in_range(spans, 5000, 5500)[0].path == "a2", "Touching end excludes the earlier segment");
+        require(spans_in_range(spans, 8000, 21000).empty(), "Range across sessions is rejected");
+        require(spans_in_range(spans, 10000, 15000).empty(), "Range in a gap has no footage");
+        ExportRequest request; request.start_ms = 3250; request.end_ms = 7000; request.height = 720; request.fps = 30; request.bitrate_kbps = 8000; request.codec = "av1";
+        auto ffargs = export_args(request, 1000, L"C:/x/list.txt", L"C:/x/progress.txt", L"C:/x/out.mp4.partial");
+        auto has = [&](const wchar_t* a, const wchar_t* b) { for (size_t i = 0; i + 1 < ffargs.size(); ++i) if (ffargs[i] == a && ffargs[i+1] == b) return true; return false; };
+        require(has(L"-ss", L"2.250") && has(L"-t", L"3.750") && has(L"-c:v", L"av1_nvenc") && has(L"-vf", L"fps=30,scale=-2:720") && has(L"-b:v", L"8000k"), "Export arguments trim relative to the first segment");
+        auto seek = std::find(ffargs.begin(), ffargs.end(), L"-ss"); require(seek > std::find(ffargs.begin(), ffargs.end(), L"-i"), "Output-side seek keeps the cut frame-accurate");
+        require(!export_progress("frame=1\n", 4000) && *export_progress("out_time_us=2000000\nprogress=continue\n", 4000) == 0.5 && *export_progress("out_time_us=1\nprogress=end\n", 4000) == 1.0, "Progress parsing");
+        auto round_trip_dir = fs::temp_directory_path() / ("FrinkyClipExport-" + unique_id());
+        write_export_request(round_trip_dir / "r.json", request); auto back = read_export_request(round_trip_dir / "r.json");
+        require(back.start_ms == 3250 && back.end_ms == 7000 && back.height == 720 && back.fps == 30 && back.codec == "av1" && back.audio, "Export request round trip");
+        fs::remove_all(round_trip_dir);
+        require(clip_name(0).starts_with("clip-19") && local_time(3600000 * 5 + 61234, true).ends_with(":01.234"), "Clip names and times use local wall-clock");
         std::cout << "Passed buffer retention, pinning, session boundaries, validation, Windows argument escaping, and atomic writes.\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

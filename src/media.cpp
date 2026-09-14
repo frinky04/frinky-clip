@@ -3,6 +3,8 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/error.h>
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
 }
 #include <stdexcept>
 #include <algorithm>
@@ -94,3 +96,55 @@ void remux(const std::vector<fs::path>& segments, const fs::path& destination) {
 }
 }
 
+namespace clip {
+Frame decode_frame(const fs::path& p, std::int64_t offset_ms, int width, bool keyframe_only) {
+    Input in(p); int index = -1;
+    for (unsigned i = 0; i < in.value->nb_streams; ++i) if (in.value->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { index = (int)i; break; }
+    if (index < 0) throw std::runtime_error("No video stream: " + path_text(p));
+    auto* stream = in.value->streams[index];
+    const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
+    if (!codec) throw std::runtime_error("No decoder for the recording's video codec");
+    AVCodecContext* ctx = avcodec_alloc_context3(codec); if (!ctx) throw std::bad_alloc();
+    AVPacket* packet = av_packet_alloc(); AVFrame* frame = av_frame_alloc(), *best = av_frame_alloc();
+    SwsContext* scaler = nullptr;
+    auto cleanup = [&] { av_packet_free(&packet); av_frame_free(&frame); av_frame_free(&best); avcodec_free_context(&ctx); sws_freeContext(scaler); };
+    try {
+        check(avcodec_parameters_to_context(ctx, stream->codecpar), "Configure decoder");
+        ctx->thread_count = 0; // Auto: libaom tile/frame threads make 1440p AV1 tolerable in software.
+        if (keyframe_only) ctx->skip_frame = AVDISCARD_NONKEY;
+        check(avcodec_open2(ctx, codec, nullptr), "Open decoder");
+        std::int64_t target = av_rescale_q(offset_ms, AVRational{1, 1000}, stream->time_base);
+        if (offset_ms > 0) av_seek_frame(in.value, index, target, AVSEEK_FLAG_BACKWARD);
+        bool have = false, done = false;
+        auto consider = [&](AVFrame* f) {
+            std::int64_t pts = f->best_effort_timestamp == AV_NOPTS_VALUE ? f->pts : f->best_effort_timestamp;
+            if (pts != AV_NOPTS_VALUE && pts > target && have) { done = true; return; }
+            av_frame_unref(best); av_frame_ref(best, f); have = true;
+            if (keyframe_only || (pts != AV_NOPTS_VALUE && pts >= target)) done = true;
+        };
+        while (!done) {
+            int r = av_read_frame(in.value, packet);
+            if (r < 0) { avcodec_send_packet(ctx, nullptr); }
+            else if (packet->stream_index != index) { av_packet_unref(packet); continue; }
+            else { avcodec_send_packet(ctx, packet); av_packet_unref(packet); }
+            while (!done) {
+                int rr = avcodec_receive_frame(ctx, frame);
+                if (rr == AVERROR(EAGAIN)) break;
+                if (rr == AVERROR_EOF || rr < 0) { done = true; break; }
+                consider(frame); av_frame_unref(frame);
+            }
+            if (r < 0) break;
+        }
+        if (!have) throw std::runtime_error("No decodable frame at that position");
+        int height = std::max(1, (int)std::lround((double)best->height * width / std::max(1, best->width)));
+        scaler = sws_getContext(best->width, best->height, (AVPixelFormat)best->format, width, height, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!scaler) throw std::runtime_error("Cannot scale decoded frame");
+        Frame out; out.width = width; out.height = height; out.rgba.resize((size_t)width * height * 4);
+        std::uint8_t* planes[1] = {out.rgba.data()}; int strides[1] = {width * 4};
+        sws_scale(scaler, best->data, best->linesize, 0, best->height, planes, strides);
+        std::int64_t pts = best->best_effort_timestamp == AV_NOPTS_VALUE ? best->pts : best->best_effort_timestamp;
+        out.pts_ms = pts == AV_NOPTS_VALUE ? offset_ms : av_rescale_q(pts, stream->time_base, AVRational{1, 1000});
+        cleanup(); return out;
+    } catch (...) { cleanup(); throw; }
+}
+}

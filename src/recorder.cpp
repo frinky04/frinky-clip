@@ -1,5 +1,6 @@
 #include "recorder.hpp"
 #include "buffer.hpp"
+#include "timeline.hpp"
 #include <shellapi.h>
 #include <future>
 #include <mutex>
@@ -42,6 +43,10 @@ public:
     std::deque<SaveJob> recovered_jobs;
     std::uint64_t frame_count = 0, lagged_frames = 0, skipped_frames = 0, render_frames = 0;
     double render_ms = 0;
+    // Editor protection: footage in [pin_start, pin_end] stays while the pin is
+    // refreshed. An export additionally hard-links its sources.
+    std::int64_t pin_start = 0, pin_end = 0, pin_at = 0;
+    fs::path export_progress_file; std::int64_t export_duration_ms = 0; double export_fraction = -1;
 
     ~Recorder() {
         if (worker.valid()) worker.wait();
@@ -275,6 +280,44 @@ public:
             return path_text(target);
         });
     }
+    void pin(std::int64_t start_ms, std::int64_t end_ms) {
+        pin_start = start_ms; pin_end = end_ms; pin_at = (start_ms || end_ms) ? now_ms() : 0;
+    }
+    std::vector<Span> spans() const {
+        std::vector<Span> result;
+        for (auto& s : buffer.segments()) result.push_back({s.path, s.session, s.end_ms - (std::int64_t)std::llround(s.seconds * 1000), s.end_ms});
+        return result;
+    }
+    // Export a range of the buffer as a re-encoded clip through ffmpeg.exe.
+    void export_clip() {
+        if (busy()) { message = "A save or export is already in progress."; return; }
+        auto request = read_export_request(app_dir() / "export-request.json");
+        if (request.end_ms - request.start_ms < 100) { message = "Mark a range of at least 0.1 s."; return; }
+        auto sources = spans_in_range(spans(), request.start_ms, request.end_ms);
+        if (sources.empty()) { message = "The range has no closed footage, or crosses a Stop/Record boundary."; return; }
+        wchar_t found[32768];
+        if (!SearchPathW(nullptr, L"ffmpeg.exe", nullptr, 32768, found, nullptr)) { message = "Export requires ffmpeg.exe on PATH."; return; }
+        fs::path ffmpeg(found);
+        auto id = "export-" + unique_id(); auto folder = cfg.storage / "pending" / id;
+        std::vector<fs::path> paths; for (auto& s : sources) paths.push_back(s.path);
+        auto linked = buffer.protect(paths, folder);
+        std::string list; for (auto& p : linked) list += "file '" + path_text(p) + "'\n";
+        atomic_write(folder / "list.txt", list);
+        auto name = clip_name(request.start_ms); auto output = cfg.storage / "clips" / (name + ".mp4");
+        for (int n = 2; fs::exists(output); ++n) output = cfg.storage / "clips" / (name + "-" + std::to_string(n) + ".mp4");
+        auto temp = output; temp += L".partial"; auto log = folder / "ffmpeg.log";
+        export_progress_file = folder / "progress.txt"; export_duration_ms = request.end_ms - request.start_ms; export_fraction = 0;
+        auto args = export_args(request, sources.front().start_ms, folder / "list.txt", export_progress_file, temp);
+        message = "Exporting clip...";
+        worker = std::async(std::launch::async, [ffmpeg, args, log, temp, output, folder] {
+            auto code = run_process(ffmpeg, args, log, 30 * 60 * 1000);
+            if (code) throw std::runtime_error("Export failed. See " + path_text(log));
+            inspect_media(temp);
+            if (!flush_closed(temp) || !MoveFileExW(temp.c_str(), output.c_str(), MOVEFILE_WRITE_THROUGH)) throw std::runtime_error("Cannot publish exported clip");
+            std::error_code ec; fs::remove_all(folder, ec);
+            return path_text(output);
+        });
+    }
     void stop() {
         if (!session() || stopping) return;
         stopping = true; stop_started = now_ms(); message = "Stopping recorder...";
@@ -302,6 +345,7 @@ public:
         obs_data_set_int(d.get(), "skipped_frames", skipped_frames); obs_data_set_int(d.get(), "render_frames", render_frames);
         obs_data_set_double(d.get(), "render_ms", render_ms);
         obs_data_set_double(d.get(), "fps", recording() ? obs_get_active_fps() : 0);
+        obs_data_set_double(d.get(), "export_progress", export_fraction);
         obs_data_set_int(d.get(), "recovered", buffer.recovered); obs_data_set_int(d.get(), "quarantined", buffer.quarantined);
         write_json(app_dir() / "status.json", d.get()); last_status = now_ms();
     }
@@ -337,11 +381,21 @@ public:
         }
         if (waiting_save && std::any_of(buffer.segments().begin(), buffer.segments().end(), [&](auto& s) { return s.path == pending_last; })) begin_save();
         if (worker.valid() && worker.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-            try { last_clip = worker.get(); message = "Saved " + path_text(fs::path(wide(last_clip)).filename()); }
+            try { last_clip = worker.get(); message = (export_progress_file.empty() ? "Saved " : "Exported ") + path_text(fs::path(wide(last_clip)).filename()); }
             catch (const std::exception& e) { failure = e.what(); message = "Save failed; protected footage has been retained."; }
+            export_fraction = -1; export_progress_file.clear();
         }
         if (!worker.valid() && !waiting_save && !recovered_jobs.empty()) { auto job = std::move(recovered_jobs.front()); recovered_jobs.pop_front(); start_job(std::move(job)); }
-        std::set<fs::path> protected_set(pinned.begin(), pinned.end()); buffer.prune(protected_set);
+        if (worker.valid() && !export_progress_file.empty()) {
+            if (auto fraction = export_progress(read_text(export_progress_file), export_duration_ms)) {
+                export_fraction = *fraction; message = "Exporting clip... " + std::to_string((int)std::lround(*fraction * 100)) + "%";
+            }
+        }
+        std::set<fs::path> protected_set(pinned.begin(), pinned.end());
+        // The editor's view and marked range stay until the pin goes stale.
+        if (pin_at && now_ms() - pin_at < 15000)
+            for (auto& s : buffer.segments()) if (s.end_ms > pin_start && s.end_ms - s.seconds * 1000 < pin_end) protected_set.insert(s.path);
+        buffer.prune(protected_set);
         if (recording()) {
             frame_count = obs_output_get_total_frames(output); lagged_frames = obs_get_lagged_frames();
             skipped_frames = video_output_get_skipped_frames(obs_get_video()); render_frames = obs_get_total_frames();
@@ -380,6 +434,8 @@ LRESULT CALLBACK recorder_proc(HWND window, UINT msg, WPARAM w, LPARAM l) {
         if (msg == ResumeMessage) { r->resume(); r->status(); return 0; }
         if (msg == ExitMessage || msg == WM_CLOSE || msg == WM_ENDSESSION) { r->exit(); r->status(); return 0; }
         if (msg == ShareMessage) { r->share(); return 0; }
+        if (msg == PinMessage) { r->pin((std::int64_t)w, (std::int64_t)l); return 0; }
+        if (msg == ExportMessage) { r->export_clip(); r->status(); return 0; }
         if (msg == WM_TIMER) { r->tick(); return 0; }
     } catch (const std::exception& e) { r->failure = e.what(); r->waiting_save = false; r->pinned.clear(); r->stop(); }
     return DefWindowProcW(window, msg, w, l);

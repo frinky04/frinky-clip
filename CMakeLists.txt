@@ -34,12 +34,13 @@ import_runtime(obs obs)
 import_runtime(avformat avformat-62)
 import_runtime(avcodec avcodec-62)
 import_runtime(avutil avutil-60)
-add_library(clip_core src/common.cpp src/media.cpp src/buffer.cpp)
+import_runtime(swscale swscale-9)
+add_library(clip_core src/common.cpp src/media.cpp src/buffer.cpp src/timeline.cpp)
 target_include_directories(clip_core PUBLIC src "${CMAKE_BINARY_DIR}/include")
 target_include_directories(clip_core SYSTEM PUBLIC "${DEPS}/obs-src/libobs" "${DEPS}/ffmpeg-src")
 target_compile_definitions(clip_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
-target_link_libraries(clip_core PUBLIC obs avformat avcodec avutil shell32 ole32)
-add_executable(frinky-clip WIN32 src/main.cpp src/recorder.cpp src/ui.cpp src/app.cpp
+target_link_libraries(clip_core PUBLIC obs avformat avcodec avutil swscale shell32 ole32)
+add_executable(frinky-clip WIN32 src/main.cpp src/recorder.cpp src/ui.cpp src/app.cpp src/thumbs.cpp
   "${DEPS}/imgui/imgui.cpp" "${DEPS}/imgui/imgui_draw.cpp" "${DEPS}/imgui/imgui_tables.cpp" "${DEPS}/imgui/imgui_widgets.cpp"
   "${DEPS}/imgui/backends/imgui_impl_win32.cpp" "${DEPS}/imgui/backends/imgui_impl_dx11.cpp")
 target_include_directories(frinky-clip PRIVATE "${DEPS}/imgui" "${DEPS}/imgui/backends")

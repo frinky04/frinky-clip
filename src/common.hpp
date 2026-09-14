@@ -36,6 +36,7 @@ struct Config {
     int share_bitrate = 20000;
     int export_height = 1080; // Clip editor export defaults: 720, 1080, or 1440 lines.
     int export_fps = 60;      // 30 or 60.
+    std::string export_codec = "h264"; // or "av1"
     unsigned hotkey = VK_F8;
     unsigned modifiers = MOD_CONTROL | MOD_SHIFT;
     bool audio = true;
@@ -54,6 +55,8 @@ constexpr UINT ShareMessage = WM_APP + 3;
 constexpr UINT TrayMessage = WM_APP + 4;
 constexpr UINT ResumeMessage = WM_APP + 7; // Recorder: start a capture session in the warm process.
 constexpr UINT ExitMessage = WM_APP + 8;   // Recorder: stop capture, finish saves, and exit.
+constexpr UINT PinMessage = WM_APP + 9;    // Recorder: protect footage in [wParam, lParam] epoch ms from expiry; (0, 0) releases.
+constexpr UINT ExportMessage = WM_APP + 10; // Recorder: export the clip described by export-request.json.
 HWND recorder_window();
 struct Monitor { std::string id, label; int width, height; bool primary; };
 std::vector<Monitor> monitors();

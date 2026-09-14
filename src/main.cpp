@@ -1,5 +1,6 @@
 #include "recorder.hpp"
 #include "buffer.hpp"
+#include "media.hpp"
 #include "app.hpp"
 #include <shellapi.h>
 #include <objbase.h>
@@ -73,6 +74,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             auto d = clip::data(); obs_data_set_int(d.get(), "segments", buffer.segments().size());
             obs_data_set_int(d.get(), "recovered", buffer.recovered); obs_data_set_int(d.get(), "quarantined", buffer.quarantined);
             obs_data_set_double(d.get(), "seconds", buffer.seconds()); clip::write_json(clip::app_dir() / "recovery.json", d.get());
+        } else if (!args.empty() && args[0] == L"--probe-frame" && args.size() >= 3) {
+            // Diagnostic: decode one frame and report timing to frame-probe.txt.
+            auto began = clip::now_ms(); std::string report;
+            for (bool keyframe : {true, false}) {
+                try {
+                    auto frame = clip::decode_frame(clip::fs::path(args[1]), std::stoll(args[2]), 320, keyframe);
+                    report += std::string(keyframe ? "keyframe" : "exact") + ": " + std::to_string(frame.width) + "x" + std::to_string(frame.height) +
+                        " pts " + std::to_string(frame.pts_ms) + " ms in " + std::to_string(clip::now_ms() - began) + " ms\n";
+                } catch (const std::exception& e) { report += std::string(keyframe ? "keyframe" : "exact") + " failed: " + e.what() + "\n"; }
+                began = clip::now_ms();
+            }
+            clip::atomic_write(clip::app_dir() / "frame-probe.txt", report);
         } else if (!args.empty() && args[0] == L"--remux" && args.size() >= 3) {
             std::vector<clip::fs::path> sources; for (size_t i = 2; i < args.size(); ++i) sources.emplace_back(args[i]);
             clip::remux(sources, clip::fs::path(args[1]));

@@ -1,5 +1,7 @@
 #include "recorder.hpp"
 #include "app.hpp"
+#include "timeline.hpp"
+#include "thumbs.hpp"
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx11.h>
@@ -7,6 +9,8 @@
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <algorithm>
+#include <future>
+#include <optional>
 #include <cmath>
 #include <stdexcept>
 #include <string_view>
@@ -179,9 +183,21 @@ int run_ui() {
     // it idles with the OBS core initialized so the first Record is quick.
     if (cfg.record_on_launch) start_recording();
     else { try { app.warm(); } catch (const std::exception& e) { error = e.what(); } }
-    // Editor view over the rolling buffer, in seconds before now: the newest
-    // visible edge and the visible length. Following keeps the edge at now.
-    double view_end_ago = 0, view_seconds = 240; bool follow = true, open_settings = false, export_system = true, export_mic = false;
+    // Editor state. Times are epoch milliseconds; the view is the newest visible
+    // edge and its length, and following keeps that edge at now.
+    std::optional<Thumbnails> thumbs_holder; thumbs_holder.emplace(device); auto& thumbs = *thumbs_holder;
+    BufferMap map; std::future<BufferMap> scanning; std::int64_t last_scan = 0, last_pin = 0;
+    std::int64_t view_end_ms = now_ms(), in_ms = 0, out_ms = 0;
+    double view_seconds = 240; bool follow = true, open_settings = false, export_system = true, export_mic = false;
+    enum class Drag { None, Range, In, Out } drag = Drag::None; std::int64_t drag_anchor = 0;
+    const double frame_ms = 1000.0 / 60;
+    auto span_at = [&](std::int64_t t) -> const Span* { for (auto& s : map.spans) if (t >= s.start_ms && t < s.end_ms) return &s; return nullptr; };
+    // Snap to a source frame of the segment that contains the time, so the
+    // export's cut lands exactly there.
+    auto snap = [&](std::int64_t t) {
+        auto* s = span_at(t); if (!s) return t;
+        return s->start_ms + (std::int64_t)std::llround(std::llround((t - s->start_ms) / frame_ms) * frame_ms);
+    };
     bool done = false;
     while (!done) {
         MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); if (msg.message == WM_QUIT) done = true; }
@@ -199,10 +215,18 @@ int run_ui() {
         auto failure = app.active() && !current ? std::string() : std::string(obs_data_get_string(status.get(), "error"));
         app.observe(fresh ? obs_data_get_string(status.get(), "state") : "", busy, current ? updated_ms : 0, !failure.empty());
         bool recording = app.recording(), paused = app.paused();
-        if (!IsWindowVisible(window) || IsIconic(window)) {
+        bool visible = IsWindowVisible(window) && !IsIconic(window);
+        if (scanning.valid() && scanning.wait_for(std::chrono::seconds(0)) == std::future_status::ready) { try { map = scanning.get(); } catch (...) {} }
+        if (visible && !scanning.valid() && now_ms() - last_scan > 2000) {
+            last_scan = now_ms(); auto root = cfg.storage / "buffer";
+            scanning = std::async(std::launch::async, [root] { return scan_buffer(root); });
+        }
+        if (!visible) {
+            if (last_pin && recorder) { PostMessageW(recorder, PinMessage, 0, 0); last_pin = 0; }
             MsgWaitForMultipleObjects(0, nullptr, FALSE, 500, QS_ALLINPUT); continue;
         }
         float current_dpi = GetDpiForWindow(window) / 96.f; if (current_dpi != dpi) { dpi = current_dpi; theme(dpi); }
+        thumbs.tick();
         ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
         ImGui::SetNextWindowPos(ImVec2(0, 0)); ImGui::SetNextWindowSize(io.DisplaySize);
         ImGui::Begin("Frinky Clip", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
@@ -211,91 +235,203 @@ int run_ui() {
         auto* draw = ImGui::GetWindowDrawList();
         bool changed = false, commit = false;
         double buffered = obs_data_get_double(status.get(), "buffer_seconds"), used = obs_data_get_double(status.get(), "buffer_gb");
+        double export_fraction = current ? obs_data_get_double(status.get(), "export_progress") : -1;
+        std::int64_t now = now_ms();
         // The overview always spans the configured history so the filled part
         // shows how much of it exists yet.
         double capacity = std::max(cfg.retention_minutes * 60.0, 10.0);
+        std::int64_t oldest = now - (std::int64_t)(capacity * 1000);
         view_seconds = std::clamp(view_seconds, 10.0, capacity);
-        if (follow) view_end_ago = 0;
-        view_end_ago = std::clamp(view_end_ago, 0.0, capacity - view_seconds);
+        if (follow) view_end_ms = now;
+        view_end_ms = std::clamp(view_end_ms, oldest + (std::int64_t)(view_seconds * 1000), now);
+        std::int64_t view_start_ms = view_end_ms - (std::int64_t)(view_seconds * 1000);
+        bool have_range = in_ms && out_ms && out_ms > in_ms;
+        auto accent_u32 = ImGui::ColorConvertFloat4ToU32(accent), muted_u32 = ImGui::ColorConvertFloat4ToU32(muted);
+        auto line_u32 = ImGui::ColorConvertFloat4ToU32(rgb(0x2b2f35)), track_u32 = ImGui::ColorConvertFloat4ToU32(rgb(0x131518));
+        auto footage_u32 = ImGui::ColorConvertFloat4ToU32(rgb(0x1e2227)), range_u32 = ImGui::ColorConvertFloat4ToU32(ImVec4(accent.x, accent.y, accent.z, .18f));
 
         // Editor header: buffer extent on the left, settings on the right.
         ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Buffer");
-        ImGui::SameLine(); ImGui::TextDisabled("%s to now", buffered > 0 ? ago(buffered).c_str() : "empty");
+        ImGui::SameLine();
+        if (map.spans.empty()) ImGui::TextDisabled("empty");
+        else ImGui::TextDisabled("%s to now  (%s)", local_time(map.spans.front().start_ms).c_str(), ago(buffered).c_str());
+        if (!follow) { ImGui::SameLine(); if (ImGui::SmallButton("Now")) follow = true; help("Return to the live edge."); }
         float settings_w = ImGui::CalcTextSize("Settings").x + style.FramePadding.x * 2;
         ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - settings_w);
         if (ImGui::Button("Settings")) open_settings = true;
-        help("Capture, buffer, hotkey, export defaults, and diagnostics.");
+        help("Capture, buffer, hotkey, app, and diagnostics.");
 
-        // Overview bar: full history, newest at the right, with the viewed window.
+        // Overview bar: full history, newest at the right, footage, range, and the viewed window.
         {
             ImVec2 p = ImGui::GetCursorScreenPos(); float w = ImGui::GetContentRegionAvail().x, h = 14 * dpi;
-            draw->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::ColorConvertFloat4ToU32(rgb(0x131518)));
-            float fill = (float)std::clamp(buffered / capacity, 0.0, 1.0);
-            draw->AddRectFilled(ImVec2(p.x + w * (1 - fill), p.y), ImVec2(p.x + w, p.y + h), ImGui::ColorConvertFloat4ToU32(rgb(0x2b2f35)));
-            float x1 = p.x + w * (float)(1 - view_end_ago / capacity), x0 = p.x + w * (float)(1 - (view_end_ago + view_seconds) / capacity);
-            draw->AddRectFilled(ImVec2(x0, p.y), ImVec2(std::max(x1, x0 + 2 * dpi), p.y + h), ImGui::ColorConvertFloat4ToU32(ImVec4(accent.x, accent.y, accent.z, .35f)));
-            draw->AddRect(ImVec2(x0, p.y), ImVec2(std::max(x1, x0 + 2 * dpi), p.y + h), ImGui::ColorConvertFloat4ToU32(accent));
+            auto ox = [&](std::int64_t t) { return p.x + w * (float)std::clamp((double)(t - oldest) / (capacity * 1000), 0.0, 1.0); };
+            draw->AddRectFilled(p, ImVec2(p.x + w, p.y + h), track_u32);
+            for (auto& s : map.spans) draw->AddRectFilled(ImVec2(ox(s.start_ms), p.y), ImVec2(std::max(ox(s.end_ms), ox(s.start_ms) + 1), p.y + h), footage_u32);
+            if (have_range) draw->AddRectFilled(ImVec2(ox(in_ms), p.y), ImVec2(std::max(ox(out_ms), ox(in_ms) + 2 * dpi), p.y + h), accent_u32);
+            float x0 = ox(view_start_ms), x1 = std::max(ox(view_end_ms), x0 + 2 * dpi);
+            draw->AddRectFilled(ImVec2(x0, p.y), ImVec2(x1, p.y + h), range_u32);
+            draw->AddRect(ImVec2(x0, p.y), ImVec2(x1, p.y + h), accent_u32);
             ImGui::InvisibleButton("overview", ImVec2(w, h));
             if (ImGui::IsItemActive()) {
-                double at = (1 - (io.MousePos.x - p.x) / w) * capacity;
-                view_end_ago = std::clamp(at - view_seconds / 2, 0.0, capacity - view_seconds); follow = view_end_ago < 0.5;
+                std::int64_t at = oldest + (std::int64_t)(((io.MousePos.x - p.x) / w) * capacity * 1000);
+                view_end_ms = at + (std::int64_t)(view_seconds * 500); follow = view_end_ms >= now - 500;
             }
             help("Whole history. Drag to move the viewed window; scroll in the lanes to zoom.");
         }
 
-        // Lanes: ruler, video, and audio tracks for the viewed window.
-        // Rows below the lanes: range, export, separator, footer, one message line, and the usage bar.
+        // Lanes: wall-clock ruler, video with thumbnails, and audio coverage for the viewed window.
         float row_h = ImGui::GetFrameHeightWithSpacing();
         float below_h = row_h * 3 + ImGui::GetTextLineHeightWithSpacing() + style.ItemSpacing.y * 3 + 3 * dpi + style.WindowPadding.y;
-        float lanes_h = std::max(140 * dpi, ImGui::GetContentRegionAvail().y - below_h);
+        // Fixed lane heights; whatever is left above them previews the cut frames.
+        float audio_h = 30 * dpi, video_h = 96 * dpi, ruler_h = ImGui::GetTextLineHeight() + 4 * dpi;
+        float lanes_h = ruler_h + 2 * dpi + video_h + (audio_h + 4 * dpi) * 2 + 4 * dpi + style.WindowPadding.y;
+        float preview_h = std::max(96 * dpi, ImGui::GetContentRegionAvail().y - lanes_h - below_h - style.ItemSpacing.y);
+        std::int64_t hover_ms = 0; bool hover_lane = false;
+        // Preview strip: the exact In and Out frames. A keyframe stands in while
+        // the exact frame decodes, so dragging a handle still shows something.
+        if (ImGui::BeginChild("preview", ImVec2(0, preview_h), ImGuiChildFlags_Borders)) {
+            ImVec2 p = ImGui::GetCursorScreenPos(); float w = ImGui::GetContentRegionAvail().x, h = ImGui::GetContentRegionAvail().y;
+            if (!have_range) {
+                const char* hint = "Mark a range to preview its first and last frames";
+                auto size = ImGui::CalcTextSize(hint); draw->AddText(ImVec2(p.x + (w - size.x) / 2, p.y + (h - size.y) / 2), muted_u32, hint);
+            } else {
+                float caption_h = ImGui::GetTextLineHeight() + 4 * dpi, img_h = h - caption_h, img_w = std::floor(img_h * 16 / 9);
+                if (img_w * 2 + 12 * dpi > w) { img_w = std::floor((w - 12 * dpi) / 2); img_h = img_w * 9 / 16; }
+                float x = p.x + (w - img_w * 2 - 12 * dpi) / 2;
+                for (auto [t, label] : {std::pair{in_ms, "In"}, std::pair{out_ms, "Out"}}) {
+                    auto* s = span_at(t == out_ms ? t - 1 : t);
+                    draw->AddRectFilled(ImVec2(x, p.y), ImVec2(x + img_w, p.y + img_h), track_u32);
+                    if (s) {
+                        std::int64_t offset = t - s->start_ms;
+                        auto exact = thumbs.frame(s->path, offset, (int)img_w);
+                        auto shown = exact.texture ? exact : thumbs.keyframe(s->path, offset, (int)img_w);
+                        if (shown.texture) {
+                            float ph = std::min(img_h, img_w * shown.height / std::max(1, shown.width));
+                            draw->AddImage(shown.texture, ImVec2(x, p.y), ImVec2(x + img_w, p.y + ph), ImVec2(0, 0), ImVec2(1, 1),
+                                exact.texture ? IM_COL32_WHITE : IM_COL32(255, 255, 255, 110));
+                        }
+                        if (!exact.texture) draw->AddText(ImVec2(x + 6 * dpi, p.y + 4 * dpi), muted_u32, exact.failed ? "Frame unavailable" : "Decoding exact frame...");
+                    } else draw->AddText(ImVec2(x + 6 * dpi, p.y + 4 * dpi), muted_u32, "No footage");
+                    draw->AddRect(ImVec2(x, p.y), ImVec2(x + img_w, p.y + img_h), (t == in_ms ? drag == Drag::In : drag == Drag::Out) ? accent_u32 : line_u32);
+                    auto caption = std::string(label) + "  " + local_time(t, true);
+                    draw->AddText(ImVec2(x, p.y + img_h + 3 * dpi), muted_u32, caption.c_str());
+                    x += img_w + 12 * dpi;
+                }
+            }
+        }
+        ImGui::EndChild();
         if (ImGui::BeginChild("lanes", ImVec2(0, lanes_h), ImGuiChildFlags_Borders)) {
             ImVec2 origin = ImGui::GetCursorScreenPos(); float w = ImGui::GetContentRegionAvail().x, label_w = 44 * dpi;
-            float track_x = origin.x + label_w, track_w = w - label_w, ruler_h = ImGui::GetTextLineHeight() + 4 * dpi;
-            auto x_of = [&](double t_ago) { return track_x + track_w * (float)(1 - (t_ago - view_end_ago) / view_seconds); };
-            float y = origin.y + ruler_h + 2 * dpi, audio_h = 30 * dpi, inner_h = ImGui::GetContentRegionAvail().y;
-            // The video lane takes whatever height the audio lanes leave.
-            float video_h = std::max(48 * dpi, inner_h - ruler_h - 2 * dpi - (audio_h + 4 * dpi) * 2 - 4 * dpi);
+            float track_x = origin.x + label_w, track_w = w - label_w;
+            double px_per_ms = track_w / (view_seconds * 1000);
+            auto x_of = [&](std::int64_t t) { return track_x + (float)((t - view_start_ms) * px_per_ms); };
+            auto t_of = [&](float x) { return view_start_ms + (std::int64_t)((x - track_x) / px_per_ms); };
+            float y = origin.y + ruler_h + 2 * dpi;
             struct Lane { const char* name; float height; } lanes[] = {{"video", video_h}, {"sys", audio_h}, {"mic", audio_h}};
-            float bottom = y + video_h + (audio_h + 4 * dpi) * 2;
+            float bottom = y + video_h + (audio_h + 4 * dpi) * 2, video_y = y;
             const double steps[] = {1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600};
-            double step = steps[0]; for (double s : steps) { step = s; if (track_w * s / view_seconds >= 72 * dpi) break; }
-            auto muted_u32 = ImGui::ColorConvertFloat4ToU32(muted), line_u32 = ImGui::ColorConvertFloat4ToU32(rgb(0x2b2f35));
-            for (double t = std::ceil(view_end_ago / step) * step; t <= view_end_ago + view_seconds; t += step) {
-                float x = x_of(t); auto label = ago(t); auto size = ImGui::CalcTextSize(label.c_str());
+            double step = steps[0]; for (double s : steps) { step = s; if (track_w * s / view_seconds >= 84 * dpi) break; }
+            std::int64_t step_ms = (std::int64_t)(step * 1000);
+            for (std::int64_t t = (view_start_ms / step_ms + 1) * step_ms; t <= view_end_ms; t += step_ms) {
+                float x = x_of(t); auto label = local_time(t); auto size = ImGui::CalcTextSize(label.c_str());
                 float tx = std::clamp(x - size.x / 2, track_x, track_x + track_w - size.x);
                 draw->AddText(ImVec2(tx, origin.y), muted_u32, label.c_str());
                 draw->AddLine(ImVec2(x, origin.y + ruler_h), ImVec2(x, bottom), line_u32);
             }
+            // Ruler drag pans; the lanes below mark the range.
+            ImGui::SetCursorScreenPos(ImVec2(track_x, origin.y)); ImGui::InvisibleButton("ruler", ImVec2(track_w, ruler_h));
+            if (ImGui::IsItemActive() && io.MouseDelta.x != 0) { view_end_ms -= (std::int64_t)(io.MouseDelta.x / px_per_ms); follow = false; }
+            help("Drag to pan. Scroll anywhere in the lanes to zoom.");
             for (auto& lane : lanes) {
                 draw->AddText(ImVec2(origin.x, y + (lane.height - ImGui::GetTextLineHeight()) / 2), muted_u32, lane.name);
-                draw->AddRectFilled(ImVec2(track_x, y), ImVec2(track_x + track_w, y + lane.height), ImGui::ColorConvertFloat4ToU32(rgb(0x131518)));
+                draw->AddRectFilled(ImVec2(track_x, y), ImVec2(track_x + track_w, y + lane.height), track_u32);
+                bool audio_lane = lane.name[0] != 'v';
+                for (auto& s : map.spans) {
+                    if (s.end_ms < view_start_ms || s.start_ms > view_end_ms) continue;
+                    if (audio_lane && lane.name[0] == 'm') continue; // No microphone track yet.
+                    float x0 = std::max(x_of(s.start_ms), track_x), x1 = std::min(x_of(s.end_ms), track_x + track_w);
+                    draw->AddRectFilled(ImVec2(x0, y + (audio_lane ? lane.height * .35f : 0)), ImVec2(x1, y + (audio_lane ? lane.height * .65f : lane.height)), footage_u32);
+                }
                 draw->AddRect(ImVec2(track_x, y), ImVec2(track_x + track_w, y + lane.height), line_u32);
                 y += lane.height + 4 * dpi;
             }
-            if (follow) draw->AddLine(ImVec2(track_x + track_w - 1, origin.y + ruler_h), ImVec2(track_x + track_w - 1, y), ImGui::ColorConvertFloat4ToU32(accent), 2 * dpi);
+            // Thumbnails: one keyframe per slot, slots spaced so pictures never overlap.
+            if (!map.spans.empty()) {
+                float thumb_h = video_h - 2 * dpi, thumb_w = std::floor(thumb_h * 16 / 9);
+                double slot = 2; while (slot * 1000 * px_per_ms < thumb_w + 4 * dpi) slot *= 2;
+                std::int64_t slot_ms = (std::int64_t)(slot * 1000);
+                draw->PushClipRect(ImVec2(track_x, video_y), ImVec2(track_x + track_w, video_y + video_h), true);
+                for (std::int64_t t = (view_start_ms / slot_ms) * slot_ms; t <= view_end_ms; t += slot_ms) {
+                    auto* s = span_at(t); if (!s) continue;
+                    auto picture = thumbs.keyframe(s->path, t - s->start_ms, (int)thumb_w);
+                    if (!picture.texture) continue;
+                    float x = x_of(t) + 1 * dpi, ph = std::min(thumb_h, thumb_w * picture.height / std::max(1, picture.width));
+                    draw->AddImage(picture.texture, ImVec2(x, video_y + 1 * dpi), ImVec2(x + thumb_w, video_y + 1 * dpi + ph));
+                }
+                draw->PopClipRect();
+            }
+            // Live edge and the marked range.
+            if (map.last_end_ms && map.last_end_ms >= view_start_ms && map.last_end_ms <= view_end_ms)
+                draw->AddRectFilled(ImVec2(x_of(map.last_end_ms), video_y), ImVec2(std::min(x_of(now), track_x + track_w), video_y + video_h), ImGui::ColorConvertFloat4ToU32(ImVec4(accent.x, accent.y, accent.z, .08f)));
+            if (follow) draw->AddLine(ImVec2(track_x + track_w - 1, origin.y + ruler_h), ImVec2(track_x + track_w - 1, bottom), accent_u32, 2 * dpi);
+            if (have_range) {
+                float x0 = x_of(in_ms), x1 = x_of(out_ms);
+                draw->AddRectFilled(ImVec2(std::max(x0, track_x), origin.y + ruler_h), ImVec2(std::min(x1, track_x + track_w), bottom), range_u32);
+                for (float x : {x0, x1}) if (x >= track_x && x <= track_x + track_w) draw->AddLine(ImVec2(x, origin.y + ruler_h), ImVec2(x, bottom), accent_u32, 2 * dpi);
+            }
+            // Lane surface: left-drag marks or adjusts the range; wheel zooms; right-drag pans.
             ImGui::SetCursorScreenPos(ImVec2(track_x, origin.y + ruler_h));
-            ImGui::InvisibleButton("lane-surface", ImVec2(track_w, std::max(y - origin.y - ruler_h, 1.f)));
-            if (ImGui::IsItemActive() && io.MouseDelta.x != 0) {
-                view_end_ago = std::clamp(view_end_ago + io.MouseDelta.x / track_w * view_seconds, 0.0, capacity - view_seconds); follow = view_end_ago < 0.5;
+            ImGui::InvisibleButton("lane-surface", ImVec2(track_w, std::max(bottom - origin.y - ruler_h, 1.f)), ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+            bool hovered = ImGui::IsItemHovered();
+            if (hovered) { hover_lane = true; hover_ms = t_of(io.MousePos.x); }
+            float grab = 6 * dpi;
+            if (ImGui::IsItemActivated() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                float mx = io.MousePos.x;
+                if (have_range && std::abs(mx - x_of(in_ms)) <= grab) drag = Drag::In;
+                else if (have_range && std::abs(mx - x_of(out_ms)) <= grab) drag = Drag::Out;
+                else { drag = Drag::Range; drag_anchor = snap(t_of(mx)); in_ms = out_ms = 0; }
             }
-            if (ImGui::IsItemHovered() && io.MouseWheel != 0) {
-                double anchor = view_end_ago + (1 - (io.MousePos.x - track_x) / track_w) * view_seconds;
+            if (ImGui::IsItemActive() && drag != Drag::None) {
+                std::int64_t t = snap(std::clamp(t_of(io.MousePos.x), oldest, now));
+                if (drag == Drag::Range) { in_ms = std::min(drag_anchor, t); out_ms = std::max(drag_anchor, t); }
+                if (drag == Drag::In) { in_ms = std::min(t, out_ms - (std::int64_t)frame_ms); }
+                if (drag == Drag::Out) { out_ms = std::max(t, in_ms + (std::int64_t)frame_ms); }
+            } else if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Right) && io.MouseDelta.x != 0) {
+                view_end_ms -= (std::int64_t)(io.MouseDelta.x / px_per_ms); follow = false;
+            }
+            if (!ImGui::IsItemActive()) { if (drag != Drag::None && in_ms == out_ms) in_ms = out_ms = 0; drag = Drag::None; }
+            if (hovered && io.MouseWheel != 0) {
+                std::int64_t anchor = t_of(io.MousePos.x);
                 double next = std::clamp(view_seconds * std::pow(1.25, -io.MouseWheel), 10.0, capacity);
-                view_end_ago = std::clamp(anchor - (anchor - view_end_ago) * next / view_seconds, 0.0, capacity - next);
-                view_seconds = next; follow = view_end_ago < 0.5;
+                view_end_ms = anchor + (std::int64_t)((view_end_ms - anchor) * next / view_seconds);
+                view_seconds = next; follow = view_end_ms >= now - 500;
             }
-            help("Drag to pan, scroll to zoom. Marking a range and thumbnails come with the clip editor.");
+            if (hovered && (drag == Drag::In || drag == Drag::Out || drag == Drag::Range)) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            else if (hovered && have_range && (std::abs(io.MousePos.x - x_of(in_ms)) <= grab || std::abs(io.MousePos.x - x_of(out_ms)) <= grab)) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         }
         ImGui::EndChild();
+        if (hover_lane && !have_range) help("Drag to mark a range. Scroll to zoom, right-drag to pan.");
 
-        // Range and export rows.
-        ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("In  --:--:--.---   Out  --:--:--.---");
-        ImGui::SameLine(); ImGui::TextDisabled("No range marked");
+        // Range row.
+        ImGui::AlignTextToFramePadding();
+        if (have_range) {
+            double seconds = (out_ms - in_ms) / 1000.0;
+            ImGui::Text("In  %s   Out  %s", local_time(in_ms, true).c_str(), local_time(out_ms, true).c_str());
+            ImGui::SameLine(); ImGui::TextDisabled("%.3f s, %lld frames", seconds, (long long)std::llround(seconds * 60));
+            ImGui::SameLine(); if (ImGui::SmallButton("Clear")) { in_ms = out_ms = 0; }
+        } else {
+            ImGui::TextDisabled("In  --:--:--.---   Out  --:--:--.---"); ImGui::SameLine();
+            ImGui::TextDisabled(hover_lane && hover_ms ? local_time(hover_ms, true).c_str() : "No range marked");
+        }
+        // Export row.
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f); int res = cfg.export_height == 720 ? 0 : cfg.export_height == 1440 ? 2 : 1;
         if (ImGui::Combo("##res", &res, "720p\0" "1080p\0" "1440p\0")) { cfg.export_height = res == 0 ? 720 : res == 2 ? 1440 : 1080; changed = commit = true; }
         help("Export resolution. Frame-accurate re-encode with NVENC.");
         ImGui::SameLine(); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f); int fps = cfg.export_fps == 30 ? 0 : 1;
         if (ImGui::Combo("##fps", &fps, "30 fps\0" "60 fps\0")) { cfg.export_fps = fps == 0 ? 30 : 60; changed = commit = true; }
+        ImGui::SameLine(); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.0f); int codec = cfg.export_codec == "av1" ? 1 : 0;
+        if (ImGui::Combo("##codec", &codec, "H.264\0" "AV1\0")) { cfg.export_codec = codec ? "av1" : "h264"; changed = commit = true; }
+        help("H.264 plays everywhere. AV1 is smaller at the same quality but needs newer players.");
         ImGui::SameLine(); ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f);
         { float mbps = cfg.share_bitrate / 1000.f; bool edited = ImGui::InputFloat("##export-bitrate", &mbps, 0, 0, "%.1f"); commit |= ImGui::IsItemDeactivatedAfterEdit();
           if (edited && std::isfinite(mbps) && mbps >= 0 && mbps <= 1000) { cfg.share_bitrate = (int)std::round(mbps * 1000); changed = true; } }
@@ -303,14 +439,33 @@ int run_ui() {
         ImGui::SameLine(); ImGui::Checkbox("System", &export_system); help("Include desktop audio in the export.");
         ImGui::SameLine(); ImGui::BeginDisabled(); ImGui::Checkbox("Mic", &export_mic); ImGui::EndDisabled();
         help("A separate microphone track is planned. Recording currently captures desktop audio only.");
+        auto sources = have_range ? spans_in_range(map.spans, in_ms, out_ms) : std::vector<Span>{};
+        bool closed = have_range && !sources.empty() && out_ms <= map.last_end_ms + 1;
+        bool can_export = closed && recorder && !busy && !app.quitting();
         float export_w = ImGui::CalcTextSize("Export").x + style.FramePadding.x * 2;
         ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - export_w);
-        ImGui::BeginDisabled(); ImGui::Button("Export"); ImGui::EndDisabled(); help("Mark a range first.");
+        ImGui::BeginDisabled(!can_export);
+        if (primary_button("Export", ImVec2(export_w, 0))) {
+            try {
+                ExportRequest request; request.start_ms = in_ms; request.end_ms = out_ms; request.height = cfg.export_height; request.fps = cfg.export_fps;
+                request.bitrate_kbps = cfg.share_bitrate; request.codec = cfg.export_codec; request.audio = export_system;
+                write_export_request(app_dir() / "export-request.json", request);
+                PostMessageW(recorder, ExportMessage, 0, 0); error.clear();
+            } catch (const std::exception& e) { error = e.what(); }
+        }
+        ImGui::EndDisabled();
+        help(!have_range ? "Mark a range first." : !closed ? (sources.empty() ? "The range crosses a Stop/Record boundary or has no footage." : "Wait for the last segment to close.")
+            : busy ? "A save or export is in progress." : "Re-encode the range to the clips folder.");
+        // Keep the viewed and marked footage from expiring while the editor shows it.
+        if (recorder && now - last_pin > 2000) {
+            std::int64_t a = have_range ? std::min(in_ms, view_start_ms) : view_start_ms, b = have_range ? std::max(out_ms, view_end_ms) : view_end_ms;
+            PostMessageW(recorder, PinMessage, (WPARAM)a, (LPARAM)b); last_pin = now;
+        }
 
         ImGui::Separator();
         // Recorder footer: state, buffer clock, and the quick actions.
         auto dot = ImGui::GetCursorScreenPos(); float line_height = ImGui::GetFrameHeight();
-        draw->AddCircleFilled(ImVec2(dot.x + 4 * dpi, dot.y + line_height / 2), 3 * dpi, ImGui::ColorConvertFloat4ToU32(recording ? accent : muted));
+        draw->AddCircleFilled(ImVec2(dot.x + 4 * dpi, dot.y + line_height / 2), 3 * dpi, recording ? accent_u32 : muted_u32);
         ImGui::Dummy(ImVec2(12 * dpi, line_height)); ImGui::SameLine(); ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(state == "quitting" ? "Quitting..." : state == "stopping" ? "Stopping..." : recording ? "Recording" : state == "starting" ? "Starting..." : "Paused");
         ImGui::SameLine(); ImGui::PushFont(regular, 19); ImGui::AlignTextToFramePadding();
@@ -336,13 +491,16 @@ int run_ui() {
         help("Open the clips folder.");
         if (error.empty() && !app.error.empty()) error = app.error;
         auto message = std::string(obs_data_get_string(status.get(), "message"));
-        bool routine = message.empty() || message == "Recording" || message == "Paused" || message.starts_with("Saved ");
+        bool routine = message.empty() || message == "Recording" || message == "Paused" || message.starts_with("Saved ") || message.starts_with("Exported ");
         if (!error.empty() || !failure.empty()) { ImGui::PushStyleColor(ImGuiCol_Text, rgb(0xf0a399)); ImGui::TextWrapped("%s", (!error.empty() ? error : failure).c_str()); ImGui::PopStyleColor(); }
         else if (app.active() && current && !routine) ImGui::TextWrapped("%s", message.c_str());
         else if (recording && !obs_data_get_bool(status.get(), "hotkey_registered")) ImGui::TextWrapped("Save hotkey unavailable. Stop and choose another shortcut.");
         else if (!settings_error.empty()) { ImGui::PushStyleColor(ImGuiCol_Text, rgb(0xf0a399)); ImGui::TextWrapped("Not saved: %s", settings_error.c_str()); ImGui::PopStyleColor(); }
+        else if (message.starts_with("Saved ") || message.starts_with("Exported ")) ImGui::TextDisabled("%s", message.c_str());
         else ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight())); // Keep the footer height stable.
-        ImGui::ProgressBar((float)std::clamp(used / std::max(.1, cfg.budget_gb), 0., 1.), ImVec2(-1, 3 * dpi), "");
+        // Disk usage normally; export progress while a clip is being written.
+        if (export_fraction >= 0) ImGui::ProgressBar((float)export_fraction, ImVec2(-1, 3 * dpi), "");
+        else { ImGui::PushStyleColor(ImGuiCol_PlotHistogram, rgb(0x464e59)); ImGui::ProgressBar((float)std::clamp(used / std::max(.1, cfg.budget_gb), 0., 1.), ImVec2(-1, 3 * dpi), ""); ImGui::PopStyleColor(); }
 
         // Settings overlay. Capture fields stay locked while a session is active.
         if (open_settings) { ImGui::OpenPopup("Settings"); open_settings = false; }
@@ -393,6 +551,7 @@ int run_ui() {
             }
             ImGui::TextDisabled("Missed frames: %lld render / %lld encode", obs_data_get_int(status.get(), "lagged_frames"), obs_data_get_int(status.get(), "skipped_frames"));
             help("Cumulative recorder misses for the last reported session. These do not measure the game's FPS impact.");
+            ImGui::TextDisabled("Closed segments: %zu | last thumbnail decode %.0f ms", map.spans.size(), thumbs.last_decode_ms());
             if (!settings_error.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, rgb(0xf0a399));
                 ImGui::TextWrapped("Not saved: %s", settings_error.c_str()); ImGui::PopStyleColor();
@@ -406,12 +565,15 @@ int run_ui() {
         if (changed) { dirty = true; settings_error.clear(); }
         if (dirty && settings_error.empty() && (commit || !ImGui::IsAnyItemActive())) save_settings();
         ImGui::EndDisabled();
-        bool active_input = ImGui::IsAnyItemActive() || io.WantTextInput;
+        bool active_input = ImGui::IsAnyItemActive() || io.WantTextInput || thumbs.busy() || drag != Drag::None;
         ImGui::End(); ImGui::Render(); const float clear[4] = {background.x, background.y, background.z, 1};
         if (target) { context->OMSetRenderTargets(1, &target, nullptr); context->ClearRenderTargetView(target, clear); ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData()); swapchain->Present(1, 0); }
         // Input wakes immediately; idle controls need no fast render loop.
         MsgWaitForMultipleObjects(0, nullptr, FALSE, active_input ? 16 : 100, QS_ALLINPUT);
     }
+    if (scanning.valid()) scanning.wait();
+    if (auto worker = app.recorder()) PostMessageW(worker, PinMessage, 0, 0);
+    thumbs_holder.reset();
     ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
     if (target) { target->Release(); target = nullptr; } swapchain->Release(); context->Release(); device->Release();
     device = nullptr; context = nullptr; swapchain = nullptr; DestroyWindow(window); UnregisterClassW(AppWindowClass, wc.hInstance); return 0;
