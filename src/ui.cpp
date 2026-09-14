@@ -448,7 +448,7 @@ int run_ui() {
                         else { float keep = full_w / (thumb_h * aspect); uv0.x = (1 - keep) / 2; uv1.x = 1 - uv0.x; }
                         uv1.x = uv0.x + (uv1.x - uv0.x) * (x1 - x0) / full_w; // Truncated at the run's end.
                         ImVec2 p0(x0, video_y + 1 * dpi), p1(x1, video_y + 1 * dpi + thumb_h);
-                        float alpha = own.texture ? std::clamp((tick_ms - own.ready_ms) / 150.f, 0.f, 1.f) : 1.f;
+                        float alpha = own.texture ? std::clamp((tick_ms - own.ready_ms) / 75.f, 0.f, 1.f) : 1.f;
                         if (alpha < 1) { fading = true; if (carry.texture && carry.texture != own.texture) draw->AddImage(carry.texture, p0, p1, uv0, uv1); }
                         draw->AddImage(picture.texture, p0, p1, uv0, uv1, IM_COL32(255, 255, 255, (int)(alpha * 255)));
                         if (own.texture) carry = own;
@@ -501,8 +501,10 @@ int run_ui() {
             // ready, fades in fast and out slow, and never drops out for a
             // frame because a decode is still on the way.
             hover_video = hovered && io.MousePos.y >= video_y && io.MousePos.y <= video_y + video_h && drag == Drag::None && !scrubbing && !ImGui::IsAnyMouseDown();
+            bool over_footage = false;
             if (hover_video && !runs.empty()) {
                 if (auto* s = span_at(hover_ms)) {
+                    over_footage = true;
                     float thumb_h = video_h - 2 * dpi; int decode_w = (int)(std::floor(thumb_h * 16 / 9) * 3 / 2);
                     auto picture = thumbs.keyframe(s->path, hover_ms - s->start_ms, decode_w, INT_MIN + 1);
                     if (picture.texture) { hover_picture = picture; hover_shown_ms = hover_ms; }
@@ -510,8 +512,10 @@ int run_ui() {
                 }
             }
             {
-                float goal = hover_video && hover_picture.texture ? 1.f : 0.f;
-                double tau = goal > hover_alpha ? 0.06 : 0.25;
+                // Only footage under the cursor holds the preview; a gap lets it
+                // fade, so a quick pass across one keeps it and resting on one does not.
+                float goal = over_footage && hover_picture.texture ? 1.f : 0.f;
+                double tau = goal > hover_alpha ? 0.03 : 0.125;
                 hover_alpha += (goal - hover_alpha) * (float)(1 - std::exp(-std::clamp((double)io.DeltaTime, 0.0, 0.1) / tau));
                 if (std::abs(hover_alpha - goal) < 0.02f) hover_alpha = goal;
                 if (hover_alpha != goal) fading = true;
