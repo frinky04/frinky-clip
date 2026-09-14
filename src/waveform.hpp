@@ -17,11 +17,13 @@ public:
     ~Waveforms();
     Waveforms(const Waveforms&) = delete;
     Waveforms& operator=(const Waveforms&) = delete;
-    // Levels for a segment (one byte per AudioBinMs), or nullptr until loaded.
-    // The pointer stays valid for the lifetime of this object.
-    const std::vector<std::uint8_t>* levels(const fs::path& segment);
+    // Levels for a segment, one byte per bin_ms (older sidecars used coarser
+    // bins), or nullptr until loaded. The pointer stays valid for the
+    // lifetime of this object.
+    struct Wave { std::vector<std::uint8_t> levels; int bin_ms = AudioBinMs; };
+    const Wave* levels(const fs::path& segment);
 private:
-    struct Entry { std::vector<std::uint8_t> levels; bool ready = false, queued = false; };
+    struct Entry { Wave wave; bool ready = false, queued = false; };
     void work();
     std::map<std::wstring, Entry> cache_;
     std::deque<std::wstring> queue_;

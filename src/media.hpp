@@ -17,7 +17,7 @@ VideoExtent probe_video(const fs::path& path);
 // Loudness of the first audio track, one value per bin: RMS in dB mapped so
 // that -50 dBFS is 0 and full scale is 255. Empty when there is no audio.
 // The recorder stores this in each segment's sidecar as hex text.
-constexpr int AudioBinMs = 50;
+constexpr int AudioBinMs = 20;
 std::vector<std::uint8_t> audio_levels(const fs::path& path, int bin_ms = AudioBinMs);
 std::string encode_levels(const std::vector<std::uint8_t>& levels);
 std::vector<std::uint8_t> decode_levels(const std::string& text);

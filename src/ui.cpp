@@ -427,19 +427,40 @@ int run_ui() {
                 if (audio_lane) {
                     // Loudness waveform: for every pixel column, the loudest
                     // bin under it, drawn symmetrically about the lane's middle.
+                    // Zoomed out, a column covers many bins: the mean is the
+                    // body and the peak a faint envelope, so the lane reads as
+                    // loudness rather than noise. Zoomed in, a column is
+                    // narrower than a bin: interpolate between bin centres.
                     float mid = y + lane.height / 2, half = lane.height / 2 - 2 * dpi;
-                    auto wave_u32 = ImGui::ColorConvertFloat4ToU32(rgb(0x6b7688));
+                    ImVec4 wave_colour = rgb(0x6b7688);
+                    auto body_u32 = ImGui::ColorConvertFloat4ToU32(wave_colour), peak_u32 = ImGui::ColorConvertFloat4ToU32(ImVec4(wave_colour.x, wave_colour.y, wave_colour.z, .3f));
+                    std::vector<float> body, peak;
                     for (auto& s : map.spans) {
                         if (s.end_ms < view_start_ms || s.start_ms > view_end_ms) continue;
-                        auto* levels = waves.levels(s.path); if (!levels || levels->empty()) continue;
-                        float xa = std::max(x_of(s.start_ms), track_x), xb = std::min(x_of(s.end_ms), track_x + track_w);
-                        for (float x = std::floor(xa); x < xb; x += 1) {
+                        auto* wave = waves.levels(s.path); if (!wave || wave->levels.empty()) continue;
+                        auto& lv = wave->levels; double bin = wave->bin_ms;
+                        float xa = std::floor(std::max(x_of(s.start_ms), track_x)), xb = std::min(x_of(s.end_ms), track_x + track_w);
+                        int columns = (int)std::max(0.f, std::ceil(xb - xa)); if (!columns) continue;
+                        body.assign(columns, 0.f); peak.assign(columns, 0.f);
+                        for (int c = 0; c < columns; ++c) {
+                            float x = xa + c;
                             std::int64_t t0 = std::max<std::int64_t>(t_of(x), s.start_ms), t1 = std::min<std::int64_t>(t_of(x + 1), s.end_ms);
-                            size_t b0 = (size_t)((t0 - s.start_ms) / AudioBinMs), b1 = std::min(levels->size(), (size_t)((t1 - s.start_ms) / AudioBinMs) + 1);
-                            std::uint8_t peak = 0; for (size_t b = b0; b < b1; ++b) peak = std::max(peak, (*levels)[b]);
-                            if (!peak) continue;
-                            float h = std::max(1.f, half * peak / 255.f);
-                            draw->AddLine(ImVec2(x + .5f, mid - h), ImVec2(x + .5f, mid + h), wave_u32, 1);
+                            if (t1 - t0 >= bin) {
+                                size_t b0 = (size_t)((t0 - s.start_ms) / bin), b1 = std::min(lv.size(), (size_t)((t1 - s.start_ms) / bin) + 1);
+                                float sum = 0, top = 0; for (size_t b = b0; b < b1; ++b) { sum += lv[b]; top = std::max(top, (float)lv[b]); }
+                                body[c] = b1 > b0 ? sum / (b1 - b0) : 0; peak[c] = top;
+                            } else {
+                                double p = ((t0 + t1) / 2.0 - s.start_ms) / bin - 0.5; std::int64_t i = (std::int64_t)std::floor(p); float f = (float)(p - i);
+                                auto at = [&](std::int64_t k) { return (float)lv[(size_t)std::clamp<std::int64_t>(k, 0, (std::int64_t)lv.size() - 1)]; };
+                                body[c] = peak[c] = at(i) * (1 - f) + at(i + 1) * f;
+                            }
+                        }
+                        // A light horizontal smoothing on the body keeps the outline calm at wide zooms.
+                        for (int c = 0; c < columns; ++c) {
+                            float v = body[c]; if (columns > 2) v = (body[std::max(0, c - 1)] + body[c] * 2 + body[std::min(columns - 1, c + 1)]) / 4;
+                            float x = xa + c + .5f;
+                            if (peak[c] > v + 2) { float hp = half * peak[c] / 255.f; draw->AddLine(ImVec2(x, mid - hp), ImVec2(x, mid + hp), peak_u32, 1); }
+                            if (v >= 1) { float hb = std::max(1.f, half * v / 255.f); draw->AddLine(ImVec2(x, mid - hb), ImVec2(x, mid + hb), body_u32, 1); }
                         }
                     }
                 }
