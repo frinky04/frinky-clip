@@ -1,6 +1,10 @@
 # Velopack implementation plan
 
-Status: implementation and local installer/upgrade tests complete; GitHub publication and public-feed verification in progress.
+Status: shipped as public releases 0.3.0 and 0.3.1. GitHub builds and anonymous installed-app upgrades are verified. Version 0.3.1 includes the rasterized app/installer icon and is installed locally with the user's settings and recording state preserved.
+
+Verified: core and lifecycle tests; local and public-feed upgrades; corrupt-package rejection; cached updates leaving second launches alone; recording/paused state restoration; an active long export draining before restart; open-app reinstall/uninstall; spaces and Unicode in install/storage paths; bounded Quit during a stalled network request; bundled DLL imports, Start menu shortcut, and uninstall registration. Both GitHub workflows built, tested, uploaded, downloaded, and checked release artifacts before publication.
+
+Remaining external check: installation on a separate clean Windows machine without OBS or Visual Studio. Local installed builds load their bundled media libraries, but this development PC is not a substitute for that check. Releases remain unsigned as planned.
 
 ## Outcome and scope
 
@@ -82,7 +86,7 @@ Extend the current build/staging path rather than creating a separate copy of th
 
 Produce:
 
-- The generated `Frinky04.FrinkyClip-Setup.exe` as the primary download.
+- The generated `Frinky04.FrinkyClip-win-Setup.exe` as the primary download.
 - Full update package and `releases.win.json`, plus other metadata required by `vpk upload`.
 - The existing manually updated portable ZIP, avoiding a second ambiguous portable artifact.
 - SHA-256 checksums, dependency notices, and the source/build material identified by the project's existing release terms. A public GitHub source archive alone should not be assumed to cover the bundled OBS/FFmpeg binaries.

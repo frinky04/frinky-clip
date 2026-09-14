@@ -42,7 +42,7 @@ ctest --test-dir build -C Release --output-on-failure
 ./scripts/test-updates.ps1 -FromVersion 0.3.0 -ToVersion 0.3.1 -Paused -LongExport
 ```
 
-Package both versions before running update tests. Add `-GitHub` to test against the public release feed instead of local packages. These tests use isolated settings/storage and require an interactive desktop with supported NVIDIA hardware. Quit any running copy first: the app's global instance/window identities are shared. Hosted CI cannot verify GPU recording or replace clean-machine testing.
+For local-feed tests, package both versions first. Add `-GitHub` to download the baseline installer and update from public releases without authentication. Tests cover reinstall/uninstall while open and paths containing spaces and non-ASCII characters. They use isolated settings/storage and require an interactive desktop with supported NVIDIA hardware. Quit any running copy first: the app's global instance/window identities are shared. Hosted CI cannot verify GPU recording or replace clean-machine testing.
 
 `FRINKY_CLIP_HOME` overrides `%LOCALAPPDATA%/FrinkyClip` for isolated tests. With that override set, `FRINKY_CLIP_UPDATE_FEED` accepts a local test feed, and `--update-test check|download|apply` invokes the same actions as Settings. Neither facility is used for normal installations.
 

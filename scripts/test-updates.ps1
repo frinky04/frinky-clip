@@ -5,31 +5,33 @@ $ErrorActionPreference = 'Stop'
 $clipTestRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if (Get-Process frinky-clip -ErrorAction SilentlyContinue) { throw 'Quit Frinky Clip before testing updates.' }
 $clipRun = Join-Path $clipTestRoot "test-output/updates-$([Guid]::NewGuid().ToString('N'))"
-$clipInstall = Join-Path $clipRun 'Installed App'
+$clipInstall = Join-Path $clipRun "Installed App $([char]0x03a9)"
 $clipHome = Join-Path $clipRun 'Preferences'
-$clipStorage = Join-Path $clipRun 'Saved clips'
+$clipStorage = Join-Path $clipRun "Saved clips $([char]0x03a9)"
 $clipFeed = Join-Path $clipRun 'feed'
 New-Item -ItemType Directory -Force $clipHome,$clipStorage,$clipFeed | Out-Null
 $clipOldHome = $env:FRINKY_CLIP_HOME; $clipOldFeed = $env:FRINKY_CLIP_UPDATE_FEED
 $env:FRINKY_CLIP_HOME = $clipHome
 $env:FRINKY_CLIP_UPDATE_FEED = if ($GitHub) { $null } else { $clipFeed }
 $clipExe = Join-Path $clipInstall 'current/frinky-clip.exe'
-function Read-Update { Get-Content "$clipHome/update-status.json" -Raw | ConvertFrom-Json }
-function Read-Recorder { Get-Content "$clipHome/status.json" -Raw | ConvertFrom-Json }
+function Read-Update { Get-Content "$clipHome/update-status.json" -Raw -Encoding UTF8 | ConvertFrom-Json }
+function Read-Recorder { Get-Content "$clipHome/status.json" -Raw -Encoding UTF8 | ConvertFrom-Json }
 function Wait-For([scriptblock]$Condition, [string]$Description, [int]$Seconds = 45) {
     $clipDeadline = [DateTime]::UtcNow.AddSeconds($Seconds)
     do {
-        try { if (& $Condition) { return } } catch {}
+        try { if (& $Condition) { Write-Host "$(Get-Date -Format HH:mm:ss) Passed: $Description"; return } } catch {}
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $clipDeadline)
     throw "Timed out: $Description (test data: $clipRun)"
 }
 function Invoke-App([string]$Arguments) {
+    Write-Host "$(Get-Date -Format HH:mm:ss) App: $Arguments"
     $clipCommand = Start-Process -FilePath $clipExe -ArgumentList $Arguments -WindowStyle Hidden -PassThru
     if (-not $clipCommand.WaitForExit(5000) -or $clipCommand.ExitCode -ne 0) { throw "App command failed: $Arguments" }
 }
 try {
-    @{record_on_launch=$false;auto_check_updates=$false;storage=$clipStorage;save_seconds=5;export_height=720;export_codec='av1'} | ConvertTo-Json | Set-Content "$clipHome/config.json"
+    $clipConfig = @{record_on_launch=$false;auto_check_updates=$false;storage=$clipStorage;save_seconds=5;export_height=720;export_codec='av1'} | ConvertTo-Json
+    [IO.File]::WriteAllText((Join-Path $clipHome 'config.json'), $clipConfig)
     [IO.File]::WriteAllText((Join-Path $clipStorage 'keep.txt'), 'User recordings must survive upgrades and uninstall.')
     $clipInstaller = "$clipTestRoot/dist/releases/$FromVersion/Frinky04.FrinkyClip-win-Setup.exe"
     if ($GitHub) {
@@ -41,6 +43,14 @@ try {
     if (-not (Test-Path "$clipInstall/current/velopack_libc.dll")) { throw 'Native updater DLL is missing.' }
     $clipOwner = Start-Process $clipExe -WindowStyle Hidden -PassThru
     Wait-For { (Read-Update).current_version -eq $FromVersion -and (Read-Update).installed -and (Read-Recorder).state -eq 'paused' } 'installed app startup'
+    [void]$clipOwner.CloseMainWindow()
+    # Reinstall the same version while the tray owner is open.
+    $clipRepair = Start-Process $clipInstaller -ArgumentList @('--silent','--installto',('"'+$clipInstall+'"'),'--log',('"'+"$clipRun/repair.log"+'"')) -WindowStyle Hidden -PassThru
+    if (-not $clipRepair.WaitForExit(45000) -or $clipRepair.ExitCode -ne 0) { throw 'Reinstallation failed.' }
+    if (-not $clipOwner.WaitForExit(5000)) { throw 'Reinstallation left the old tray owner running.' }
+    $clipOwner = Start-Process $clipExe -WindowStyle Hidden -PassThru
+    Wait-For { (Read-Recorder).state -eq 'paused' -and (Read-Update).installed } 'reinstalled app startup'
+    [void]$clipOwner.CloseMainWindow()
     Invoke-App '--update-test check'
     Wait-For { (Read-Update).available -and (Read-Update).version -eq $ToVersion } 'update discovery'
     if (-not $GitHub) {
@@ -63,7 +73,7 @@ try {
     Invoke-App '--save 5'
     if ($LongExport) {
         Wait-For { -not (Read-Recorder).busy } 'quick save before export'
-        $clipSegments = (Get-Content "$clipHome/segments.json" -Raw | ConvertFrom-Json).segments
+        $clipSegments = (Get-Content "$clipHome/segments.json" -Raw -Encoding UTF8 | ConvertFrom-Json).segments
         $clipStart = $clipSegments[0].start_ms
         $clipEnd = $clipSegments[-1].end_ms
         Invoke-App "--export $clipStart $clipEnd"
@@ -82,7 +92,7 @@ try {
     $clipSaved = @(Get-ChildItem "$clipStorage/clips" -Filter '*.mp4' -ErrorAction SilentlyContinue)
     if (-not $clipSaved.Count) { throw 'Accepted save did not finish before updating.' }
     if ($LongExport -and $clipSaved.Count -lt 2) { throw 'Long export was interrupted by update.' }
-    $clipPrefs = Get-Content "$clipHome/config.json" -Raw | ConvertFrom-Json
+    $clipPrefs = Get-Content "$clipHome/config.json" -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($clipPrefs.record_on_launch -or $clipPrefs.auto_check_updates -or $clipPrefs.storage.Replace('\','/') -ne $clipStorage.Replace('\','/')) { throw 'Upgrade changed saved preferences.' }
     # Every non-system media DLL must load from the installed app, not OBS.
     $clipAppProcess = Get-Process frinky-clip | Where-Object { $_.Path -eq $clipExe } | Select-Object -First 1
@@ -93,7 +103,7 @@ try {
     if (-not $clipUninstall.WaitForExit(30000) -or $clipUninstall.ExitCode -ne 0) { throw 'Uninstall failed.' }
     Wait-For { -not (Get-Process frinky-clip -ErrorAction SilentlyContinue) } 'full shutdown on uninstall'
     if ((Test-Path $clipExe) -or -not (Test-Path "$clipHome/config.json") -or -not (Test-Path "$clipStorage/keep.txt")) { throw 'Uninstall did not preserve user data or remove the app.' }
-    [IO.File]::WriteAllText((Join-Path $clipRun 'passed.txt'), "$FromVersion -> $ToVersion; installed, checked, downloaded, restored recording state, saved clip, preserved preferences, uninstalled. GitHub=$GitHub; Paused=$Paused; LongExport=$LongExport")
+    [IO.File]::WriteAllText((Join-Path $clipRun 'passed.txt'), "$FromVersion -> $ToVersion; installed, reinstalled while open, checked, downloaded, restored recording state, saved clip, preserved preferences, uninstalled while open; Unicode/spaced paths. GitHub=$GitHub; Paused=$Paused; LongExport=$LongExport")
     Write-Host "Update integration passed: $clipRun"
 } finally {
     # Close only this test's executable, never an unrelated Frinky Clip instance.
