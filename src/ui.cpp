@@ -50,6 +50,16 @@ void theme(float dpi) {
     c[ImGuiCol_ModalWindowDimBg] = ImVec4(0, 0, 0, .55f);
     s.ScaleAllSizes(dpi); s.FontScaleDpi = dpi;
 }
+// Window sizing, in 100%-scale client pixels. The chrome is everything but
+// the viewport: header, overview, lanes, transport and export rows, footer
+// and its message line. The default window makes the 16:9 viewport fill the
+// content width; the minimum keeps the viewport at its smallest usable
+// height so nothing scrolls off the bottom.
+constexpr int DefaultClientWidth = 760, MinClientWidth = 720, ChromeHeight = 352, MinPreviewHeight = 96, SidePadding = 14;
+RECT window_rect(int client_w, int client_h, UINT dpi) {
+    float scale = dpi / 96.f; RECT rect{0, 0, (LONG)(client_w * scale), (LONG)(client_h * scale)};
+    AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi); return rect;
+}
 void render_target() {
     ID3D11Texture2D* back = nullptr;
     if (SUCCEEDED(swapchain->GetBuffer(0, IID_PPV_ARGS(&back)))) { device->CreateRenderTargetView(back, nullptr, &target); back->Release(); }
@@ -72,8 +82,9 @@ LRESULT CALLBACK ui_proc(HWND window, UINT msg, WPARAM w, LPARAM l) {
         SetWindowPos(window, nullptr, rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top, SWP_NOZORDER | SWP_NOACTIVATE); return 0;
     }
     if (msg == WM_GETMINMAXINFO) {
-        auto* limits = reinterpret_cast<MINMAXINFO*>(l); float scale = GetDpiForWindow(window) / 96.f;
-        limits->ptMinTrackSize = {(LONG)(720 * scale), (LONG)(480 * scale)}; return 0;
+        auto* limits = reinterpret_cast<MINMAXINFO*>(l);
+        auto rect = window_rect(MinClientWidth, ChromeHeight + MinPreviewHeight, GetDpiForWindow(window));
+        limits->ptMinTrackSize = {rect.right - rect.left, rect.bottom - rect.top}; return 0;
     }
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
     return DefWindowProcW(window, msg, w, l);
@@ -100,8 +111,6 @@ void open_path(HWND owner, fs::path path, std::string& error, bool folder = fals
     } catch (const std::exception& e) { error = e.what(); }
 }
 std::string duration(double seconds) { int s = (int)seconds; char t[40]; snprintf(t, sizeof(t), "%02d:%02d:%02d", s / 3600, s / 60 % 60, s % 60); return t; }
-// Timeline labels are relative to now: "-h:mm:ss" ago.
-std::string ago(double seconds) { int s = (int)std::round(std::max(seconds, 0.)); char t[40]; snprintf(t, sizeof(t), "-%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60); return t; }
 void help(const char* text) {
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal | ImGuiHoveredFlags_AllowWhenDisabled)) {
         ImGui::BeginTooltip(); ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26); ImGui::TextUnformatted(text); ImGui::PopTextWrapPos(); ImGui::EndTooltip();
@@ -150,7 +159,9 @@ int run_ui() {
     std::string error, settings_error; bool dirty = false;
     WNDCLASSW wc{}; wc.style = CS_CLASSDC; wc.lpfnWndProc = ui_proc; wc.hInstance = GetModuleHandleW(nullptr);
     wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION); wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.lpszClassName = AppWindowClass; RegisterClassW(&wc);
-    HWND window = CreateWindowW(AppWindowClass, L"Frinky Clip", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 900, 600, nullptr, nullptr, wc.hInstance, &app);
+    auto initial = window_rect(DefaultClientWidth, (DefaultClientWidth - 2 * SidePadding) * 9 / 16 + ChromeHeight, GetDpiForSystem());
+    HWND window = CreateWindowW(AppWindowClass, L"Frinky Clip", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+        initial.right - initial.left, initial.bottom - initial.top, nullptr, nullptr, wc.hInstance, &app);
     if (!window) throw std::runtime_error("Cannot create app window");
     app.attach(window);
     BOOL dark = TRUE; DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
@@ -293,8 +304,8 @@ int run_ui() {
         ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Buffer");
         ImGui::SameLine();
         if (map.spans.empty()) ImGui::TextDisabled("empty");
-        else ImGui::TextDisabled("%s to now  (%s)", local_time(map.spans.front().start_ms).c_str(), ago(buffered).c_str());
-        if (!follow) { ImGui::SameLine(); if (ImGui::SmallButton("Now")) follow = true; help("Return to the live edge."); }
+        else ImGui::TextDisabled("%s to now", local_time(map.spans.front().start_ms).c_str());
+        if (!follow) { ImGui::SameLine(); if (ImGui::Button("Now")) follow = true; help("Return to the live edge."); }
         float settings_w = ImGui::CalcTextSize("Settings").x + style.FramePadding.x * 2;
         ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - settings_w);
         if (ImGui::Button("Settings")) open_settings = true;
@@ -323,7 +334,7 @@ int run_ui() {
         float below_h = row_h * 3 + ImGui::GetTextLineHeightWithSpacing() + style.ItemSpacing.y * 3 + 3 * dpi + style.WindowPadding.y;
         // Fixed lane heights; whatever is left above them previews the cut frames.
         float audio_h = 30 * dpi, video_h = 96 * dpi, ruler_h = ImGui::GetTextLineHeight() + 4 * dpi;
-        float lanes_h = ruler_h + 2 * dpi + video_h + (audio_h + 4 * dpi) * 2 + 4 * dpi + style.WindowPadding.y;
+        float lanes_h = ruler_h + 2 * dpi + video_h + (audio_h + 4 * dpi) + 4 * dpi + style.WindowPadding.y;
         float preview_h = std::max(96 * dpi, ImGui::GetContentRegionAvail().y - lanes_h - below_h - style.ItemSpacing.y);
         std::int64_t hover_ms = 0; bool hover_lane = false, hover_video = false, fading = false; auto tick_ms = steady_ms();
         // Viewport: the frame at the playhead, streaming while playing.
@@ -352,16 +363,19 @@ int run_ui() {
             if (picture.texture) {
                 float ph = std::min(img_h, img_w * picture.height / std::max(1, picture.width));
                 draw->AddImage(picture.texture, ImVec2(x, y + (img_h - ph) / 2), ImVec2(x + img_w, y + (img_h - ph) / 2 + ph));
+                draw->AddRect(ImVec2(x, y), ImVec2(x + img_w, y + img_h), IM_COL32(255, 255, 255, 26)); // Picture outline: a hairline of white at 10%.
             } else {
                 auto problem = player.error();
-                const char* hint = !problem.empty() ? problem.c_str() : map.spans.empty() ? "No footage yet" : player.busy() ? "Decoding..." : "Click the timeline to place the playhead. Space plays.";
+                const char* hint = !problem.empty() ? problem.c_str()
+                    : map.spans.empty() ? (recording ? "No footage yet. The first segment closes in a few seconds." : "No footage yet. Press Record to start the buffer.")
+                    : player.busy() ? "Decoding…" : "Click the timeline to place the playhead. Space plays.";
                 auto size = ImGui::CalcTextSize(hint); draw->AddText(ImVec2(p.x + (w - size.x) / 2, p.y + (h - size.y) / 2), muted_u32, hint);
             }
             // Playhead time in the corner of the picture.
             if (picture.texture) {
-                auto caption = local_time(picture.ms, true); auto size = ImGui::CalcTextSize(caption.c_str());
+                auto stamp = local_time(picture.ms, true); auto size = ImGui::CalcTextSize(stamp.c_str());
                 draw->AddRectFilled(ImVec2(x + 6 * dpi, y + img_h - size.y - 10 * dpi), ImVec2(x + size.x + 14 * dpi, y + img_h - 4 * dpi), IM_COL32(11, 12, 14, 200));
-                draw->AddText(ImVec2(x + 10 * dpi, y + img_h - size.y - 7 * dpi), ImGui::ColorConvertFloat4ToU32(foreground), caption.c_str());
+                draw->AddText(ImVec2(x + 10 * dpi, y + img_h - size.y - 7 * dpi), ImGui::ColorConvertFloat4ToU32(foreground), stamp.c_str());
             }
             ImGui::SetCursorScreenPos(ImVec2(x, y)); ImGui::InvisibleButton("viewport", ImVec2(std::max(img_w, 1.f), std::max(img_h, 1.f)));
             if (ImGui::IsItemClicked()) player.toggle();
@@ -375,8 +389,9 @@ int run_ui() {
             auto x_of = [&](std::int64_t t) { return track_x + (float)((t - view_start_ms) * px_per_ms); };
             auto t_of = [&](float x) { return view_start_ms + (std::int64_t)((x - track_x) / px_per_ms); };
             float y = origin.y + ruler_h + 2 * dpi;
-            struct Lane { const char* name; float height; } lanes[] = {{"video", video_h}, {"sys", audio_h}, {"mic", audio_h}};
-            float bottom = y + video_h + (audio_h + 4 * dpi) * 2, video_y = y;
+            // A microphone lane joins these once a microphone track is recorded.
+            struct Lane { const char* name; float height; } lanes[] = {{"video", video_h}, {"audio", audio_h}};
+            float bottom = y + video_h + (audio_h + 4 * dpi), video_y = y;
             const double steps[] = {1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600};
             double step = steps[0]; for (double s : steps) { step = s; if (track_w * s / view_seconds >= 84 * dpi) break; }
             std::int64_t step_ms = (std::int64_t)(step * 1000);
@@ -397,7 +412,6 @@ int run_ui() {
                 bool audio_lane = lane.name[0] != 'v';
                 for (auto& run : runs) {
                     if (run.second < view_start_ms || run.first > view_end_ms) continue;
-                    if (audio_lane && lane.name[0] == 'm') continue; // No microphone track yet.
                     float x0 = std::max(x_of(run.first), track_x), x1 = std::min(x_of(run.second), track_x + track_w);
                     draw->AddRectFilled(ImVec2(x0, y + (audio_lane ? lane.height * .35f : 0)), ImVec2(x1, y + (audio_lane ? lane.height * .65f : lane.height)), footage_u32);
                 }
@@ -586,16 +600,16 @@ int run_ui() {
         // Transport and range row.
         ImGui::AlignTextToFramePadding();
         if (ImGui::Button(player.playing() ? "Pause" : "Play", ImVec2(60 * dpi, 0))) player.toggle();
-        help("Space. Click the timeline to place the playhead; arrows step one frame, Shift+arrows one second.");
+        help("Space plays and pauses. Arrow keys step one frame; Shift+arrows step one second.");
         ImGui::SameLine(); ImGui::TextUnformatted(playhead ? local_time(playhead, true).c_str() : "--:--:--.---");
-        ImGui::SameLine(); ImGui::TextDisabled("|");
+        ImGui::SameLine(0, 12 * dpi);
         if (have_range) {
             double seconds = (out_ms - in_ms) / 1000.0;
             ImGui::SameLine(); ImGui::Text("In %s  Out %s", local_time(in_ms, true).c_str(), local_time(out_ms, true).c_str());
             ImGui::SameLine(); ImGui::TextDisabled("%.3f s, %lld frames", seconds, (long long)std::llround(seconds * 60));
-            ImGui::SameLine(); if (ImGui::SmallButton("Clear")) { in_ms = out_ms = 0; }
+            ImGui::SameLine(); if (ImGui::Button("Clear")) { in_ms = out_ms = 0; }
         } else {
-            ImGui::SameLine(); ImGui::TextDisabled(in_ms ? ("In " + local_time(in_ms, true) + "  press O for out").c_str() : out_ms ? ("Out " + local_time(out_ms, true) + "  press I for in").c_str() : "Drag the lane or press I and O to mark a range");
+            ImGui::SameLine(); ImGui::TextDisabled(in_ms ? ("In " + local_time(in_ms, true) + "  press O to mark the out point").c_str() : out_ms ? ("Out " + local_time(out_ms, true) + "  press I to mark the in point").c_str() : "Drag the lane or press I and O to mark a range");
         }
         // Export row.
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f); int res = cfg.export_height == 720 ? 0 : cfg.export_height == 1440 ? 2 : 1;
@@ -610,8 +624,8 @@ int run_ui() {
         { float mbps = cfg.share_bitrate / 1000.f; bool edited = ImGui::InputFloat("##export-bitrate", &mbps, 0, 0, "%.1f"); commit |= ImGui::IsItemDeactivatedAfterEdit();
           if (edited && std::isfinite(mbps) && mbps >= 0 && mbps <= 1000) { cfg.share_bitrate = (int)std::round(mbps * 1000); changed = true; } }
         ImGui::SameLine(); ImGui::TextDisabled("Mbps"); help("Export bitrate.");
-        ImGui::SameLine(); ImGui::Checkbox("System", &export_system); help("Include desktop audio in the export.");
-        ImGui::SameLine(); ImGui::BeginDisabled(); ImGui::Checkbox("Mic", &export_mic); ImGui::EndDisabled();
+        ImGui::SameLine(); ImGui::Checkbox("Desktop audio", &export_system); help("Include desktop audio in the export.");
+        ImGui::SameLine(); ImGui::BeginDisabled(); ImGui::Checkbox("Microphone", &export_mic); ImGui::EndDisabled();
         help("A separate microphone track is planned. Recording currently captures desktop audio only.");
         auto sources = have_range ? spans_in_range(map.spans, in_ms, out_ms) : std::vector<Span>{};
         bool closed = have_range && !sources.empty() && out_ms <= map.last_end_ms + 1;
@@ -639,9 +653,9 @@ int run_ui() {
         ImGui::Separator();
         // Recorder footer: state, buffer clock, and the quick actions.
         auto dot = ImGui::GetCursorScreenPos(); float line_height = ImGui::GetFrameHeight();
-        draw->AddCircleFilled(ImVec2(dot.x + 4 * dpi, dot.y + line_height / 2), 3 * dpi, recording ? accent_u32 : muted_u32);
+        draw->AddCircleFilled(ImVec2(dot.x + 4 * dpi, dot.y + line_height / 2), 3 * dpi, recording ? ImGui::ColorConvertFloat4ToU32(foreground) : muted_u32);
         ImGui::Dummy(ImVec2(12 * dpi, line_height)); ImGui::SameLine(); ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(state == "quitting" ? "Quitting..." : state == "stopping" ? "Stopping..." : recording ? "Recording" : state == "starting" ? "Starting..." : "Paused");
+        ImGui::TextUnformatted(state == "quitting" ? "Quitting…" : state == "stopping" ? "Stopping…" : recording ? "Recording" : state == "starting" ? "Starting…" : "Paused");
         ImGui::SameLine(); ImGui::PushFont(regular, 19); ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(duration(buffered).c_str()); ImGui::PopFont();
         ImGui::SameLine(); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("buffered");
@@ -653,7 +667,7 @@ int run_ui() {
         float folder_w = ImGui::CalcTextSize("Folder").x + style.FramePadding.x * 2, keys_w = ImGui::CalcTextSize(keys.c_str()).x;
         ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - (button_w + save_w + keys_w + folder_w + style.ItemSpacing.x * 3));
         if (paused) {
-            if (primary_button("Record", ImVec2(button_w, 0))) start_recording();
+            if (ImGui::Button("Record", ImVec2(button_w, 0))) start_recording();
         } else {
             ImGui::BeginDisabled(!recording); if (ImGui::Button("Stop", ImVec2(button_w, 0))) app.stop(); ImGui::EndDisabled();
         }
@@ -682,7 +696,7 @@ int run_ui() {
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x / 2, io.DisplaySize.y / 2), ImGuiCond_Always, ImVec2(.5f, .5f));
         bool settings_open = true;
         if (ImGui::BeginPopupModal("Settings", &settings_open, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove)) {
-            ImGui::BeginDisabled(!paused); section(paused ? "Capture" : "Capture - stop to edit");
+            ImGui::BeginDisabled(!paused); section(paused ? "Capture" : "Capture (stop recording to edit)");
             if (properties("capture")) {
                 row("Display"); std::string display_label = displays.empty() ? "No monitor" : displays.front().label;
                 for (auto& d : displays) if (d.id == cfg.monitor) display_label = d.label;
@@ -718,7 +732,7 @@ int run_ui() {
                 ImGui::EndTable();
             }
             section("Diagnostics");
-            if (ImGui::Button("Open Log")) open_path(window, app_dir() / "recorder.log", error);
+            if (ImGui::Button("Open log")) open_path(window, app_dir() / "recorder.log", error);
             if (recording) {
                 ImGui::SameLine(); ImGui::AlignTextToFramePadding();
                 ImGui::TextDisabled("%.1f fps | %.2f ms render", obs_data_get_double(status.get(), "fps"), obs_data_get_double(status.get(), "render_ms"));

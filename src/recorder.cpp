@@ -40,7 +40,7 @@ public:
     obs_encoder_t* video_encoder = nullptr;
     obs_encoder_t* audio_encoder = nullptr;
     obs_output_t* output = nullptr;
-    std::string message = "Starting recorder...", last_clip, failure;
+    std::string message = "Starting recorder…", last_clip, failure;
     std::future<std::string> worker;
     std::deque<SaveJob> recovered_jobs;
     std::uint64_t frame_count = 0, lagged_frames = 0, skipped_frames = 0, render_frames = 0;
@@ -253,12 +253,12 @@ public:
         if (!active.empty() && !stopping) {
             pinned.push_back(active); pending_last = active; waiting_save = true;
             calldata_t cd{}; proc_handler_call(obs_output_get_proc_handler(output), "split_file", &cd); calldata_free(&cd);
-            message = "Saving: waiting for the next keyframe...";
+            message = "Saving: waiting for the next keyframe…";
         } else if (!pinned.empty()) { begin_save(); }
         else message = "No completed footage in this session yet.";
     }
     void start_job(SaveJob job) {
-        message = "Saving clip...";
+        message = "Saving clip…";
         worker = std::async(std::launch::async, [job] {
             if (!fs::exists(job.output)) remux(job.paths, job.output);
             else inspect_media(job.output); // Previous process may have published before crashing.
@@ -298,7 +298,7 @@ public:
         auto name = clip_name(request.start_ms); auto target = cfg.storage / "clips" / (name + ".mp4");
         for (int n = 2; fs::exists(target); ++n) target = cfg.storage / "clips" / (name + "-" + std::to_string(n) + ".mp4");
         export_progress = std::make_shared<std::atomic<double>>(0.0); export_fraction = 0;
-        message = "Exporting clip...";
+        message = "Exporting clip…";
         auto progress = export_progress;
         worker = std::async(std::launch::async, [sources, request, target, folder, progress] {
             auto result = clip::export_clip(sources, request, target, progress.get());
@@ -309,14 +309,14 @@ public:
     }
     void stop() {
         if (!session() || stopping) return;
-        stopping = true; stop_started = now_ms(); message = "Stopping recorder...";
+        stopping = true; stop_started = now_ms(); message = "Stopping recorder…";
         if (obs_output_active(output)) obs_output_stop(output);
         else stopped_code = 0;
     }
     void exit() {
         if (exiting) return;
         exiting = true; stop();
-        if (!session()) message = "Quitting...";
+        if (!session()) message = "Quitting…";
     }
     const char* state() const {
         return exiting ? "exiting" : stopping ? "stopping" : recording() ? "recording" : "paused";
@@ -382,7 +382,7 @@ public:
         if (!worker.valid() && !waiting_save && !recovered_jobs.empty()) { auto job = std::move(recovered_jobs.front()); recovered_jobs.pop_front(); start_job(std::move(job)); }
         if (worker.valid() && export_progress) {
             double fraction = export_progress->load();
-            if (fraction != export_fraction) { export_fraction = fraction; message = "Exporting clip... " + std::to_string((int)std::lround(fraction * 100)) + "%"; }
+            if (fraction != export_fraction) { export_fraction = fraction; message = "Exporting clip… " + std::to_string((int)std::lround(fraction * 100)) + "%"; }
         }
         std::set<fs::path> protected_set(pinned.begin(), pinned.end());
         // The editor's view and marked range stay until the pin goes stale.
@@ -407,7 +407,7 @@ public:
         if (stopping && (!output || !obs_output_active(output)) && to_finalize.empty() && !waiting_save) {
             auto requested = stop_started; end_session();
             blog(LOG_INFO, "Frinky Clip: session stopped in %lld ms", (long long)(now_ms() - requested));
-            message = exiting ? "Quitting..." : failure.empty() ? "Paused" : "Recorder stopped. Completed buffer footage is retained.";
+            message = exiting ? "Quitting…" : failure.empty() ? "Paused" : "Recorder stopped. Completed buffer footage is retained.";
             status();
         }
         if (exiting && !session() && !busy()) {
