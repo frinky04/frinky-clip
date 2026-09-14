@@ -1,5 +1,5 @@
 #pragma once
-#include "common.hpp"
+#include "media.hpp"
 #include <optional>
 
 namespace clip {
@@ -10,9 +10,9 @@ struct Span {
     fs::path path;
     std::string session;
     std::int64_t start_ms = 0, end_ms = 0;
-    // Coarse loudness (CoarseBinMs per value) carried by the index, so the
+    // Coarse peak file (CoarseBinMs per value) carried by the index, so the
     // zoomed-out audio lane needs no per-segment loads. Empty until measured.
-    std::vector<std::uint8_t> coarse;
+    AudioLevels coarse;
 };
 // The rolling buffer's closed segments in time order, plus the wall-clock end
 // of the last closed segment (the open one continues from there).

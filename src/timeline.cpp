@@ -25,7 +25,7 @@ BufferMap scan_buffer(const fs::path& root) {
             }
             if (end <= start) continue;
             Span span{media, name, start, end};
-            if (obs_data_has_user_value(d.get(), "audio_levels")) span.coarse = downsample_levels(decode_levels(obs_data_get_string(d.get(), "audio_levels")), (int)obs_data_get_int(d.get(), "audio_bin_ms"), CoarseBinMs);
+            span.coarse = downsample_levels(read_levels(d.get()), CoarseBinMs);
             map.spans.push_back(std::move(span));
         }
     }
@@ -42,7 +42,7 @@ std::optional<BufferMap> read_index(const fs::path& path) {
         auto item = Data(obs_data_array_item(array, i), obs_data_release);
         Span s{fs::path(wide(obs_data_get_string(item.get(), "path"))), obs_data_get_string(item.get(), "session"),
             obs_data_get_int(item.get(), "start_ms"), obs_data_get_int(item.get(), "end_ms")};
-        s.coarse = decode_levels(obs_data_get_string(item.get(), "audio"));
+        s.coarse = read_levels(item.get());
         if (!s.path.empty() && s.end_ms > s.start_ms) map.spans.push_back(std::move(s));
     }
     obs_data_array_release(array);
@@ -55,11 +55,10 @@ void write_index(const fs::path& path, const BufferMap& map) {
     for (auto& s : map.spans) {
         auto item = data(); obs_data_set_string(item.get(), "path", path_text(s.path).c_str()); obs_data_set_string(item.get(), "session", s.session.c_str());
         obs_data_set_int(item.get(), "start_ms", s.start_ms); obs_data_set_int(item.get(), "end_ms", s.end_ms);
-        if (!s.coarse.empty()) obs_data_set_string(item.get(), "audio", encode_levels(s.coarse).c_str());
+        if (!s.coarse.empty()) write_levels(item.get(), s.coarse);
         obs_data_array_push_back(array, item.get());
     }
     obs_data_set_array(d.get(), "segments", array); obs_data_array_release(array);
-    obs_data_set_int(d.get(), "audio_bin_ms", CoarseBinMs);
     obs_data_set_int(d.get(), "updated_ms", now_ms()); // Index is transient: no flush.
     write_json_fast(path, d.get());
 }

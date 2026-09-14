@@ -90,7 +90,7 @@ VideoExtent probe_video(const fs::path& p) {
     }
     return extent;
 }
-std::vector<std::uint8_t> audio_levels(const fs::path& p, int bin_ms) {
+AudioLevels audio_levels(const fs::path& p, int bin_ms) {
     Input in(p, false); int index = -1;
     for (unsigned i = 0; i < in.value->nb_streams; ++i) if (in.value->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) { index = (int)i; break; }
     if (index < 0) return {};
@@ -98,7 +98,7 @@ std::vector<std::uint8_t> audio_levels(const fs::path& p, int bin_ms) {
     const AVCodec* codec = avcodec_find_decoder(par->codec_id); if (!codec) return {};
     AVCodecContext* ctx = avcodec_alloc_context3(codec); if (!ctx) throw std::bad_alloc();
     SwrContext* swr = nullptr; AVPacket* packet = av_packet_alloc(); AVFrame* frame = av_frame_alloc();
-    std::vector<double> energy; std::vector<int> counts; std::vector<float> mono;
+    std::vector<double> energy; std::vector<float> peaks; std::vector<int> counts; std::vector<float> mono;
     try {
         av_check(avcodec_parameters_to_context(ctx, par), "Configure audio decoder");
         av_check(avcodec_open2(ctx, codec, nullptr), "Open audio decoder");
@@ -111,8 +111,8 @@ std::vector<std::uint8_t> audio_levels(const fs::path& p, int bin_ms) {
             int got = swr_convert(swr, &out, f->nb_samples, (const std::uint8_t**)f->extended_data, f->nb_samples);
             for (int i = 0; i < got; ++i, ++seen) {
                 size_t bin = (size_t)(seen / bin_samples);
-                if (bin >= energy.size()) { energy.resize(bin + 1, 0.0); counts.resize(bin + 1, 0); }
-                energy[bin] += (double)mono[i] * mono[i]; ++counts[bin];
+                if (bin >= energy.size()) { energy.resize(bin + 1, 0.0); peaks.resize(bin + 1, 0.f); counts.resize(bin + 1, 0); }
+                float v = mono[i]; energy[bin] += (double)v * v; peaks[bin] = std::max(peaks[bin], std::abs(v)); ++counts[bin];
             }
         };
         auto drain = [&] {
@@ -130,10 +130,11 @@ std::vector<std::uint8_t> audio_levels(const fs::path& p, int bin_ms) {
         avcodec_send_packet(ctx, nullptr); drain();
     } catch (...) { swr_free(&swr); av_packet_free(&packet); av_frame_free(&frame); avcodec_free_context(&ctx); throw; }
     swr_free(&swr); av_packet_free(&packet); av_frame_free(&frame); avcodec_free_context(&ctx);
-    std::vector<std::uint8_t> result(energy.size());
+    AudioLevels result; result.bin_ms = bin_ms; result.peak.resize(energy.size()); result.rms.resize(energy.size());
+    auto byte = [](double v) { return (std::uint8_t)std::lround(std::clamp(v, 0.0, 1.0) * 255.0); };
     for (size_t i = 0; i < energy.size(); ++i) {
-        double rms = counts[i] ? std::sqrt(energy[i] / counts[i]) : 0.0, db = 20.0 * std::log10(std::max(rms, 1e-6));
-        result[i] = (std::uint8_t)std::lround(std::clamp((db + 50.0) / 50.0, 0.0, 1.0) * 255.0);
+        result.peak[i] = byte(peaks[i]);
+        result.rms[i] = byte(counts[i] ? std::sqrt(energy[i] / counts[i]) : 0.0);
     }
     return result;
 }
@@ -148,16 +149,27 @@ std::vector<std::uint8_t> decode_levels(const std::string& text) {
     for (size_t i = 0; i + 1 < text.size(); i += 2) levels.push_back((std::uint8_t)((nibble(text[i]) << 4) | nibble(text[i + 1])));
     return levels;
 }
-std::vector<std::uint8_t> downsample_levels(const std::vector<std::uint8_t>& levels, int from_bin_ms, int to_bin_ms) {
-    if (levels.empty() || from_bin_ms <= 0 || to_bin_ms <= from_bin_ms) return levels;
-    size_t group = (size_t)std::max(1, to_bin_ms / from_bin_ms);
-    std::vector<std::uint8_t> result((levels.size() + group - 1) / group);
-    for (size_t i = 0; i < result.size(); ++i) {
-        size_t begin = i * group, end = std::min(levels.size(), begin + group); unsigned sum = 0;
-        for (size_t k = begin; k < end; ++k) sum += levels[k];
-        result[i] = (std::uint8_t)(sum / (end - begin));
+AudioLevels downsample_levels(const AudioLevels& levels, int to_bin_ms) {
+    if (levels.empty() || levels.bin_ms <= 0 || to_bin_ms <= levels.bin_ms) return levels;
+    size_t group = (size_t)std::max(1, to_bin_ms / levels.bin_ms), count = (levels.peak.size() + group - 1) / group;
+    AudioLevels result; result.bin_ms = levels.bin_ms * (int)group; result.peak.resize(count); result.rms.resize(count);
+    for (size_t i = 0; i < count; ++i) {
+        size_t begin = i * group, end = std::min(levels.peak.size(), begin + group); unsigned top = 0; double squares = 0;
+        for (size_t k = begin; k < end; ++k) { top = std::max<unsigned>(top, levels.peak[k]); double r = levels.rms[k]; squares += r * r; }
+        result.peak[i] = (std::uint8_t)top; result.rms[i] = (std::uint8_t)std::lround(std::sqrt(squares / (end - begin)));
     }
     return result;
+}
+AudioLevels read_levels(obs_data_t* d) {
+    AudioLevels levels;
+    if (!obs_data_has_user_value(d, "audio_peak")) return levels;
+    levels.peak = decode_levels(obs_data_get_string(d, "audio_peak")); levels.rms = decode_levels(obs_data_get_string(d, "audio_rms"));
+    levels.rms.resize(levels.peak.size(), 0); levels.bin_ms = (int)obs_data_get_int(d, "audio_bin_ms"); if (levels.bin_ms <= 0) levels.bin_ms = AudioBinMs;
+    return levels;
+}
+void write_levels(obs_data_t* d, const AudioLevels& levels) {
+    obs_data_set_string(d, "audio_peak", encode_levels(levels.peak).c_str()); obs_data_set_string(d, "audio_rms", encode_levels(levels.rms).c_str());
+    obs_data_set_int(d, "audio_bin_ms", levels.bin_ms);
 }
 void remux(const std::vector<fs::path>& segments, const fs::path& destination) {
     if (segments.empty()) throw std::runtime_error("No completed footage to save");

@@ -7,23 +7,21 @@
 #include <thread>
 
 namespace clip {
-// Loudness per segment for the audio lane. The recorder writes levels into
-// each segment's sidecar as it closes; segments from before that are
-// measured here on demand. Loading runs on a worker thread; the lane draws
-// what is ready and asks again next frame for the rest.
+// The fine peak file per segment for the audio lane, read from the sidecar
+// on a worker thread when the view is zoomed in enough to need it. The
+// coarse level travels with the segment index and needs no loading; the
+// recorder measures segments that have no peak file yet.
 class Waveforms {
 public:
     Waveforms();
     ~Waveforms();
     Waveforms(const Waveforms&) = delete;
     Waveforms& operator=(const Waveforms&) = delete;
-    // Levels for a segment, one byte per bin_ms (older sidecars used coarser
-    // bins), or nullptr until loaded. The pointer stays valid for the
-    // lifetime of this object.
-    struct Wave { std::vector<std::uint8_t> levels; int bin_ms = AudioBinMs; };
-    const Wave* levels(const fs::path& segment);
+    // Fine levels for a segment, or nullptr until read. The pointer stays
+    // valid for the lifetime of this object; an unmeasured segment is empty.
+    const AudioLevels* levels(const fs::path& segment);
 private:
-    struct Entry { Wave wave; bool ready = false, queued = false; };
+    struct Entry { AudioLevels levels; bool ready = false, queued = false; std::int64_t read_ms = 0; };
     void work();
     std::map<std::wstring, Entry> cache_;
     std::deque<std::wstring> queue_;

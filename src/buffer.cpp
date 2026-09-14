@@ -72,23 +72,23 @@ bool Buffer::finalize(const fs::path& p) {
         obs_data_set_int(d.get(), "start_ms", start); obs_data_set_int(d.get(), "end_ms", end);
         obs_data_set_int(d.get(), "frames", video.frames); obs_data_set_double(d.get(), "seconds", (end - start) / 1000.0);
         // Loudness for the editor's audio lane; a failure here is not a reason to lose the segment.
-        try { segment.levels = audio_levels(p); segment.level_bin_ms = AudioBinMs; segment.measured = true; } catch (...) {}
-        if (segment.measured) { obs_data_set_string(d.get(), "audio_levels", encode_levels(segment.levels).c_str()); obs_data_set_int(d.get(), "audio_bin_ms", AudioBinMs); }
+        try { segment.audio = audio_levels(p); segment.measured = true; } catch (...) {}
+        if (segment.measured) write_levels(d.get(), segment.audio);
         write_json(metadata, d.get());
-    } else if (obs_data_has_user_value(d.get(), "audio_levels")) {
-        segment.levels = decode_levels(obs_data_get_string(d.get(), "audio_levels")); segment.level_bin_ms = (int)obs_data_get_int(d.get(), "audio_bin_ms"); segment.measured = true;
+    } else if (obs_data_has_user_value(d.get(), "audio_peak")) {
+        segment.audio = read_levels(d.get()); segment.measured = true;
     }
     segment.start_ms = start; segment.end_ms = end; segment.bytes = fs::file_size(p);
     segments_.push_back(std::move(segment));
     sort();
     return true;
 }
-void Buffer::set_levels(const fs::path& p, std::vector<std::uint8_t> levels, int bin_ms) {
+void Buffer::set_levels(const fs::path& p, AudioLevels levels) {
     auto it = std::find_if(segments_.begin(), segments_.end(), [&](auto& s) { return s.path == p; });
     if (it == segments_.end()) return;
-    it->levels = std::move(levels); it->level_bin_ms = bin_ms; it->measured = true;
+    it->audio = std::move(levels); it->measured = true;
     auto sidecar = p; sidecar += L".json"; auto d = read_json(sidecar);
-    obs_data_set_string(d.get(), "audio_levels", encode_levels(it->levels).c_str()); obs_data_set_int(d.get(), "audio_bin_ms", bin_ms);
+    write_levels(d.get(), it->audio);
     try { write_json_fast(sidecar, d.get()); } catch (...) {}
 }
 void Buffer::configure(const Config& c) {
@@ -121,9 +121,7 @@ void Buffer::recover() {
                 std::error_code size_error; auto bytes = fs::file_size(file, size_error);
                 if (start > 0 && end > start && !size_error && bytes > 0) {
                     Segment segment{file, path_text(session.path().filename()), start, end, bytes};
-                    if (obs_data_has_user_value(d.get(), "audio_levels")) {
-                        segment.levels = decode_levels(obs_data_get_string(d.get(), "audio_levels")); segment.level_bin_ms = (int)obs_data_get_int(d.get(), "audio_bin_ms"); segment.measured = true;
-                    }
+                    if (obs_data_has_user_value(d.get(), "audio_peak")) { segment.audio = read_levels(d.get()); segment.measured = true; }
                     segments_.push_back(std::move(segment)); continue;
                 }
             }

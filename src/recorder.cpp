@@ -51,7 +51,7 @@ public:
     size_t indexed_count = (size_t)-1; std::int64_t indexed_end = -1, indexed_at = 0; // Last published segment index.
     // Segments from before loudness was stored are measured one at a time in
     // the background; the index republishes as results arrive.
-    std::future<std::vector<std::pair<fs::path, std::vector<std::uint8_t>>>> measuring; bool levels_changed = false;
+    std::future<std::vector<std::pair<fs::path, AudioLevels>>> measuring; bool levels_changed = false;
     HWND controls = nullptr; // The tray app's control window, told when status changes.
     // Export progress is shared with the worker; -1 while no export runs.
     std::shared_ptr<std::atomic<double>> export_progress; double export_fraction = -1;
@@ -283,7 +283,7 @@ public:
     }
     std::vector<Span> spans() const {
         std::vector<Span> result;
-        for (auto& s : buffer.segments()) result.push_back({s.path, s.session, s.start_ms, s.end_ms, downsample_levels(s.levels, s.level_bin_ms, CoarseBinMs)});
+        for (auto& s : buffer.segments()) result.push_back({s.path, s.session, s.start_ms, s.end_ms, downsample_levels(s.audio, CoarseBinMs)});
         return result;
     }
     // Export a range of the buffer as a re-encoded clip through the linked
@@ -419,7 +419,7 @@ public:
         }
         if (now_ms() - last_status >= 1000) status();
         if (measuring.valid() && measuring.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-            try { for (auto& [path, levels] : measuring.get()) buffer.set_levels(path, std::move(levels), AudioBinMs); } catch (...) {}
+            try { for (auto& [path, levels] : measuring.get()) buffer.set_levels(path, std::move(levels)); } catch (...) {}
             levels_changed = true;
         }
         if (!measuring.valid()) {
@@ -427,8 +427,8 @@ public:
             std::vector<fs::path> batch;
             for (auto it = buffer.segments().rbegin(); it != buffer.segments().rend() && batch.size() < 8; ++it) if (!it->measured) batch.push_back(it->path);
             if (!batch.empty()) measuring = std::async(std::launch::async, [batch] {
-                std::vector<std::pair<fs::path, std::vector<std::uint8_t>>> results;
-                for (auto& path : batch) { std::vector<std::uint8_t> levels; try { levels = audio_levels(path); } catch (...) {} results.emplace_back(path, std::move(levels)); }
+                std::vector<std::pair<fs::path, AudioLevels>> results;
+                for (auto& path : batch) { AudioLevels levels; try { levels = audio_levels(path); } catch (...) {} results.emplace_back(path, std::move(levels)); }
                 return results;
             });
         }
