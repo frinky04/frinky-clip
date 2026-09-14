@@ -21,6 +21,11 @@ constexpr int AudioBinMs = 20;
 std::vector<std::uint8_t> audio_levels(const fs::path& path, int bin_ms = AudioBinMs);
 std::string encode_levels(const std::vector<std::uint8_t>& levels);
 std::vector<std::uint8_t> decode_levels(const std::string& text);
+// Coarser bins for the editor's zoomed-out view: the mean of each group of
+// fine bins. Published in the segment index so the whole buffer draws at
+// once without reading any sidecar.
+constexpr int CoarseBinMs = 250;
+std::vector<std::uint8_t> downsample_levels(const std::vector<std::uint8_t>& levels, int from_bin_ms, int to_bin_ms);
 void remux(const std::vector<fs::path>& segments, const fs::path& destination);
 // A D3D11VA decode device shared by decoders. Wrapping the render device lets
 // decoded frames be sampled directly as shader resources; a private device

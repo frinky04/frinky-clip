@@ -148,6 +148,17 @@ std::vector<std::uint8_t> decode_levels(const std::string& text) {
     for (size_t i = 0; i + 1 < text.size(); i += 2) levels.push_back((std::uint8_t)((nibble(text[i]) << 4) | nibble(text[i + 1])));
     return levels;
 }
+std::vector<std::uint8_t> downsample_levels(const std::vector<std::uint8_t>& levels, int from_bin_ms, int to_bin_ms) {
+    if (levels.empty() || from_bin_ms <= 0 || to_bin_ms <= from_bin_ms) return levels;
+    size_t group = (size_t)std::max(1, to_bin_ms / from_bin_ms);
+    std::vector<std::uint8_t> result((levels.size() + group - 1) / group);
+    for (size_t i = 0; i < result.size(); ++i) {
+        size_t begin = i * group, end = std::min(levels.size(), begin + group); unsigned sum = 0;
+        for (size_t k = begin; k < end; ++k) sum += levels[k];
+        result[i] = (std::uint8_t)(sum / (end - begin));
+    }
+    return result;
+}
 void remux(const std::vector<fs::path>& segments, const fs::path& destination) {
     if (segments.empty()) throw std::runtime_error("No completed footage to save");
     fs::create_directories(destination.parent_path());

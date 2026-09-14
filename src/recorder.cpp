@@ -48,7 +48,10 @@ public:
     // Editor protection: footage in [pin_start, pin_end] stays while the pin is
     // refreshed. An export additionally hard-links its sources.
     std::int64_t pin_start = 0, pin_end = 0, pin_at = 0;
-    size_t indexed_count = (size_t)-1; std::int64_t indexed_end = -1; // Last published segment index.
+    size_t indexed_count = (size_t)-1; std::int64_t indexed_end = -1, indexed_at = 0; // Last published segment index.
+    // Segments from before loudness was stored are measured one at a time in
+    // the background; the index republishes as results arrive.
+    std::future<std::vector<std::pair<fs::path, std::vector<std::uint8_t>>>> measuring; bool levels_changed = false;
     HWND controls = nullptr; // The tray app's control window, told when status changes.
     // Export progress is shared with the worker; -1 while no export runs.
     std::shared_ptr<std::atomic<double>> export_progress; double export_fraction = -1;
@@ -280,7 +283,7 @@ public:
     }
     std::vector<Span> spans() const {
         std::vector<Span> result;
-        for (auto& s : buffer.segments()) result.push_back({s.path, s.session, s.start_ms, s.end_ms});
+        for (auto& s : buffer.segments()) result.push_back({s.path, s.session, s.start_ms, s.end_ms, downsample_levels(s.levels, s.level_bin_ms, CoarseBinMs)});
         return result;
     }
     // Export a range of the buffer as a re-encoded clip through the linked
@@ -415,14 +418,28 @@ public:
             shutdown_core(); status(); PostQuitMessage(exit_code); return;
         }
         if (now_ms() - last_status >= 1000) status();
+        if (measuring.valid() && measuring.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            try { for (auto& [path, levels] : measuring.get()) buffer.set_levels(path, std::move(levels), AudioBinMs); } catch (...) {}
+            levels_changed = true;
+        }
+        if (!measuring.valid()) {
+            // A batch per job, newest first, so a two-hour backlog fills in about a minute.
+            std::vector<fs::path> batch;
+            for (auto it = buffer.segments().rbegin(); it != buffer.segments().rend() && batch.size() < 8; ++it) if (!it->measured) batch.push_back(it->path);
+            if (!batch.empty()) measuring = std::async(std::launch::async, [batch] {
+                std::vector<std::pair<fs::path, std::vector<std::uint8_t>>> results;
+                for (auto& path : batch) { std::vector<std::uint8_t> levels; try { levels = audio_levels(path); } catch (...) {} results.emplace_back(path, std::move(levels)); }
+                return results;
+            });
+        }
         // Publish the segment list whenever it changes; the editor reads this
         // one file instead of every sidecar.
         auto& segments = buffer.segments();
         std::int64_t newest = segments.empty() ? 0 : segments.back().end_ms;
-        if (segments.size() != indexed_count || newest != indexed_end) {
+        if (segments.size() != indexed_count || newest != indexed_end || (levels_changed && now_ms() - indexed_at > 2000)) {
             BufferMap map; for (auto& s : spans()) map.spans.push_back(s);
             map.last_end_ms = newest;
-            try { write_index(app_dir() / "segments.json", map); indexed_count = segments.size(); indexed_end = newest; } catch (...) {}
+            try { write_index(app_dir() / "segments.json", map); indexed_count = segments.size(); indexed_end = newest; indexed_at = now_ms(); levels_changed = false; } catch (...) {}
         }
     }
 };

@@ -427,41 +427,61 @@ int run_ui() {
                 if (audio_lane) {
                     // Loudness waveform: for every pixel column, the loudest
                     // bin under it, drawn symmetrically about the lane's middle.
-                    // Zoomed out, a column covers many bins: the mean is the
-                    // body and the peak a faint envelope, so the lane reads as
-                    // loudness rather than noise. Zoomed in, a column is
-                    // narrower than a bin: interpolate between bin centres.
+                    // Two levels of detail, like a mip chain. Zoomed out, the
+                    // coarse levels carried by the segment index draw the whole
+                    // buffer at once with no per-segment loads, and a smoothing
+                    // kernel that widens with the zoom keeps only the broad
+                    // strokes. Zoomed in, the fine levels from the sidecar are
+                    // loaded lazily, interpolated between bin centres, with the
+                    // peak as a faint envelope; the coarse level stands in
+                    // until they arrive.
                     float mid = y + lane.height / 2, half = lane.height / 2 - 2 * dpi;
                     ImVec4 wave_colour = rgb(0x6b7688);
                     auto body_u32 = ImGui::ColorConvertFloat4ToU32(wave_colour), peak_u32 = ImGui::ColorConvertFloat4ToU32(ImVec4(wave_colour.x, wave_colour.y, wave_colour.z, .3f));
-                    std::vector<float> body, peak;
+                    double ms_per_column = 1.0 / px_per_ms;
+                    bool fine = ms_per_column < 4 * AudioBinMs;
+                    int columns = (int)track_w; std::vector<float> body(columns, -1.f), peak(columns, -1.f);
                     for (auto& s : map.spans) {
                         if (s.end_ms < view_start_ms || s.start_ms > view_end_ms) continue;
-                        auto* wave = waves.levels(s.path); if (!wave || wave->levels.empty()) continue;
-                        auto& lv = wave->levels; double bin = wave->bin_ms;
-                        float xa = std::floor(std::max(x_of(s.start_ms), track_x)), xb = std::min(x_of(s.end_ms), track_x + track_w);
-                        int columns = (int)std::max(0.f, std::ceil(xb - xa)); if (!columns) continue;
-                        body.assign(columns, 0.f); peak.assign(columns, 0.f);
-                        for (int c = 0; c < columns; ++c) {
-                            float x = xa + c;
+                        const std::vector<std::uint8_t>* lv = nullptr; double bin = CoarseBinMs;
+                        if (fine) if (auto* wave = waves.levels(s.path); wave && !wave->levels.empty()) { lv = &wave->levels; bin = wave->bin_ms; }
+                        if (!lv) { if (s.coarse.empty()) continue; lv = &s.coarse; }
+                        int ca = (int)std::floor(std::max(x_of(s.start_ms), track_x) - track_x), cb = (int)std::ceil(std::min(x_of(s.end_ms), track_x + track_w) - track_x);
+                        for (int c = std::max(0, ca); c < std::min(columns, cb); ++c) {
+                            float x = track_x + c;
                             std::int64_t t0 = std::max<std::int64_t>(t_of(x), s.start_ms), t1 = std::min<std::int64_t>(t_of(x + 1), s.end_ms);
                             if (t1 - t0 >= bin) {
-                                size_t b0 = (size_t)((t0 - s.start_ms) / bin), b1 = std::min(lv.size(), (size_t)((t1 - s.start_ms) / bin) + 1);
-                                float sum = 0, top = 0; for (size_t b = b0; b < b1; ++b) { sum += lv[b]; top = std::max(top, (float)lv[b]); }
+                                size_t b0 = (size_t)((t0 - s.start_ms) / bin), b1 = std::min(lv->size(), (size_t)((t1 - s.start_ms) / bin) + 1);
+                                float sum = 0, top = 0; for (size_t b = b0; b < b1; ++b) { sum += (*lv)[b]; top = std::max(top, (float)(*lv)[b]); }
                                 body[c] = b1 > b0 ? sum / (b1 - b0) : 0; peak[c] = top;
                             } else {
                                 double p = ((t0 + t1) / 2.0 - s.start_ms) / bin - 0.5; std::int64_t i = (std::int64_t)std::floor(p); float f = (float)(p - i);
-                                auto at = [&](std::int64_t k) { return (float)lv[(size_t)std::clamp<std::int64_t>(k, 0, (std::int64_t)lv.size() - 1)]; };
+                                auto at = [&](std::int64_t k) { return (float)(*lv)[(size_t)std::clamp<std::int64_t>(k, 0, (std::int64_t)lv->size() - 1)]; };
                                 body[c] = peak[c] = at(i) * (1 - f) + at(i + 1) * f;
                             }
                         }
-                        // A light horizontal smoothing on the body keeps the outline calm at wide zooms.
+                    }
+                    // Smoothing radius grows with the number of bins under a
+                    // column, so a two-hour view shows the shape of a session
+                    // and a ten-second view shows every beat. Gaps stay gaps.
+                    double bins_per_column = ms_per_column / (fine ? AudioBinMs : CoarseBinMs);
+                    int radius = std::clamp((int)std::lround(std::log2(std::max(1.0, bins_per_column))), 0, 8);
+                    std::vector<float> smooth(body);
+                    for (int pass = 0; pass < 2 && radius > 0; ++pass) {
+                        std::vector<float> next(smooth);
                         for (int c = 0; c < columns; ++c) {
-                            float v = body[c]; if (columns > 2) v = (body[std::max(0, c - 1)] + body[c] * 2 + body[std::min(columns - 1, c + 1)]) / 4;
-                            float x = xa + c + .5f;
-                            if (peak[c] > v + 2) { float hp = half * peak[c] / 255.f; draw->AddLine(ImVec2(x, mid - hp), ImVec2(x, mid + hp), peak_u32, 1); }
-                            if (v >= 1) { float hb = std::max(1.f, half * v / 255.f); draw->AddLine(ImVec2(x, mid - hb), ImVec2(x, mid + hb), body_u32, 1); }
+                            if (smooth[c] < 0) continue;
+                            float sum = 0; int n = 0;
+                            for (int k = std::max(0, c - radius); k <= std::min(columns - 1, c + radius); ++k) if (smooth[k] >= 0) { sum += smooth[k]; ++n; }
+                            next[c] = n ? sum / n : smooth[c];
                         }
+                        smooth.swap(next);
+                    }
+                    for (int c = 0; c < columns; ++c) {
+                        if (body[c] < 0) continue;
+                        float x = track_x + c + .5f, v = smooth[c];
+                        if (fine && bins_per_column < 8 && peak[c] > v + 2) { float hp = half * peak[c] / 255.f; draw->AddLine(ImVec2(x, mid - hp), ImVec2(x, mid + hp), peak_u32, 1); }
+                        if (v >= 1) { float hb = std::max(1.f, half * v / 255.f); draw->AddLine(ImVec2(x, mid - hb), ImVec2(x, mid + hb), body_u32, 1); }
                     }
                 }
                 draw->AddRect(ImVec2(track_x, y), ImVec2(track_x + track_w, y + lane.height), line_u32);
