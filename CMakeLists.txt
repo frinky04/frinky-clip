@@ -1,0 +1,66 @@
+cmake_minimum_required(VERSION 3.28)
+project(FrinkyClip VERSION 0.1.0 LANGUAGES CXX)
+if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+  message(FATAL_ERROR "Frinky Clip requires MSVC and 64-bit Windows.")
+endif()
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(OBS_ROOT "C:/Program Files/obs-studio" CACHE PATH "OBS 32.2.2 installation")
+set(DEPS "${CMAKE_SOURCE_DIR}/.deps")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/include/libavutil")
+file(WRITE "${CMAKE_BINARY_DIR}/include/obsconfig.h" "#pragma once\n#define OBS_RELEASE_CANDIDATE 0\n#define OBS_BETA 0\n#define OBS_DATA_PATH \"data\"\n#define OBS_INSTALL_PREFIX \"\"\n")
+file(WRITE "${CMAKE_BINARY_DIR}/include/libavutil/avconfig.h" "#ifndef AVUTIL_AVCONFIG_H\n#define AVUTIL_AVCONFIG_H\n#define AV_HAVE_BIGENDIAN 0\n#define AV_HAVE_FAST_UNALIGNED 1\n#endif\n")
+get_filename_component(MSVC_BIN "${CMAKE_LINKER}" DIRECTORY)
+# The installed runtime has no SDK import libraries. Generate them from its
+# export tables; public headers are pinned to the matching OBS / FFmpeg ABI.
+function(import_runtime target dll)
+  execute_process(COMMAND "${MSVC_BIN}/dumpbin.exe" /exports "${OBS_ROOT}/bin/64bit/${dll}.dll"
+    OUTPUT_VARIABLE exports COMMAND_ERROR_IS_FATAL ANY)
+  string(REGEX MATCHALL "[ \t]+[0-9]+[ \t]+[0-9A-F]+[ \t]+[0-9A-F]+[ \t]+[^\r\n]+" rows "${exports}")
+  set(def "LIBRARY ${dll}.dll\nEXPORTS\n")
+  foreach(row IN LISTS rows)
+    string(REGEX REPLACE "^[ \t]+[0-9]+[ \t]+[0-9A-F]+[ \t]+[0-9A-F]+[ \t]+([^ \r\n]+).*" "\\1" symbol "${row}")
+    string(APPEND def "${symbol}\n")
+  endforeach()
+  file(WRITE "${CMAKE_BINARY_DIR}/${target}.def" "${def}")
+  execute_process(COMMAND "${MSVC_BIN}/lib.exe" /nologo /machine:x64 "/def:${CMAKE_BINARY_DIR}/${target}.def"
+    "/out:${CMAKE_BINARY_DIR}/${target}.lib" OUTPUT_QUIET COMMAND_ERROR_IS_FATAL ANY)
+  add_library(${target} SHARED IMPORTED)
+  set_target_properties(${target} PROPERTIES IMPORTED_IMPLIB "${CMAKE_BINARY_DIR}/${target}.lib"
+    IMPORTED_LOCATION "${OBS_ROOT}/bin/64bit/${dll}.dll")
+endfunction()
+import_runtime(obs obs)
+import_runtime(avformat avformat-62)
+import_runtime(avcodec avcodec-62)
+import_runtime(avutil avutil-60)
+add_library(clip_core src/common.cpp src/media.cpp src/buffer.cpp)
+target_include_directories(clip_core PUBLIC src "${CMAKE_BINARY_DIR}/include")
+target_include_directories(clip_core SYSTEM PUBLIC "${DEPS}/obs-src/libobs" "${DEPS}/ffmpeg-src")
+target_compile_definitions(clip_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(clip_core PUBLIC obs avformat avcodec avutil shell32 ole32)
+add_executable(frinky-clip WIN32 src/main.cpp src/recorder.cpp src/ui.cpp src/app.cpp
+  "${DEPS}/imgui/imgui.cpp" "${DEPS}/imgui/imgui_draw.cpp" "${DEPS}/imgui/imgui_tables.cpp" "${DEPS}/imgui/imgui_widgets.cpp"
+  "${DEPS}/imgui/backends/imgui_impl_win32.cpp" "${DEPS}/imgui/backends/imgui_impl_dx11.cpp")
+target_include_directories(frinky-clip PRIVATE "${DEPS}/imgui" "${DEPS}/imgui/backends")
+target_link_libraries(frinky-clip PRIVATE clip_core d3d11 dxgi dwmapi comctl32 dbghelp)
+target_compile_options(frinky-clip PRIVATE /Zi)
+target_link_options(frinky-clip PRIVATE /DEBUG)
+target_compile_options(clip_core PRIVATE /W4 /utf-8 /EHsc)
+target_compile_options(frinky-clip PRIVATE /W4 /utf-8 /EHsc)
+add_custom_command(TARGET frinky-clip POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/NotoSansMono-Medium.ttf" "$<TARGET_FILE_DIR:frinky-clip>/NotoSansMono-Medium.ttf")
+enable_testing()
+add_executable(clip-tests tests/core_tests.cpp)
+target_link_libraries(clip-tests PRIVATE clip_core)
+add_test(NAME clip-core COMMAND clip-tests)
+# Keep OBS unmodified. Only runtime DLLs and helper executables are copied;
+# modules and data are loaded from the configured installation.
+file(GLOB runtime_dlls "${OBS_ROOT}/bin/64bit/*.dll")
+list(FILTER runtime_dlls EXCLUDE REGEX "/(Qt6[^/]*|obs-frontend-api|obs-scripting|lua51|libobs-opengl)\\.dll$")
+foreach(target frinky-clip clip-tests)
+  add_custom_command(TARGET ${target} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${runtime_dlls} "$<TARGET_FILE_DIR:${target}>"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OBS_ROOT}/bin/64bit/obs-ffmpeg-mux.exe" "${OBS_ROOT}/bin/64bit/obs-nvenc-test.exe" "${OBS_ROOT}/bin/64bit/obs-qsv-test.exe" "${OBS_ROOT}/bin/64bit/obs-amf-test.exe" "$<TARGET_FILE_DIR:${target}>")
+endforeach()
+file(GENERATE OUTPUT "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/runtime.json" CONTENT "{\"obs_root\":\"${OBS_ROOT}\"}\n")
