@@ -9,7 +9,9 @@ extern "C" {
 namespace clip {
 std::vector<std::int64_t> keyframe_times(const fs::path& segment) {
     std::vector<std::int64_t> result; AVFormatContext* fmt = nullptr;
-    if (!open_without_probe(&fmt, segment)) return result;
+    // A segment that cannot be opened (expired since the index was read)
+    // still gets one entry, so lookups never face an empty list.
+    if (!open_without_probe(&fmt, segment)) return {0};
     int index = -1;
     for (unsigned i = 0; i < fmt->nb_streams; ++i) if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { index = (int)i; break; }
     if (index >= 0) {
@@ -56,7 +58,7 @@ Thumbnails::Picture Thumbnails::request(Key key) {
             return {};
         }
         auto it = std::upper_bound(index.keyframes_ms.begin(), index.keyframes_ms.end(), key.offset);
-        key.offset = it == index.keyframes_ms.begin() ? index.keyframes_ms.front() : *(it - 1);
+        key.offset = index.keyframes_ms.empty() ? 0 : it == index.keyframes_ms.begin() ? index.keyframes_ms.front() : *(it - 1);
     }
     auto& entry = cache_[key]; entry.used = frame_;
     if (!entry.picture.texture && !entry.picture.failed && !entry.decoded && !entry.queued) {
