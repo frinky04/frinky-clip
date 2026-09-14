@@ -41,7 +41,7 @@ target_include_directories(clip_core PUBLIC src "${CMAKE_BINARY_DIR}/include")
 target_include_directories(clip_core SYSTEM PUBLIC "${DEPS}/obs-src/libobs" "${DEPS}/ffmpeg-src")
 target_compile_definitions(clip_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(clip_core PUBLIC obs avformat avcodec avutil swscale swresample shell32 ole32)
-add_executable(frinky-clip WIN32 src/main.cpp src/recorder.cpp src/ui.cpp src/app.cpp src/thumbs.cpp src/player.cpp
+add_executable(frinky-clip WIN32 src/main.cpp src/recorder.cpp src/ui.cpp src/app.cpp src/thumbs.cpp src/waveform.cpp src/player.cpp
   "${DEPS}/imgui/imgui.cpp" "${DEPS}/imgui/imgui_draw.cpp" "${DEPS}/imgui/imgui_tables.cpp" "${DEPS}/imgui/imgui_widgets.cpp"
   "${DEPS}/imgui/backends/imgui_impl_win32.cpp" "${DEPS}/imgui/backends/imgui_impl_dx11.cpp")
 target_include_directories(frinky-clip PRIVATE "${DEPS}/imgui" "${DEPS}/imgui/backends")

@@ -2,6 +2,7 @@
 #include "app.hpp"
 #include "timeline.hpp"
 #include "thumbs.hpp"
+#include "waveform.hpp"
 #include "player.hpp"
 #include <imgui.h>
 #include <imgui_impl_win32.h>
@@ -55,7 +56,7 @@ void theme(float dpi) {
 // and its message line. The default window makes the 16:9 viewport fill the
 // content width; the minimum keeps the viewport at its smallest usable
 // height so nothing scrolls off the bottom.
-constexpr int DefaultClientWidth = 760, MinClientWidth = 720, ChromeHeight = 317, MinPreviewHeight = 96, SidePadding = 14;
+constexpr int DefaultClientWidth = 760, MinClientWidth = 720, ChromeHeight = 327, MinPreviewHeight = 96, SidePadding = 14;
 RECT window_rect(int client_w, int client_h, UINT dpi) {
     float scale = dpi / 96.f; RECT rect{0, 0, (LONG)(client_w * scale), (LONG)(client_h * scale)};
     AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi); return rect;
@@ -199,6 +200,7 @@ int run_ui() {
     // Editor state. Times are epoch milliseconds; the view is the newest visible
     // edge and its length, and following keeps that edge at now.
     std::optional<Thumbnails> thumbs_holder; thumbs_holder.emplace(device); auto& thumbs = *thumbs_holder;
+    std::optional<Waveforms> waves_holder; waves_holder.emplace(); auto& waves = *waves_holder;
     BufferMap map; std::future<BufferMap> scanning; std::int64_t last_scan = 0, last_pin = 0;
     // The view has a target (what the user asked for) and a displayed value
     // that eases toward it, so pans and zooms glide instead of jumping.
@@ -340,7 +342,7 @@ int run_ui() {
         float below_h = 2 * dpi + style.ItemSpacing.y + row_h * 2 + 6 * dpi + style.ItemSpacing.y + style.WindowPadding.y + ImGui::GetFrameHeight() + style.ItemSpacing.y
             + (line_open ? ImGui::GetFrameHeightWithSpacing() : 0);
         // Fixed lane heights; whatever is left above them previews the cut frames.
-        float audio_h = 30 * dpi, video_h = 96 * dpi, ruler_h = ImGui::GetTextLineHeight() + 4 * dpi;
+        float audio_h = 40 * dpi, video_h = 96 * dpi, ruler_h = ImGui::GetTextLineHeight() + 4 * dpi;
         float lanes_h = ruler_h + 2 * dpi + video_h + (audio_h + 4 * dpi) + 4 * dpi + style.WindowPadding.y;
         float preview_h = std::max(96 * dpi, ImGui::GetContentRegionAvail().y - lanes_h - below_h - style.ItemSpacing.y);
         std::int64_t hover_ms = 0; bool hover_lane = false, hover_video = false, fading = false; auto tick_ms = steady_ms();
@@ -420,7 +422,26 @@ int run_ui() {
                 for (auto& run : runs) {
                     if (run.second < view_start_ms || run.first > view_end_ms) continue;
                     float x0 = std::max(x_of(run.first), track_x), x1 = std::min(x_of(run.second), track_x + track_w);
-                    draw->AddRectFilled(ImVec2(x0, y + (audio_lane ? lane.height * .35f : 0)), ImVec2(x1, y + (audio_lane ? lane.height * .65f : lane.height)), footage_u32);
+                    draw->AddRectFilled(ImVec2(x0, y + (audio_lane ? lane.height * .5f - 1 * dpi : 0)), ImVec2(x1, y + (audio_lane ? lane.height * .5f + 1 * dpi : lane.height)), footage_u32);
+                }
+                if (audio_lane) {
+                    // Loudness waveform: for every pixel column, the loudest
+                    // bin under it, drawn symmetrically about the lane's middle.
+                    float mid = y + lane.height / 2, half = lane.height / 2 - 2 * dpi;
+                    auto wave_u32 = ImGui::ColorConvertFloat4ToU32(rgb(0x6b7688));
+                    for (auto& s : map.spans) {
+                        if (s.end_ms < view_start_ms || s.start_ms > view_end_ms) continue;
+                        auto* levels = waves.levels(s.path); if (!levels || levels->empty()) continue;
+                        float xa = std::max(x_of(s.start_ms), track_x), xb = std::min(x_of(s.end_ms), track_x + track_w);
+                        for (float x = std::floor(xa); x < xb; x += 1) {
+                            std::int64_t t0 = std::max<std::int64_t>(t_of(x), s.start_ms), t1 = std::min<std::int64_t>(t_of(x + 1), s.end_ms);
+                            size_t b0 = (size_t)((t0 - s.start_ms) / AudioBinMs), b1 = std::min(levels->size(), (size_t)((t1 - s.start_ms) / AudioBinMs) + 1);
+                            std::uint8_t peak = 0; for (size_t b = b0; b < b1; ++b) peak = std::max(peak, (*levels)[b]);
+                            if (!peak) continue;
+                            float h = std::max(1.f, half * peak / 255.f);
+                            draw->AddLine(ImVec2(x + .5f, mid - h), ImVec2(x + .5f, mid + h), wave_u32, 1);
+                        }
+                    }
                 }
                 draw->AddRect(ImVec2(track_x, y), ImVec2(track_x + track_w, y + lane.height), line_u32);
                 y += lane.height + 4 * dpi;
@@ -826,7 +847,7 @@ int run_ui() {
     }
     if (scanning.valid()) scanning.wait();
     if (auto worker = app.recorder()) PostMessageW(worker, PinMessage, 0, 0);
-    player_holder.reset(); thumbs_holder.reset();
+    player_holder.reset(); thumbs_holder.reset(); waves_holder.reset();
     ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
     if (target) { target->Release(); target = nullptr; } swapchain->Release(); context->Release(); device->Release();
     device = nullptr; context = nullptr; swapchain = nullptr; DestroyWindow(window); UnregisterClassW(AppWindowClass, wc.hInstance); return 0;

@@ -14,6 +14,13 @@ void av_check(int code, const char* context); // Throws with the FFmpeg error te
 // rather than on the container duration, which includes the audio tail.
 struct VideoExtent { std::int64_t frames = 0; int fps_num = 60, fps_den = 1; };
 VideoExtent probe_video(const fs::path& path);
+// Loudness of the first audio track, one value per bin: RMS in dB mapped so
+// that -50 dBFS is 0 and full scale is 255. Empty when there is no audio.
+// The recorder stores this in each segment's sidecar as hex text.
+constexpr int AudioBinMs = 50;
+std::vector<std::uint8_t> audio_levels(const fs::path& path, int bin_ms = AudioBinMs);
+std::string encode_levels(const std::vector<std::uint8_t>& levels);
+std::vector<std::uint8_t> decode_levels(const std::string& text);
 void remux(const std::vector<fs::path>& segments, const fs::path& destination);
 // A D3D11VA decode device shared by decoders. Wrapping the render device lets
 // decoded frames be sampled directly as shader resources; a private device

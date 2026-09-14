@@ -70,6 +70,8 @@ bool Buffer::finalize(const fs::path& p) {
         end = std::max(start + 1, chained_ms(chain.anchor_ms, chain.frames, chain.fps_num, chain.fps_den));
         obs_data_set_int(d.get(), "start_ms", start); obs_data_set_int(d.get(), "end_ms", end);
         obs_data_set_int(d.get(), "frames", video.frames); obs_data_set_double(d.get(), "seconds", (end - start) / 1000.0);
+        // Loudness for the editor's audio lane; a failure here is not a reason to lose the segment.
+        try { auto levels = audio_levels(p); if (!levels.empty()) { obs_data_set_string(d.get(), "audio_levels", encode_levels(levels).c_str()); obs_data_set_int(d.get(), "audio_bin_ms", AudioBinMs); } } catch (...) {}
         write_json(metadata, d.get());
     }
     segments_.push_back({p, session, start, end, fs::file_size(p)});

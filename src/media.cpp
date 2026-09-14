@@ -10,6 +10,8 @@ extern "C" {
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/channel_layout.h>
+#include <libswresample/swresample.h>
 }
 #include <stdexcept>
 #include <algorithm>
@@ -87,6 +89,64 @@ VideoExtent probe_video(const fs::path& p) {
         extent.fps_num = (int)std::lround((extent.frames - 1) * 1000000.0 / (double)span_us); extent.fps_den = 1;
     }
     return extent;
+}
+std::vector<std::uint8_t> audio_levels(const fs::path& p, int bin_ms) {
+    Input in(p, false); int index = -1;
+    for (unsigned i = 0; i < in.value->nb_streams; ++i) if (in.value->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) { index = (int)i; break; }
+    if (index < 0) return {};
+    auto* par = in.value->streams[index]->codecpar;
+    const AVCodec* codec = avcodec_find_decoder(par->codec_id); if (!codec) return {};
+    AVCodecContext* ctx = avcodec_alloc_context3(codec); if (!ctx) throw std::bad_alloc();
+    SwrContext* swr = nullptr; AVPacket* packet = av_packet_alloc(); AVFrame* frame = av_frame_alloc();
+    std::vector<double> energy; std::vector<int> counts; std::vector<float> mono;
+    try {
+        av_check(avcodec_parameters_to_context(ctx, par), "Configure audio decoder");
+        av_check(avcodec_open2(ctx, codec, nullptr), "Open audio decoder");
+        AVChannelLayout layout = AV_CHANNEL_LAYOUT_MONO;
+        av_check(swr_alloc_set_opts2(&swr, &layout, AV_SAMPLE_FMT_FLT, ctx->sample_rate, &ctx->ch_layout, ctx->sample_fmt, ctx->sample_rate, 0, nullptr), "Mix audio");
+        av_check(swr_init(swr), "Mix audio");
+        int bin_samples = std::max(1, ctx->sample_rate * bin_ms / 1000); std::int64_t seen = 0;
+        auto consume = [&](AVFrame* f) {
+            mono.resize((size_t)f->nb_samples); std::uint8_t* out = reinterpret_cast<std::uint8_t*>(mono.data());
+            int got = swr_convert(swr, &out, f->nb_samples, (const std::uint8_t**)f->extended_data, f->nb_samples);
+            for (int i = 0; i < got; ++i, ++seen) {
+                size_t bin = (size_t)(seen / bin_samples);
+                if (bin >= energy.size()) { energy.resize(bin + 1, 0.0); counts.resize(bin + 1, 0); }
+                energy[bin] += (double)mono[i] * mono[i]; ++counts[bin];
+            }
+        };
+        auto drain = [&] {
+            while (true) {
+                int r = avcodec_receive_frame(ctx, frame);
+                if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) return;
+                av_check(r, "Decode audio"); consume(frame); av_frame_unref(frame);
+            }
+        };
+        int r;
+        while ((r = av_read_frame(in.value, packet)) >= 0) {
+            if (packet->stream_index == index) { avcodec_send_packet(ctx, packet); drain(); }
+            av_packet_unref(packet);
+        }
+        avcodec_send_packet(ctx, nullptr); drain();
+    } catch (...) { swr_free(&swr); av_packet_free(&packet); av_frame_free(&frame); avcodec_free_context(&ctx); throw; }
+    swr_free(&swr); av_packet_free(&packet); av_frame_free(&frame); avcodec_free_context(&ctx);
+    std::vector<std::uint8_t> result(energy.size());
+    for (size_t i = 0; i < energy.size(); ++i) {
+        double rms = counts[i] ? std::sqrt(energy[i] / counts[i]) : 0.0, db = 20.0 * std::log10(std::max(rms, 1e-6));
+        result[i] = (std::uint8_t)std::lround(std::clamp((db + 50.0) / 50.0, 0.0, 1.0) * 255.0);
+    }
+    return result;
+}
+std::string encode_levels(const std::vector<std::uint8_t>& levels) {
+    static const char digits[] = "0123456789abcdef"; std::string text; text.reserve(levels.size() * 2);
+    for (auto v : levels) { text += digits[v >> 4]; text += digits[v & 15]; }
+    return text;
+}
+std::vector<std::uint8_t> decode_levels(const std::string& text) {
+    auto nibble = [](char c) { return c >= 'a' ? c - 'a' + 10 : c >= 'A' ? c - 'A' + 10 : c - '0'; };
+    std::vector<std::uint8_t> levels; levels.reserve(text.size() / 2);
+    for (size_t i = 0; i + 1 < text.size(); i += 2) levels.push_back((std::uint8_t)((nibble(text[i]) << 4) | nibble(text[i + 1])));
+    return levels;
 }
 void remux(const std::vector<fs::path>& segments, const fs::path& destination) {
     if (segments.empty()) throw std::runtime_error("No completed footage to save");
