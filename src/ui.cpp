@@ -226,7 +226,6 @@ int run_ui() {
     // Hover preview state persists across frames so it can fade and hold its last picture.
     Thumbnails::Picture hover_picture{}; float hover_alpha = 0, hover_x = 0; std::int64_t hover_shown_ms = 0;
     enum class Drag { None, Press, Range, In, Out } drag = Drag::None; std::int64_t drag_anchor = 0, scrub_ms = 0; float press_x = 0; bool scrubbing = false;
-    bool right_press = false, right_moved = false; float right_x = 0; // A right-click without a drag resets the view.
     std::optional<Player> player_holder; player_holder.emplace(device, context); auto& player = *player_holder;
     const double frame_ms = 1000.0 / 60;
     auto span_at = [&](std::int64_t t) -> const Span* { for (auto& s : map.spans) if (t >= s.start_ms && t < s.end_ms) return &s; return nullptr; };
@@ -627,14 +626,6 @@ int run_ui() {
                 else if (have_range && std::abs(mx - x_of(out_ms)) <= grab) drag = Drag::Out;
                 else { drag = Drag::Press; drag_anchor = snap(t_of(mx)); }
             }
-            // Right button: a drag pans; a click on a handle clears the range;
-            // a click anywhere else resets the view to its default, the same
-            // convention as right-clicking a slider.
-            if (ImGui::IsItemActivated() && ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
-                right_press = true; right_moved = false; right_x = io.MousePos.x;
-                if (have_range && (std::abs(right_x - x_of(in_ms)) <= grab || std::abs(right_x - x_of(out_ms)) <= grab)) { in_ms = out_ms = 0; right_press = false; }
-            }
-            if (right_press && std::abs(io.MousePos.x - right_x) > 4 * dpi) right_moved = true;
             if (ImGui::IsItemActive() && drag != Drag::None) {
                 std::int64_t t = snap(std::clamp(t_of(io.MousePos.x), oldest, now));
                 if (drag == Drag::Press && std::abs(io.MousePos.x - press_x) > 4 * dpi) { drag = Drag::Range; in_ms = out_ms = 0; }
@@ -648,8 +639,6 @@ int run_ui() {
                 if (drag == Drag::Press) player.seek(drag_anchor);
                 if (drag == Drag::Range && in_ms == out_ms) in_ms = out_ms = 0;
                 drag = Drag::None;
-                if (right_press && !right_moved) { target_seconds = 240; follow = true; }
-                right_press = false;
             }
             if (hovered && io.MouseWheel != 0) {
                 // Zoom about the cursor in target space, so the moment under
@@ -664,7 +653,7 @@ int run_ui() {
             else if (hovered && have_range && (std::abs(io.MousePos.x - x_of(in_ms)) <= grab || std::abs(io.MousePos.x - x_of(out_ms)) <= grab)) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         }
         ImGui::EndChild();
-        if (hover_lane && !hover_video && !have_range) help("Click to place the playhead, drag to mark a range. Scroll to zoom, right-drag to pan. Right-click resets the view.");
+        if (hover_lane && !hover_video && !have_range) help("Click to place the playhead, drag to mark a range. Scroll to zoom, right-drag to pan.");
         // Keyboard transport when no field has focus: Space plays, I/O mark at
         // the playhead, arrows step a frame (a second with Shift).
         if (!io.WantTextInput && !ImGui::IsAnyItemActive()) {
