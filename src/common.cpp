@@ -1,5 +1,7 @@
 #include "common.hpp"
 #include <shlobj.h>
+#include <mmdeviceapi.h>
+#include <functiondiscoverykeys_devpkey.h>
 #include <fstream>
 #include <stdexcept>
 #include <chrono>
@@ -100,6 +102,8 @@ Config Config::load() {
     integer("export_height", c.export_height); integer("export_fps", c.export_fps);
     if (obs_data_has_user_value(d.get(), "budget_gb")) c.budget_gb = obs_data_get_double(d.get(), "budget_gb");
     if (obs_data_has_user_value(d.get(), "audio")) c.audio = obs_data_get_bool(d.get(), "audio");
+    if (obs_data_has_user_value(d.get(), "mic")) c.mic = obs_data_get_bool(d.get(), "mic");
+    if (obs_data_has_user_value(d.get(), "mic_device")) c.mic_device = obs_data_get_string(d.get(), "mic_device");
     if (obs_data_has_user_value(d.get(), "record_on_launch")) c.record_on_launch = obs_data_get_bool(d.get(), "record_on_launch");
     if (obs_data_has_user_value(d.get(), "hotkey")) c.hotkey = (unsigned)obs_data_get_int(d.get(), "hotkey");
     if (obs_data_has_user_value(d.get(), "modifiers")) c.modifiers = (unsigned)obs_data_get_int(d.get(), "modifiers");
@@ -125,10 +129,29 @@ void Config::save() const {
     obs_data_set_string(d.get(), "export_codec", export_codec.c_str());
     obs_data_set_int(d.get(), "hotkey", hotkey); obs_data_set_int(d.get(), "modifiers", modifiers);
     obs_data_set_bool(d.get(), "audio", audio); obs_data_set_string(d.get(), "monitor", monitor.c_str());
+    obs_data_set_bool(d.get(), "mic", mic); obs_data_set_string(d.get(), "mic_device", mic_device.c_str());
     obs_data_set_bool(d.get(), "record_on_launch", record_on_launch);
     obs_data_set_string(d.get(), "storage", path_text(storage).c_str()); write_json(app_dir() / "config.json", d.get());
 }
 HWND recorder_window() { return FindWindowW(RecorderClass, nullptr); }
+std::vector<AudioDevice> capture_devices() {
+    // The ids are MMDevice ids, which is what OBS's WASAPI source takes.
+    std::vector<AudioDevice> result{{"default", "Default microphone"}};
+    IMMDeviceEnumerator* devices = nullptr; IMMDeviceCollection* collection = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&devices))) return result;
+    if (SUCCEEDED(devices->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &collection))) {
+        UINT count = 0; collection->GetCount(&count);
+        for (UINT i = 0; i < count; ++i) {
+            IMMDevice* device = nullptr; if (FAILED(collection->Item(i, &device))) continue;
+            LPWSTR id = nullptr; IPropertyStore* store = nullptr; PROPVARIANT name; PropVariantInit(&name);
+            if (SUCCEEDED(device->GetId(&id)) && SUCCEEDED(device->OpenPropertyStore(STGM_READ, &store)) && SUCCEEDED(store->GetValue(PKEY_Device_FriendlyName, &name)) && name.vt == VT_LPWSTR)
+                result.push_back({utf8(id), utf8(name.pwszVal)});
+            PropVariantClear(&name); if (store) store->Release(); if (id) CoTaskMemFree(id); device->Release();
+        }
+        collection->Release();
+    }
+    devices->Release(); return result;
+}
 std::vector<Monitor> monitors() {
     std::vector<Monitor> result;
     EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR h, HDC, LPRECT, LPARAM p) -> BOOL {

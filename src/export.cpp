@@ -15,6 +15,7 @@ extern "C" {
 #include <libavutil/samplefmt.h>
 }
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -26,15 +27,17 @@ template <class T, void (*Free)(T**)> struct Owned {
     T* value = nullptr;
     Owned() = default; explicit Owned(T* v) : value(v) {}
     Owned(const Owned&) = delete; Owned& operator=(const Owned&) = delete;
+    Owned(Owned&& other) noexcept : value(other.value) { other.value = nullptr; }
+    Owned& operator=(Owned&& other) noexcept { if (this != &other) { Free(&value); value = other.value; other.value = nullptr; } return *this; }
     ~Owned() { Free(&value); }
     T* operator->() const { return value; } operator T*() const { return value; }
     void reset(T* v = nullptr) { Free(&value); value = v; }
 };
+void free_fifo(AVAudioFifo** f) { if (*f) { av_audio_fifo_free(*f); *f = nullptr; } }
+void free_scaler(SwsContext** s) { sws_freeContext(*s); *s = nullptr; }
 using CodecContext = Owned<AVCodecContext, avcodec_free_context>;
 using Frame = Owned<AVFrame, av_frame_free>;
 using Packet = Owned<AVPacket, av_packet_free>;
-void free_fifo(AVAudioFifo** f) { if (*f) { av_audio_fifo_free(*f); *f = nullptr; } }
-void free_scaler(SwsContext** s) { sws_freeContext(*s); *s = nullptr; }
 using Fifo = Owned<AVAudioFifo, free_fifo>;
 using Resampler = Owned<SwrContext, swr_free>;
 using Scaler = Owned<SwsContext, free_scaler>;
@@ -82,11 +85,13 @@ AVCodecContext* open_audio_encoder(const AVCodecContext* source) {
     if (avcodec_open2(ctx, codec, nullptr) < 0) return nullptr;
     auto* raw = ctx.value; ctx.value = nullptr; return raw;
 }
+// One requested audio track's decoder within the open segment.
+struct AudioDecoder { int index = -1; CodecContext ctx; Resampler swr; std::int64_t base_us = -1, samples = 0; };
 // One open segment: demuxer, decoders, and their conversion state.
 struct Source {
-    Format fmt; Span span; int vindex = -1, aindex = -1;
-    CodecContext video, audio; HwBinding binding; bool hardware = false;
-    Resampler swr; std::int64_t audio_base_us = -1, audio_samples = 0; // Timeline position of the source's audio.
+    Format fmt; Span span; int vindex = -1;
+    CodecContext video; HwBinding binding; bool hardware = false;
+    std::vector<AudioDecoder> audio; // One per requested track; index -1 when the segment lacks that track.
 };
 struct Exporter {
     const ExportRequest& r; std::shared_ptr<HwDevice> hw; std::atomic<double>* progress;
@@ -94,11 +99,17 @@ struct Exporter {
     AVFormatContext* out = nullptr; AVStream* vstream = nullptr; AVStream* astream = nullptr;
     CodecContext venc, aenc; Packet packet{av_packet_alloc()}; Frame decoded{av_frame_alloc()}, cpu{av_frame_alloc()}, scaled{av_frame_alloc()}, audio_frame{av_frame_alloc()};
     Scaler sws; int sws_src_w = 0, sws_src_h = 0, sws_fmt = -1;
-    Fifo fifo; std::int64_t frames_out = 0, samples_out = 0, audio_pts = 0; bool video_done = false, audio_done = false;
-    std::string decoder_name, encoder_name;
+    // Requested audio tracks by stream ordinal (0 desktop, 1 microphone). Each
+    // has a queue of converted samples placed on the output grid; the mix
+    // consumes them in step, padding a track that has fallen behind or is
+    // absent from the current segment with silence.
+    struct Track { int ordinal; Fifo fifo; std::int64_t written = 0; };
+    std::vector<Track> tracks; std::int64_t frames_out = 0, mixed_out = 0, audio_pts = 0; bool video_done = false, audio_done = false;
+    std::string decoder_name, encoder_name; fs::path temp_path;
     Exporter(const ExportRequest& request, std::atomic<double>* p) : r(request), progress(p) {
         in_us = request.start_ms * 1000; out_us = request.end_ms * 1000;
         total_frames = std::max<std::int64_t>(1, (out_us - in_us) * request.fps / Million);
+        if (request.audio) tracks.push_back({0}); if (request.mic) tracks.push_back({1});
     }
     ~Exporter() { if (out) { if (out->pb) avio_closep(&out->pb); avformat_free_context(out); } }
     std::int64_t due_us(std::int64_t n) const { return in_us + n * Million / r.fps; }
@@ -133,64 +144,89 @@ struct Exporter {
         else ++frames_out;
         if (frames_out >= total_frames) video_done = true;
     }
-    void encode_audio(bool flush) {
-        int size = aenc->frame_size > 0 ? aenc->frame_size : 1024;
-        while (av_audio_fifo_size(fifo) >= size || (flush && av_audio_fifo_size(fifo) > 0)) {
-            int n = std::min(size, av_audio_fifo_size(fifo));
+    // Mix the tracks' queues in step and encode. Without `flush`, a frame is
+    // taken only when every track present in the current segment has one
+    // ready; absent or exhausted tracks contribute silence.
+    void mix_encode(const Source& src, bool flush) {
+        if (!aenc) return;
+        int size = aenc->frame_size > 0 ? aenc->frame_size : 1024, channels = aenc->ch_layout.nb_channels;
+        while (true) {
+            int have = INT_MAX, most = 0; bool any_present = false;
+            for (size_t k = 0; k < tracks.size(); ++k) {
+                int n = av_audio_fifo_size(tracks[k].fifo); most = std::max(most, n);
+                if (k < src.audio.size() && src.audio[k].index >= 0) { any_present = true; have = std::min(have, n); }
+            }
+            int n = flush ? std::min(size, most) : size;
+            if (!flush && (!any_present || have < size)) return;
+            n = (int)std::min<std::int64_t>(n, total_samples - mixed_out); // Never past the out point.
+            if (n <= 0) return;
             av_frame_unref(audio_frame); audio_frame->nb_samples = n; audio_frame->format = aenc->sample_fmt; audio_frame->sample_rate = aenc->sample_rate;
             av_channel_layout_copy(&audio_frame->ch_layout, &aenc->ch_layout);
             av_check(av_frame_get_buffer(audio_frame, 0), "Allocate audio frame");
-            if (av_audio_fifo_read(fifo, (void**)audio_frame->data, n) < n) throw std::runtime_error("Audio queue underrun");
-            audio_frame->pts = audio_pts; audio_pts += n;
+            for (int c = 0; c < channels; ++c) std::memset(audio_frame->data[c], 0, (size_t)n * sizeof(float));
+            std::uint8_t* planes[AV_NUM_DATA_POINTERS] = {};
+            av_check(av_samples_alloc(planes, nullptr, channels, n, aenc->sample_fmt, 0), "Mix audio");
+            for (auto& track : tracks) {
+                int got = std::max(0, av_audio_fifo_read(track.fifo, (void**)planes, n));
+                for (int c = 0; c < channels; ++c) {
+                    auto* mix = reinterpret_cast<float*>(audio_frame->data[c]); auto* in = reinterpret_cast<const float*>(planes[c]);
+                    for (int i = 0; i < got; ++i) mix[i] += in[i];
+                }
+                track.written = std::max(track.written, mixed_out + n);
+            }
+            av_freep(&planes[0]);
+            for (int c = 0; c < channels; ++c) { auto* mix = reinterpret_cast<float*>(audio_frame->data[c]); for (int i = 0; i < n; ++i) mix[i] = std::clamp(mix[i], -1.f, 1.f); }
+            audio_frame->pts = audio_pts; audio_pts += n; mixed_out += n;
             av_check(avcodec_send_frame(aenc, audio_frame), "Encode audio"); write(aenc, astream);
+            if (mixed_out >= total_samples) { audio_done = true; return; }
         }
     }
-    // Place decoded samples on the output sample grid: skip what is already
-    // written, fill any gap with silence, stop at the out point.
-    void place_audio(Source& src, AVFrame* frame) {
-        if (src.audio_base_us < 0) {
+    // Place decoded samples of one track on the output sample grid: skip what
+    // is already written, fill any gap with silence, stop at the out point.
+    void place_audio(Source& src, size_t k, AVFrame* frame) {
+        auto& dec = src.audio[k]; auto& track = tracks[k];
+        if (dec.base_us < 0) {
             std::int64_t pts = frame->best_effort_timestamp == AV_NOPTS_VALUE ? frame->pts : frame->best_effort_timestamp;
             if (pts == AV_NOPTS_VALUE) return;
-            src.audio_base_us = src.span.start_ms * 1000 + av_rescale_q(pts, src.fmt->streams[src.aindex]->time_base, AVRational{1, Million});
-            src.audio_samples = 0;
+            dec.base_us = src.span.start_ms * 1000 + av_rescale_q(pts, src.fmt->streams[dec.index]->time_base, AVRational{1, Million});
+            dec.samples = 0;
         }
-        int rate = aenc->sample_rate;
-        std::int64_t first = av_rescale(src.audio_base_us - in_us, rate, Million) + src.audio_samples; // Output index of this frame's first sample.
-        src.audio_samples += frame->nb_samples;
+        int rate = aenc->sample_rate, channels = aenc->ch_layout.nb_channels;
+        std::int64_t first = av_rescale(dec.base_us - in_us, rate, Million) + dec.samples; // Output index of this frame's first sample.
+        dec.samples += frame->nb_samples;
         std::uint8_t* converted[AV_NUM_DATA_POINTERS] = {};
-        int count = swr_get_out_samples(src.swr, frame->nb_samples); if (count <= 0) return;
-        av_check(av_samples_alloc(converted, nullptr, aenc->ch_layout.nb_channels, count, aenc->sample_fmt, 0), "Convert audio");
-        count = swr_convert(src.swr, converted, count, (const std::uint8_t**)frame->extended_data, frame->nb_samples);
+        int count = swr_get_out_samples(dec.swr, frame->nb_samples); if (count <= 0) return;
+        av_check(av_samples_alloc(converted, nullptr, channels, count, aenc->sample_fmt, 0), "Convert audio");
+        count = swr_convert(dec.swr, converted, count, (const std::uint8_t**)frame->extended_data, frame->nb_samples);
         if (count > 0) {
-            std::int64_t skip = std::clamp<std::int64_t>(samples_out - first, 0, count);
-            std::int64_t gap = std::clamp<std::int64_t>(first - samples_out, 0, rate); // Bounded silence for a seam or dropout.
+            std::int64_t skip = std::clamp<std::int64_t>(track.written - first, 0, count);
+            std::int64_t gap = std::clamp<std::int64_t>(first - track.written, 0, std::min<std::int64_t>(rate, total_samples - track.written)); // Bounded silence for a seam or dropout.
             if (gap > 0) {
                 std::uint8_t* silence[AV_NUM_DATA_POINTERS] = {};
-                av_check(av_samples_alloc(silence, nullptr, aenc->ch_layout.nb_channels, (int)gap, aenc->sample_fmt, 0), "Fill audio gap");
-                av_samples_set_silence(silence, 0, (int)gap, aenc->ch_layout.nb_channels, aenc->sample_fmt);
-                av_audio_fifo_write(fifo, (void**)silence, (int)gap); samples_out += gap; av_freep(&silence[0]);
+                av_check(av_samples_alloc(silence, nullptr, channels, (int)gap, aenc->sample_fmt, 0), "Fill audio gap");
+                av_samples_set_silence(silence, 0, (int)gap, channels, aenc->sample_fmt);
+                av_audio_fifo_write(track.fifo, (void**)silence, (int)gap); track.written += gap; av_freep(&silence[0]);
             }
-            std::int64_t take = std::min<std::int64_t>(count - skip, total_samples - samples_out);
+            std::int64_t take = std::min<std::int64_t>(count - skip, total_samples - track.written);
             if (take > 0) {
-                // Advance plane pointers past the skipped samples.
                 std::uint8_t* planes[AV_NUM_DATA_POINTERS] = {}; int bytes = av_get_bytes_per_sample(aenc->sample_fmt);
-                for (int c = 0; c < aenc->ch_layout.nb_channels; ++c) planes[c] = converted[c] + skip * bytes;
-                av_audio_fifo_write(fifo, (void**)planes, (int)take); samples_out += take;
+                for (int c = 0; c < channels; ++c) planes[c] = converted[c] + skip * bytes;
+                av_audio_fifo_write(track.fifo, (void**)planes, (int)take); track.written += take;
             }
-            if (samples_out >= total_samples) audio_done = true;
         }
         av_freep(&converted[0]);
-        encode_audio(false);
+        mix_encode(src, false);
     }
     void open(Source& src, const Span& span, bool hardware) {
-        src.fmt.reset(); src.video.reset(); src.audio.reset(); src.swr.reset(); src.audio_base_us = -1; src.vindex = src.aindex = -1;
+        src.fmt.reset(); src.video.reset(); src.audio.clear(); src.vindex = -1;
         AVFormatContext* fmt = nullptr;
         if (!open_without_probe(&fmt, span.path)) throw std::runtime_error("Cannot open " + path_text(span.path));
         src.fmt.reset(fmt); src.span = span;
+        std::vector<int> audio_streams;
         for (unsigned i = 0; i < fmt->nb_streams; ++i) {
             auto* par = fmt->streams[i]->codecpar;
             if (par->codec_type == AVMEDIA_TYPE_VIDEO && src.vindex < 0) src.vindex = (int)i;
-            if (par->codec_type == AVMEDIA_TYPE_AUDIO && src.aindex < 0) src.aindex = (int)i;
+            if (par->codec_type == AVMEDIA_TYPE_AUDIO) audio_streams.push_back((int)i);
         }
         if (src.vindex < 0) throw std::runtime_error("No video stream: " + path_text(span.path));
         auto* vpar = fmt->streams[src.vindex]->codecpar;
@@ -202,32 +238,32 @@ struct Exporter {
         if (src.hardware) { src.binding = {hw, false, 8}; src.video->opaque = &src.binding; src.video->get_format = hw_get_format; }
         av_check(avcodec_open2(src.video, vcodec, nullptr), "Open decoder");
         decoder_name = std::string(vcodec->name) + (src.hardware ? " (D3D11VA)" : " (software)");
-        if (r.audio && src.aindex >= 0) {
-            auto* apar = fmt->streams[src.aindex]->codecpar; const AVCodec* acodec = avcodec_find_decoder(apar->codec_id);
-            if (acodec) {
-                src.audio.reset(avcodec_alloc_context3(acodec));
-                if (avcodec_parameters_to_context(src.audio, apar) < 0 || avcodec_open2(src.audio, acodec, nullptr) < 0) src.audio.reset();
-            }
-            if (src.audio && !aenc) { aenc.reset(open_audio_encoder(src.audio)); if (!aenc) src.audio.reset(); }
-            if (src.audio) {
-                SwrContext* swr = nullptr;
-                if (swr_alloc_set_opts2(&swr, &aenc->ch_layout, aenc->sample_fmt, aenc->sample_rate, &src.audio->ch_layout, src.audio->sample_fmt, src.audio->sample_rate, 0, nullptr) < 0 || swr_init(swr) < 0) { swr_free(&swr); src.audio.reset(); }
-                src.swr.reset(swr);
-            }
+        src.audio.resize(tracks.size());
+        for (size_t k = 0; k < tracks.size(); ++k) {
+            auto& dec = src.audio[k]; size_t ordinal = (size_t)tracks[k].ordinal;
+            if (ordinal >= audio_streams.size()) continue; // This segment has no such track: silence.
+            auto* apar = fmt->streams[audio_streams[ordinal]]->codecpar; const AVCodec* acodec = avcodec_find_decoder(apar->codec_id);
+            if (!acodec) continue;
+            dec.ctx.reset(avcodec_alloc_context3(acodec));
+            if (avcodec_parameters_to_context(dec.ctx, apar) < 0 || avcodec_open2(dec.ctx, acodec, nullptr) < 0) { dec.ctx.reset(); continue; }
+            if (!aenc) { aenc.reset(open_audio_encoder(dec.ctx)); if (!aenc) { dec.ctx.reset(); continue; } }
+            SwrContext* swr = nullptr;
+            if (swr_alloc_set_opts2(&swr, &aenc->ch_layout, aenc->sample_fmt, aenc->sample_rate, &dec.ctx->ch_layout, dec.ctx->sample_fmt, dec.ctx->sample_rate, 0, nullptr) < 0 || swr_init(swr) < 0) { swr_free(&swr); dec.ctx.reset(); continue; }
+            dec.swr.reset(swr); dec.index = audio_streams[ordinal];
         }
     }
-    void begin_output(const fs::path& temp, int src_w, int src_h) {
-        av_check(avformat_alloc_output_context2(&out, nullptr, "mp4", path_text(temp).c_str()), "Create clip");
+    void begin_output(int src_w, int src_h) {
+        av_check(avformat_alloc_output_context2(&out, nullptr, "mp4", path_text(temp_path).c_str()), "Create clip");
         venc.reset(open_video_encoder(r, src_w, src_h, encoder_name));
         vstream = avformat_new_stream(out, nullptr); if (!vstream) throw std::bad_alloc();
         av_check(avcodec_parameters_from_context(vstream->codecpar, venc), "Describe video"); vstream->time_base = venc->time_base; vstream->avg_frame_rate = venc->framerate;
         if (aenc) {
             astream = avformat_new_stream(out, nullptr); if (!astream) throw std::bad_alloc();
             av_check(avcodec_parameters_from_context(astream->codecpar, aenc), "Describe audio"); astream->time_base = aenc->time_base;
-            fifo.reset(av_audio_fifo_alloc(aenc->sample_fmt, aenc->ch_layout.nb_channels, aenc->frame_size > 0 ? aenc->frame_size * 4 : 4096));
+            for (auto& track : tracks) track.fifo.reset(av_audio_fifo_alloc(aenc->sample_fmt, aenc->ch_layout.nb_channels, aenc->frame_size > 0 ? aenc->frame_size * 4 : 4096));
             total_samples = av_rescale(out_us - in_us, aenc->sample_rate, Million);
         } else audio_done = true;
-        av_check(avio_open(&out->pb, path_text(temp).c_str(), AVIO_FLAG_WRITE), "Open clip output");
+        av_check(avio_open(&out->pb, path_text(temp_path).c_str(), AVIO_FLAG_WRITE), "Open clip output");
         AVDictionary* options = nullptr; av_dict_set(&options, "movflags", "+faststart", 0);
         int result = avformat_write_header(out, &options); av_dict_free(&options); av_check(result, "Write clip header");
     }
@@ -240,17 +276,25 @@ struct Exporter {
             std::int64_t pts = f->best_effort_timestamp == AV_NOPTS_VALUE ? f->pts : f->best_effort_timestamp;
             if (pts == AV_NOPTS_VALUE) return;
             std::int64_t t = src.span.start_ms * 1000 + av_rescale_q(pts, vstream_in->time_base, AVRational{1, Million});
-            if (!out) begin_output_from(f);
+            if (!out) begin_output(f->width, f->height);
             // Emit this picture for every output slot it covers; a source
             // frame ahead of the next slot is dropped (60 to 30 fps).
             while (!video_done && due_us(frames_out) <= t + 1000) encode_video(f);
         };
-        auto drain = [&](AVCodecContext* ctx, bool video) {
+        auto drain_video = [&] {
             while (true) {
-                int result = avcodec_receive_frame(ctx, decoded);
+                int result = avcodec_receive_frame(src.video, decoded);
                 if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) return;
-                if (result < 0) { if (video && src.hardware && !frames_seen) throw HwFailure{}; av_check(result, "Decode"); }
-                if (video) video_frame(decoded); else if (!audio_done && aenc) place_audio(src, decoded);
+                if (result < 0) { if (src.hardware && !frames_seen) throw HwFailure{}; av_check(result, "Decode"); }
+                video_frame(decoded); av_frame_unref(decoded);
+            }
+        };
+        auto drain_audio = [&](size_t k) {
+            while (true) {
+                int result = avcodec_receive_frame(src.audio[k].ctx, decoded);
+                if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) return;
+                if (result < 0) return;
+                if (!audio_done && out) place_audio(src, k, decoded);
                 av_frame_unref(decoded);
             }
         };
@@ -260,27 +304,26 @@ struct Exporter {
             if (result < 0) {
                 if (result != AVERROR_EOF) av_check(result, "Read segment");
                 if (eof) break;
-                eof = true; avcodec_send_packet(src.video, nullptr); if (src.audio) avcodec_send_packet(src.audio, nullptr);
-                drain(src.video, true); if (src.audio) drain(src.audio, false);
+                eof = true; avcodec_send_packet(src.video, nullptr); drain_video();
+                for (size_t k = 0; k < src.audio.size(); ++k) if (src.audio[k].ctx) { avcodec_send_packet(src.audio[k].ctx, nullptr); drain_audio(k); }
                 break;
             }
             if (packet->stream_index == src.vindex) {
                 int sent = avcodec_send_packet(src.video, packet); av_packet_unref(packet);
                 if (sent < 0 && sent != AVERROR(EAGAIN)) { if (src.hardware && !frames_seen) throw HwFailure{}; av_check(sent, "Decode video"); }
-                drain(src.video, true);
-            } else if (src.audio && packet->stream_index == src.aindex) {
-                avcodec_send_packet(src.audio, packet); av_packet_unref(packet);
-                drain(src.audio, false);
-            } else av_packet_unref(packet);
+                drain_video();
+            } else {
+                bool used = false;
+                for (size_t k = 0; k < src.audio.size(); ++k) if (src.audio[k].ctx && packet->stream_index == src.audio[k].index) { avcodec_send_packet(src.audio[k].ctx, packet); used = true; av_packet_unref(packet); drain_audio(k); break; }
+                if (!used) av_packet_unref(packet);
+            }
         }
         return !(video_done && audio_done);
     }
-    fs::path temp_path;
-    void begin_output_from(AVFrame* f) { begin_output(temp_path, f->width, f->height); }
-    void finish() {
+    void finish(const Source& src) {
         if (!out) throw std::runtime_error("No frames in the marked range");
         av_check(avcodec_send_frame(venc, nullptr), "Flush video"); write(venc, vstream);
-        if (aenc) { encode_audio(true); av_check(avcodec_send_frame(aenc, nullptr), "Flush audio"); write(aenc, astream); }
+        if (aenc) { mix_encode(src, true); av_check(avcodec_send_frame(aenc, nullptr), "Flush audio"); write(aenc, astream); }
         av_check(av_write_trailer(out), "Finish clip"); av_check(avio_closep(&out->pb), "Close clip");
     }
 };
@@ -305,7 +348,7 @@ ExportResult export_clip(const std::vector<Span>& sources, const ExportRequest& 
                 exporter.open(src, span, hardware);
                 if (!exporter.run_source(src)) break;
             }
-            exporter.finish();
+            exporter.finish(src);
             result.video_encoder = exporter.encoder_name; result.decoder = exporter.decoder_name; result.frames = exporter.frames_out;
             break;
         } catch (const HwFailure&) {
@@ -331,7 +374,7 @@ int export_test(const fs::path& buffer_root, int seconds) {
     for (size_t i = map.spans.size(); i > 1; --i) if (map.spans[i - 1].start_ms == map.spans[i - 2].end_ms) { seam = i - 1; break; }
     if (seam >= map.spans.size()) { atomic_write(app_dir() / "export-test.txt", report + "No contiguous segment pair\n"); return 1; }
     ExportRequest request; request.start_ms = map.spans[seam].start_ms - 1500; request.end_ms = request.start_ms + seconds * 1000;
-    request.height = 720; request.bitrate_kbps = 8000;
+    request.height = 720; request.bitrate_kbps = 8000; request.mic = map.spans[seam].coarse.size() > 1;
     for (const char* codec : {"h264", "av1"}) for (int fps : {60, 30}) {
         request.codec = codec; request.fps = fps;
         auto sources = spans_in_range(map.spans, request.start_ms, request.end_ms);
@@ -344,7 +387,7 @@ int export_test(const fs::path& buffer_root, int seconds) {
             bool ok = std::abs(info.seconds - seconds) < 0.06 && video.frames == expected && info.height == 720 && info.audio;
             report += std::string(codec) + " " + std::to_string(fps) + " fps: " + std::to_string(now_ms() - began) + " ms, " + std::to_string(video.frames) + "/" +
                 std::to_string(expected) + " frames, " + std::to_string(info.seconds) + " s, " + std::to_string(info.width) + "x" + std::to_string(info.height) +
-                ", audio " + (info.audio ? "yes" : "no") + ", " + result.video_encoder + " from " + result.decoder + (ok ? "" : "  MISMATCH") + "\n";
+                ", audio " + (info.audio ? "yes" : "no") + (request.mic ? " (with microphone)" : "") + ", " + result.video_encoder + " from " + result.decoder + (ok ? "" : "  MISMATCH") + "\n";
             if (!ok) ++failures;
         } catch (const std::exception& e) { report += std::string(codec) + " " + std::to_string(fps) + " fps failed: " + e.what() + "\n"; ++failures; }
     }

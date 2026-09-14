@@ -154,7 +154,7 @@ int run_ui() {
         if (auto existing = FindWindowW(AppWindowClass, nullptr)) { ShowWindow(existing, SW_RESTORE); SetForegroundWindow(existing); }
         return 0;
     }
-    Config cfg = Config::load(); auto displays = monitors();
+    Config cfg = Config::load(); auto displays = monitors(); auto microphones = capture_devices();
     char storage[2048]; strncpy_s(storage, path_text(cfg.storage).c_str(), _TRUNCATE);
     auto status = read_json(app_dir() / "status.json"); std::int64_t last_read = 0;
     std::string error, settings_error; bool dirty = false;
@@ -206,7 +206,7 @@ int run_ui() {
     // that eases toward it, so pans and zooms glide instead of jumping.
     std::int64_t target_end_ms = now_ms(), in_ms = 0, out_ms = 0;
     double target_seconds = 240, shown_seconds = 240, shown_end_ms = (double)target_end_ms; bool animating = false;
-    bool follow = true, open_settings = false, export_system = true;
+    bool follow = true, open_settings = false, export_system = true, export_mic = true;
     // Status lives on the action that started the work: the recorder's message
     // is watched for transitions, and a result shows on its button for a while.
     std::string last_message, notice, dismissed_failure; std::int64_t exported_at = 0, saved_at = 0, notice_at = 0; bool hotkey_warning_dismissed = false;
@@ -344,7 +344,9 @@ int run_ui() {
             + (line_open ? ImGui::GetFrameHeightWithSpacing() : 0);
         // Fixed lane heights; whatever is left above them previews the cut frames.
         float audio_h = 40 * dpi, video_h = 96 * dpi, ruler_h = ImGui::GetTextLineHeight() + 4 * dpi;
-        float lanes_h = ruler_h + 2 * dpi + video_h + (audio_h + 4 * dpi) + 4 * dpi + style.WindowPadding.y;
+        // The microphone lane appears when it is being recorded or any footage carries one.
+        bool mic_lane = cfg.mic || std::any_of(map.spans.begin(), map.spans.end(), [](const Span& s) { return s.coarse.size() > 1; });
+        float lanes_h = ruler_h + 2 * dpi + video_h + (audio_h + 4 * dpi) * (mic_lane ? 2 : 1) + 4 * dpi + style.WindowPadding.y;
         float preview_h = std::max(96 * dpi, ImGui::GetContentRegionAvail().y - lanes_h - below_h - style.ItemSpacing.y);
         std::int64_t hover_ms = 0; bool hover_lane = false, hover_video = false, fading = false; auto tick_ms = steady_ms();
         // Viewport: the frame at the playhead, streaming while playing.
@@ -399,9 +401,10 @@ int run_ui() {
             auto x_of = [&](std::int64_t t) { return track_x + (float)((t - view_start_ms) * px_per_ms); };
             auto t_of = [&](float x) { return view_start_ms + (std::int64_t)((x - track_x) / px_per_ms); };
             float y = origin.y + ruler_h + 2 * dpi;
-            // A microphone lane joins these once a microphone track is recorded.
-            struct Lane { const char* name; float height; } lanes[] = {{"video", video_h}, {"audio", audio_h}};
-            float bottom = y + video_h + (audio_h + 4 * dpi), video_y = y;
+            // Lanes: video, desktop audio, and the microphone when footage has one.
+            struct Lane { const char* name; float height; int track; };
+            std::vector<Lane> lanes{{"video", video_h, -1}, {"audio", audio_h, 0}}; if (mic_lane) lanes.push_back({"mic", audio_h, 1});
+            float bottom = y + video_h + (audio_h + 4 * dpi) * (mic_lane ? 2 : 1), video_y = y;
             const double steps[] = {1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600};
             double step = steps[0]; for (double s : steps) { step = s; if (track_w * s / view_seconds >= 84 * dpi) break; }
             std::int64_t step_ms = (std::int64_t)(step * 1000);
@@ -419,7 +422,7 @@ int run_ui() {
             for (auto& lane : lanes) {
                 draw->AddText(ImVec2(origin.x, y + (lane.height - ImGui::GetTextLineHeight()) / 2), muted_u32, lane.name);
                 draw->AddRectFilled(ImVec2(track_x, y), ImVec2(track_x + track_w, y + lane.height), track_u32);
-                bool audio_lane = lane.name[0] != 'v';
+                bool audio_lane = lane.track >= 0;
                 for (auto& run : runs) {
                     if (run.second < view_start_ms || run.first > view_end_ms) continue;
                     float x0 = std::max(x_of(run.first), track_x), x1 = std::min(x_of(run.second), track_x + track_w);
@@ -445,9 +448,9 @@ int run_ui() {
                     auto height = [&](float v) { return v <= 0 ? 0.f : std::max(1.f, half * std::pow(v / 255.f, .7f)); }; // Mild curve keeps quiet passages visible.
                     for (auto& s : map.spans) {
                         if (s.end_ms < view_start_ms || s.start_ms > view_end_ms) continue;
-                        const AudioLevels* lv = nullptr;
-                        if (fine) if (auto* wave = waves.levels(s.path); wave && !wave->empty()) lv = wave;
-                        if (!lv) { if (s.coarse.empty()) continue; lv = &s.coarse; }
+                        const AudioLevels* lv = nullptr; size_t track = (size_t)lane.track;
+                        if (fine) if (auto* wave = waves.levels(s.path); wave && wave->size() > track && !(*wave)[track].empty()) lv = &(*wave)[track];
+                        if (!lv) { if (s.coarse.size() <= track || s.coarse[track].empty()) continue; lv = &s.coarse[track]; }
                         double bin = lv->bin_ms; size_t count = lv->peak.size();
                         float xa = std::floor(std::max(x_of(s.start_ms), track_x)), xb = std::min(x_of(s.end_ms), track_x + track_w);
                         for (float x = xa; x < xb; x += 1) {
@@ -683,8 +686,13 @@ int run_ui() {
           if (edited && std::isfinite(mbps) && mbps >= 0 && mbps <= 1000) { cfg.share_bitrate = (int)std::round(mbps * 1000); changed = true; } }
         help("Export bitrate.");
         ImGui::SameLine(0, style.ItemInnerSpacing.x); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("Mbps");
-        ImGui::SameLine(0, 12 * dpi); ImGui::Checkbox("Desktop audio", &export_system); help("Include desktop audio in the export. A microphone track is planned.");
         auto sources = have_range ? spans_in_range(map.spans, in_ms, out_ms) : std::vector<Span>{};
+        // The microphone option follows the footage: it is offered when every
+        // segment in the marked range carries a microphone track.
+        bool mic_available = !sources.empty() && std::all_of(sources.begin(), sources.end(), [](const Span& s) { return s.coarse.size() > 1; });
+        ImGui::SameLine(0, 12 * dpi); ImGui::Checkbox("Desktop audio", &export_system); help("Include desktop audio in the export.");
+        ImGui::SameLine(); ImGui::BeginDisabled(!mic_available); ImGui::Checkbox("Microphone", &export_mic); ImGui::EndDisabled();
+        help(mic_available ? "Mix the microphone into the export's audio." : "The marked range has no microphone track. Enable the microphone in Settings to record one.");
         bool closed = have_range && !sources.empty() && out_ms <= map.last_end_ms + 1;
         bool can_export = closed && recorder && !busy && !app.quitting();
         // Watch the recorder's message for results and notices.
@@ -710,7 +718,7 @@ int run_ui() {
         if (pressed && !exporting) {
             try {
                 ExportRequest request; request.start_ms = in_ms; request.end_ms = out_ms; request.height = cfg.export_height; request.fps = cfg.export_fps;
-                request.bitrate_kbps = cfg.share_bitrate; request.codec = cfg.export_codec; request.audio = export_system;
+                request.bitrate_kbps = cfg.share_bitrate; request.codec = cfg.export_codec; request.audio = export_system; request.mic = export_mic && mic_available;
                 write_export_request(app_dir() / "export-request.json", request);
                 PostMessageW(recorder, ExportMessage, 0, 0); error.clear();
             } catch (const std::exception& e) { error = e.what(); }
@@ -811,7 +819,13 @@ int run_ui() {
                 row("Display"); std::string display_label = displays.empty() ? "No monitor" : displays.front().label;
                 for (auto& d : displays) if (d.id == cfg.monitor) display_label = d.label;
                 if (ImGui::BeginCombo("##display", display_label.c_str())) { for (auto& d : displays) if (ImGui::Selectable(d.label.c_str(), d.id == cfg.monitor)) { cfg.monitor = d.id; changed = commit = true; } ImGui::EndCombo(); }
-                row("Audio"); if (ImGui::Checkbox("Desktop", &cfg.audio)) changed = commit = true; help("Records the default playback device. Microphone and per-app filtering are not enabled in this prototype.");
+                row("Audio"); if (ImGui::Checkbox("Desktop", &cfg.audio)) changed = commit = true; help("Records the default playback device as the first audio track.");
+                ImGui::SameLine(0, 12 * dpi); if (ImGui::Checkbox("Microphone", &cfg.mic)) changed = commit = true; help("Records the selected input as a second audio track, shown as its own lane and mixed into exports on request.");
+                if (cfg.mic) {
+                    row("Microphone"); std::string mic_label = "Default microphone";
+                    for (auto& d : microphones) if (d.id == cfg.mic_device) mic_label = d.label;
+                    if (ImGui::BeginCombo("##microphone", mic_label.c_str())) { for (auto& d : microphones) if (ImGui::Selectable(d.label.c_str(), d.id == cfg.mic_device)) { cfg.mic_device = d.id; changed = commit = true; } ImGui::EndCombo(); }
+                }
                 changed |= bitrate_row("Bitrate", cfg.bitrate, commit); changed |= bitrate_row("Max bitrate", cfg.max_bitrate, commit);
                 ImGui::EndTable();
             }

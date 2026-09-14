@@ -71,7 +71,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             // Export [start_ms, end_ms] epoch times with the saved export defaults; the UI writes the same request file.
             auto cfg = clip::Config::load(); clip::ExportRequest request;
             request.start_ms = std::stoll(args[1]); request.end_ms = std::stoll(args[2]);
-            request.height = cfg.export_height; request.fps = cfg.export_fps; request.bitrate_kbps = cfg.share_bitrate; request.codec = cfg.export_codec;
+            request.height = cfg.export_height; request.fps = cfg.export_fps; request.bitrate_kbps = cfg.share_bitrate; request.codec = cfg.export_codec; request.mic = cfg.mic;
             clip::write_export_request(clip::app_dir() / "export-request.json", request);
             auto window = clip::recorder_window(); result = window && PostMessageW(window, clip::ExportMessage, 0, 0) ? 0 : 1;
         } else if (!args.empty() && args[0] == L"--export-test" && args.size() >= 2) {

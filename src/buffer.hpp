@@ -14,7 +14,7 @@ struct Segment {
     std::uintmax_t bytes = 0;
     // The audio peak file from the sidecar. `measured` is false until the
     // track has been analysed; a measured segment with no audio stays empty.
-    AudioLevels audio; bool measured = false;
+    std::vector<AudioLevels> audio; bool measured = false; // One entry per audio track: desktop, then microphone.
     double seconds() const { return (end_ms - start_ms) / 1000.0; }
 };
 // Pure policy functions also exercised with small, synthetic quotas in tests.
@@ -33,7 +33,7 @@ public:
     bool finalize(const fs::path& path);
     // Segments recorded before loudness was stored are measured in the
     // background: the next one to do, and where to put the result.
-    void set_levels(const fs::path& path, AudioLevels levels);
+    void set_levels(const fs::path& path, std::vector<AudioLevels> levels);
     // Apply new retention/budget settings. The storage folder must be unchanged.
     void configure(const Config& config);
     void prune(const std::set<fs::path>& pinned = {});

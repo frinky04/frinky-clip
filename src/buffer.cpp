@@ -83,7 +83,7 @@ bool Buffer::finalize(const fs::path& p) {
     sort();
     return true;
 }
-void Buffer::set_levels(const fs::path& p, AudioLevels levels) {
+void Buffer::set_levels(const fs::path& p, std::vector<AudioLevels> levels) {
     auto it = std::find_if(segments_.begin(), segments_.end(), [&](auto& s) { return s.path == p; });
     if (it == segments_.end()) return;
     it->audio = std::move(levels); it->measured = true;

@@ -14,13 +14,14 @@ void av_check(int code, const char* context); // Throws with the FFmpeg error te
 // rather than on the container duration, which includes the audio tail.
 struct VideoExtent { std::int64_t frames = 0; int fps_num = 60, fps_den = 1; };
 VideoExtent probe_video(const fs::path& path);
-// The audio track's "peak file", as editors keep it: per bin, the peak
+// Each audio track's "peak file", as editors keep it: per bin, the peak
 // sample amplitude and the RMS, both linear with full scale at 255. Peak
-// draws the silhouette; RMS the solid core inside it. Empty when there is
-// no audio. The recorder stores this in each segment's sidecar as hex text.
+// draws the silhouette; RMS the solid core inside it. One entry per audio
+// stream in the file (desktop, then microphone); empty when there is no
+// audio. The recorder stores these in each segment's sidecar as hex text.
 constexpr int AudioBinMs = 20;
 struct AudioLevels { std::vector<std::uint8_t> peak, rms; int bin_ms = AudioBinMs; bool empty() const { return peak.empty(); } };
-AudioLevels audio_levels(const fs::path& path, int bin_ms = AudioBinMs);
+std::vector<AudioLevels> audio_levels(const fs::path& path, int bin_ms = AudioBinMs);
 std::string encode_levels(const std::vector<std::uint8_t>& levels);
 std::vector<std::uint8_t> decode_levels(const std::string& text);
 // The next level of the chain: peak by max, RMS by root mean square, over
@@ -28,9 +29,11 @@ std::vector<std::uint8_t> decode_levels(const std::string& text);
 // buffer draws at once without reading any sidecar.
 constexpr int CoarseBinMs = 250;
 AudioLevels downsample_levels(const AudioLevels& levels, int to_bin_ms);
-// Sidecar and index representation: "audio_peak", "audio_rms" hex text and "audio_bin_ms".
-AudioLevels read_levels(obs_data_t* data);
-void write_levels(obs_data_t* data, const AudioLevels& levels);
+std::vector<AudioLevels> downsample_levels(const std::vector<AudioLevels>& tracks, int to_bin_ms);
+// Sidecar and index representation: "audio_peak", "audio_rms" hex text and
+// "audio_bin_ms" for the first track, "audio2_peak", "audio2_rms" for the second.
+std::vector<AudioLevels> read_levels(obs_data_t* data);
+void write_levels(obs_data_t* data, const std::vector<AudioLevels>& tracks);
 void remux(const std::vector<fs::path>& segments, const fs::path& destination);
 // A D3D11VA decode device shared by decoders. Wrapping the render device lets
 // decoded frames be sampled directly as shader resources; a private device

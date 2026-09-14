@@ -19,9 +19,9 @@ public:
     Waveforms& operator=(const Waveforms&) = delete;
     // Fine levels for a segment, or nullptr until read. The pointer stays
     // valid for the lifetime of this object; an unmeasured segment is empty.
-    const AudioLevels* levels(const fs::path& segment);
+    const std::vector<AudioLevels>* levels(const fs::path& segment);
 private:
-    struct Entry { AudioLevels levels; bool ready = false, queued = false; std::int64_t read_ms = 0; };
+    struct Entry { std::vector<AudioLevels> levels; bool ready = false, queued = false; std::int64_t read_ms = 0; };
     void work();
     std::map<std::wstring, Entry> cache_;
     std::deque<std::wstring> queue_;

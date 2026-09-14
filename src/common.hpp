@@ -38,7 +38,9 @@ struct Config {
     std::string export_codec = "h264"; // or "av1"
     unsigned hotkey = VK_F8;
     unsigned modifiers = MOD_CONTROL | MOD_SHIFT;
-    bool audio = true;
+    bool audio = true;              // Desktop audio.
+    bool mic = false;               // Microphone, as a second audio track.
+    std::string mic_device = "default"; // MMDevice id, or "default".
     bool record_on_launch = true;
     std::string monitor;
     fs::path storage;
@@ -62,5 +64,7 @@ void plain_write(const fs::path& path, const std::string& text); // Atomic renam
 void write_json_fast(const fs::path& path, obs_data_t* value);
 HWND recorder_window();
 struct Monitor { std::string id, label; int width, height; bool primary; };
+struct AudioDevice { std::string id, label; };
+std::vector<AudioDevice> capture_devices(); // Microphones and other inputs, default first.
 std::vector<Monitor> monitors();
 }

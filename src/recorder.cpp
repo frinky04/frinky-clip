@@ -36,9 +36,11 @@ public:
     std::atomic<int> stopped_code{-999};
     obs_source_t* capture = nullptr;
     obs_source_t* audio = nullptr;
+    obs_source_t* mic = nullptr;
     obs_scene_t* scene = nullptr;
     obs_encoder_t* video_encoder = nullptr;
     obs_encoder_t* audio_encoder = nullptr;
+    obs_encoder_t* mic_encoder = nullptr; // Second AAC track, from the microphone mixer.
     obs_output_t* output = nullptr;
     std::string message = "Starting recorder…", last_clip, failure;
     std::future<std::string> worker;
@@ -51,7 +53,7 @@ public:
     size_t indexed_count = (size_t)-1; std::int64_t indexed_end = -1, indexed_at = 0; // Last published segment index.
     // Segments from before loudness was stored are measured one at a time in
     // the background; the index republishes as results arrive.
-    std::vector<std::future<std::vector<std::pair<fs::path, AudioLevels>>>> measuring; std::set<fs::path> measuring_paths; bool levels_changed = false;
+    std::vector<std::future<std::vector<std::pair<fs::path, std::vector<AudioLevels>>>>> measuring; std::set<fs::path> measuring_paths; bool levels_changed = false;
     HWND controls = nullptr; // The tray app's control window, told when status changes.
     // Export progress is shared with the worker; -1 while no export runs.
     std::shared_ptr<std::atomic<double>> export_progress; double export_fraction = -1;
@@ -162,7 +164,7 @@ public:
             obs_data_set_bool(settings.get(), "use_device_timing", true);
             audio = obs_source_create("wasapi_output_capture", "Desktop audio", settings.get(), nullptr);
             if (!audio) throw std::runtime_error("Desktop audio capture creation failed");
-            obs_set_output_source(1, audio);
+            obs_source_set_audio_mixers(audio, 1); obs_set_output_source(1, audio); // Desktop audio feeds track 1 only.
         }
         // ffmpeg_muxer requires an audio encoder. With desktop capture disabled,
         // OBS supplies silence; no microphone or application audio is captured.
@@ -170,6 +172,19 @@ public:
         audio_encoder = obs_audio_encoder_create("ffmpeg_aac", "AAC", settings.get(), 0, nullptr);
         if (!audio_encoder) throw std::runtime_error("AAC encoder unavailable");
         obs_encoder_set_audio(audio_encoder, obs_get_audio());
+        if (cfg.mic && !synthetic) {
+            // The microphone is its own source on mixer 2, encoded as a second
+            // track, so the editor can show it as a lane and the export can
+            // include or leave it out per clip.
+            settings = data(); obs_data_set_string(settings.get(), "device_id", cfg.mic_device.c_str());
+            mic = obs_source_create("wasapi_input_capture", "Microphone", settings.get(), nullptr);
+            if (!mic) throw std::runtime_error("Microphone capture creation failed. Check the selected device.");
+            obs_source_set_audio_mixers(mic, 2); obs_set_output_source(2, mic);
+            settings = data(); obs_data_set_int(settings.get(), "bitrate", 128);
+            mic_encoder = obs_audio_encoder_create("ffmpeg_aac", "AAC microphone", settings.get(), 1, nullptr);
+            if (!mic_encoder) throw std::runtime_error("AAC encoder unavailable for the microphone");
+            obs_encoder_set_audio(mic_encoder, obs_get_audio());
+        }
         settings = data(); obs_data_set_string(settings.get(), "rate_control", "vbr");
         obs_data_set_int(settings.get(), "bitrate", cfg.bitrate); obs_data_set_int(settings.get(), "max_bitrate", cfg.max_bitrate);
         // A keyframe every second: a seek decodes at most a second of frames
@@ -190,6 +205,7 @@ public:
         output = obs_output_create("ffmpeg_muxer", "Disk buffer", settings.get(), nullptr);
         if (!output) throw std::runtime_error("Recording output unavailable");
         obs_output_set_video_encoder(output, video_encoder); if (audio_encoder) obs_output_set_audio_encoder(output, audio_encoder, 0);
+        if (mic_encoder) obs_output_set_audio_encoder(output, mic_encoder, 1);
         auto* signals = obs_output_get_signal_handler(output);
         // Callbacks run on OBS threads: record the event, then wake the message
         // loop so the tick runs now rather than at the next 250 ms timer.
@@ -219,12 +235,14 @@ public:
             if (obs_output_active(output)) obs_output_force_stop(output);
             obs_output_release(output); output = nullptr;
         }
-        obs_set_output_source(0, nullptr); obs_set_output_source(1, nullptr);
+        obs_set_output_source(0, nullptr); obs_set_output_source(1, nullptr); obs_set_output_source(2, nullptr);
         if (scene) { obs_scene_release(scene); scene = nullptr; }
         if (capture) { obs_source_release(capture); capture = nullptr; }
         if (audio) { obs_source_release(audio); audio = nullptr; }
+        if (mic) { obs_source_release(mic); mic = nullptr; }
         if (video_encoder) { obs_encoder_release(video_encoder); video_encoder = nullptr; }
         if (audio_encoder) { obs_encoder_release(audio_encoder); audio_encoder = nullptr; }
+        if (mic_encoder) { obs_encoder_release(mic_encoder); mic_encoder = nullptr; }
         // Destroying the capture source stops desktop duplication, so an idle
         // recorder only renders an empty canvas.
         while (obs_wait_for_destroy_queue()) {}
@@ -432,8 +450,8 @@ public:
             if (batch.empty()) break;
             for (auto& path : batch) measuring_paths.insert(path);
             measuring.push_back(std::async(std::launch::async, [batch] {
-                std::vector<std::pair<fs::path, AudioLevels>> results;
-                for (auto& path : batch) { AudioLevels levels; try { levels = audio_levels(path); } catch (...) {} results.emplace_back(path, std::move(levels)); }
+                std::vector<std::pair<fs::path, std::vector<AudioLevels>>> results;
+                for (auto& path : batch) { std::vector<AudioLevels> levels; try { levels = audio_levels(path); } catch (...) {} results.emplace_back(path, std::move(levels)); }
                 return results;
             }));
         }

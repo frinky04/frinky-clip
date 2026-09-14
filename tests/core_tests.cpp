@@ -58,10 +58,10 @@ int main() {
         require(spans_in_range(spans, 5000, 5500).size() == 1 && spans_in_range(spans, 5000, 5500)[0].path == "a2", "Touching end excludes the earlier segment");
         require(spans_in_range(spans, 8000, 21000).empty(), "Range across sessions is rejected");
         require(spans_in_range(spans, 10000, 15000).empty(), "Range in a gap has no footage");
-        ExportRequest request; request.start_ms = 3250; request.end_ms = 7000; request.height = 720; request.fps = 30; request.bitrate_kbps = 8000; request.codec = "av1";
+        ExportRequest request; request.start_ms = 3250; request.end_ms = 7000; request.height = 720; request.fps = 30; request.bitrate_kbps = 8000; request.codec = "av1"; request.mic = true;
         auto round_trip_dir = fs::temp_directory_path() / ("FrinkyClipExport-" + unique_id());
         write_export_request(round_trip_dir / "r.json", request); auto back = read_export_request(round_trip_dir / "r.json");
-        require(back.start_ms == 3250 && back.end_ms == 7000 && back.height == 720 && back.fps == 30 && back.codec == "av1" && back.audio, "Export request round trip");
+        require(back.start_ms == 3250 && back.end_ms == 7000 && back.height == 720 && back.fps == 30 && back.codec == "av1" && back.audio && back.mic, "Export request round trip");
         fs::remove_all(round_trip_dir);
         auto index_dir = fs::temp_directory_path() / ("FrinkyClipIndex-" + unique_id());
         BufferMap published; published.spans = {{"C:/b/session-a/s1.mkv", "session-a", 1000, 5000}, {"C:/b/session-a/s2.mkv", "session-a", 5000, 9000}}; published.last_end_ms = 9000;
