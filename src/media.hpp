@@ -1,6 +1,7 @@
 #pragma once
 #include "common.hpp"
 #include <memory>
+#include <functional>
 extern "C" {
 #include <libavutil/pixfmt.h>
 }
@@ -70,9 +71,9 @@ public:
     ~Decoder();
     Decoder(const Decoder&) = delete;
     Decoder& operator=(const Decoder&) = delete;
-    Frame decode(const fs::path& path, std::int64_t offset_ms, int width, bool keyframe_only);
+    Frame decode(const fs::path& path, std::int64_t offset_ms, int width, bool keyframe_only, const std::function<bool()>& cancelled = {});
 private:
     struct State; State* s_;
-    friend Frame decode_with(State*, const fs::path&, std::int64_t, int, bool);
+    friend Frame decode_with(State*, const fs::path&, std::int64_t, int, bool, const std::function<bool()>&);
 };
 }

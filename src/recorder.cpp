@@ -51,8 +51,8 @@ public:
     // refreshed. An export additionally hard-links its sources.
     std::int64_t pin_start = 0, pin_end = 0, pin_at = 0;
     size_t indexed_count = (size_t)-1; std::int64_t indexed_end = -1, indexed_at = 0; // Last published segment index.
-    // Segments from before loudness was stored are measured one at a time in
-    // the background; the index republishes as results arrive.
+    // Closed footage is published before its background audio measurement;
+    // the index republishes as results arrive.
     std::vector<std::future<std::vector<std::pair<fs::path, std::vector<AudioLevels>>>>> measuring; std::set<fs::path> measuring_paths; bool levels_changed = false;
     HWND controls = nullptr; // The tray app's control window, told when status changes.
     // Export progress is shared with the worker; -1 while no export runs.
@@ -436,16 +436,17 @@ public:
             shutdown_core(); status(); PostQuitMessage(exit_code); return;
         }
         if (now_ms() - last_status >= 1000) status();
-        // Peak files for segments that have none: several batches in flight,
-        // newest first, so a two-hour backlog fills in seconds rather than minutes.
+        // Give recording/export priority over a waveform backlog. Small batches
+        // also let newly closed footage take priority over old unmeasured files.
         for (auto it = measuring.begin(); it != measuring.end();) {
             if (it->wait_for(std::chrono::seconds(0)) != std::future_status::ready) { ++it; continue; }
             try { for (auto& [path, levels] : it->get()) { buffer.set_levels(path, std::move(levels)); measuring_paths.erase(path); } } catch (...) {}
             levels_changed = true; it = measuring.erase(it);
         }
-        while (measuring.size() < 4) {
+        const size_t measurement_workers = recording() || worker.valid() ? 1 : 2;
+        while (!exiting && measuring.size() < measurement_workers) {
             std::vector<fs::path> batch;
-            for (auto it = buffer.segments().rbegin(); it != buffer.segments().rend() && batch.size() < 8; ++it)
+            for (auto it = buffer.segments().rbegin(); it != buffer.segments().rend() && batch.size() < 2; ++it)
                 if (!it->measured && !measuring_paths.contains(it->path)) batch.push_back(it->path);
             if (batch.empty()) break;
             for (auto& path : batch) measuring_paths.insert(path);

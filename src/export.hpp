@@ -9,7 +9,7 @@ namespace clip {
 // chosen by their timeline time, so the cut is frame-accurate and audio is
 // trimmed to the sample. `progress`, when given, receives 0..1. Throws on
 // failure; the output is verified and published atomically.
-struct ExportResult { std::string video_encoder, decoder; std::int64_t frames = 0; };
+struct ExportResult { std::string video_encoder, decoder; std::int64_t frames = 0; bool gpu_input = false; /* Actual D3D11 input to NVENC. */ };
 ExportResult export_clip(const std::vector<Span>& sources, const ExportRequest& request, const fs::path& output, std::atomic<double>* progress = nullptr);
 // Headless check: export a short range across a segment seam from a buffer
 // folder with each codec and frame rate, verify duration and frame count, and

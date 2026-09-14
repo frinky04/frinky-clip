@@ -23,6 +23,11 @@ extern "C" {
 namespace clip {
 namespace {
 constexpr std::int64_t Million = 1000000;
+// Pinned DXVA reserves at most 17 reference/work surfaces. These 32 extra
+// slots keep the single decoder array below its 64-slice driver limit while
+// covering NVENC's 16-frame output delay plus reordering and the current frame.
+constexpr int GpuInputExtraFrames = 32;
+constexpr int GpuInputDelay = 16;
 template <class T, void (*Free)(T**)> struct Owned {
     T* value = nullptr;
     Owned() = default; explicit Owned(T* v) : value(v) {}
@@ -42,6 +47,7 @@ using Fifo = Owned<AVAudioFifo, free_fifo>;
 using Resampler = Owned<SwrContext, swr_free>;
 using Scaler = Owned<SwsContext, free_scaler>;
 using Format = Owned<AVFormatContext, avformat_close_input>;
+struct HwInputFailure {};
 struct HwFailure {};
 
 bool supports(const AVCodecContext* ctx, const AVCodec* codec, AVPixelFormat wanted) {
@@ -52,26 +58,38 @@ bool supports(const AVCodecContext* ctx, const AVCodec* codec, AVPixelFormat wan
 }
 // Open the first usable video encoder for the request. NVENC first; H.264
 // additionally has a software fallback so an export never depends on the GPU.
-AVCodecContext* open_video_encoder(const ExportRequest& r, int src_w, int src_h, std::string& name_out) {
+AVCodecContext* open_video_encoder(const ExportRequest& r, int src_w, int src_h, std::string& name_out, AVFrame* input) {
     int height = r.height & ~1, width = ((int)std::lround((double)src_w * height / std::max(1, src_h)) + 1) & ~1;
     std::vector<const char*> names = r.codec == "av1" ? std::vector<const char*>{"av1_nvenc"} : std::vector<const char*>{"h264_nvenc", "libx264"};
     std::string errors;
     for (auto name : names) {
         const AVCodec* codec = avcodec_find_encoder_by_name(name);
         if (!codec) { errors += std::string(name) + " missing; "; continue; }
-        CodecContext ctx(avcodec_alloc_context3(codec)); if (!ctx) throw std::bad_alloc();
-        ctx->width = width; ctx->height = height; ctx->time_base = {1, r.fps}; ctx->framerate = {r.fps, 1};
-        ctx->pix_fmt = supports(ctx, codec, AV_PIX_FMT_NV12) ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
-        ctx->bit_rate = (std::int64_t)r.bitrate_kbps * 1000; ctx->rc_max_rate = ctx->bit_rate * 3 / 2; ctx->rc_buffer_size = (int)std::min<std::int64_t>(ctx->bit_rate * 2, INT32_MAX);
-        ctx->gop_size = r.fps * 2; ctx->color_range = AVCOL_RANGE_MPEG; ctx->colorspace = AVCOL_SPC_BT709;
-        ctx->color_primaries = AVCOL_PRI_BT709; ctx->color_trc = AVCOL_TRC_BT709; ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-        AVDictionary* options = nullptr;
-        if (std::strstr(name, "nvenc")) { av_dict_set(&options, "preset", "p5", 0); av_dict_set(&options, "rc", "vbr", 0); }
-        else { av_dict_set(&options, "preset", "fast", 0); ctx->thread_count = 0; }
-        if (r.codec != "av1") av_dict_set(&options, "profile", "high", 0);
-        int result = avcodec_open2(ctx, codec, &options); av_dict_free(&options);
-        if (result < 0) { char text[AV_ERROR_MAX_STRING_SIZE]; av_strerror(result, text, sizeof(text)); errors += std::string(name) + ": " + text + "; "; continue; }
-        name_out = name; auto* raw = ctx.value; ctx.value = nullptr; return raw;
+        auto* pool = input && input->hw_frames_ctx ? reinterpret_cast<AVHWFramesContext*>(input->hw_frames_ctx->data) : nullptr;
+        bool gpu = std::strstr(name, "nvenc") && input && input->format == AV_PIX_FMT_D3D11 &&
+            input->width == width && input->height == height && pool && pool->format == AV_PIX_FMT_D3D11 && pool->sw_format == AV_PIX_FMT_NV12;
+        for (int attempt = gpu ? 0 : 1; attempt < 2; ++attempt) {
+            CodecContext ctx(avcodec_alloc_context3(codec)); if (!ctx) throw std::bad_alloc();
+            ctx->width = width; ctx->height = height; ctx->time_base = {1, r.fps}; ctx->framerate = {r.fps, 1};
+            ctx->pix_fmt = supports(ctx, codec, AV_PIX_FMT_NV12) ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
+            if (attempt == 0) {
+                ctx->pix_fmt = AV_PIX_FMT_D3D11;
+                ctx->hw_frames_ctx = av_buffer_ref(input->hw_frames_ctx);
+                ctx->hw_device_ctx = av_buffer_ref(pool->device_ref);
+                if (!ctx->hw_frames_ctx || !ctx->hw_device_ctx) throw std::bad_alloc();
+            }
+            ctx->bit_rate = (std::int64_t)r.bitrate_kbps * 1000; ctx->rc_max_rate = ctx->bit_rate * 3 / 2; ctx->rc_buffer_size = (int)std::min<std::int64_t>(ctx->bit_rate * 2, INT32_MAX);
+            ctx->gop_size = r.fps * 2; ctx->color_range = AVCOL_RANGE_MPEG; ctx->colorspace = AVCOL_SPC_BT709;
+            ctx->color_primaries = AVCOL_PRI_BT709; ctx->color_trc = AVCOL_TRC_BT709; ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            AVDictionary* options = nullptr;
+            if (std::strstr(name, "nvenc")) { av_dict_set(&options, "preset", "p5", 0); av_dict_set(&options, "rc", "vbr", 0); }
+            else { av_dict_set(&options, "preset", "fast", 0); ctx->thread_count = 0; }
+            if (attempt == 0) av_dict_set_int(&options, "delay", GpuInputDelay, 0);
+            if (r.codec != "av1") av_dict_set(&options, "profile", "high", 0);
+            int result = avcodec_open2(ctx, codec, &options); av_dict_free(&options);
+            if (result < 0) { char text[AV_ERROR_MAX_STRING_SIZE]; av_strerror(result, text, sizeof(text)); errors += std::string(name) + ": " + text + "; "; continue; }
+            name_out = name; auto* raw = ctx.value; ctx.value = nullptr; return raw;
+        }
     }
     throw std::runtime_error("No usable video encoder (" + errors + "). Check the NVIDIA driver.");
 }
@@ -97,6 +115,7 @@ struct Exporter {
     const ExportRequest& r; std::shared_ptr<HwDevice> hw; std::atomic<double>* progress;
     std::int64_t in_us, out_us, total_frames, total_samples = 0;
     AVFormatContext* out = nullptr; AVStream* vstream = nullptr; AVStream* astream = nullptr;
+    bool force_cpu_input = false;
     CodecContext venc, aenc; Packet packet{av_packet_alloc()}; Frame decoded{av_frame_alloc()}, cpu{av_frame_alloc()}, scaled{av_frame_alloc()}, audio_frame{av_frame_alloc()};
     Scaler sws; int sws_src_w = 0, sws_src_h = 0, sws_fmt = -1;
     // Requested audio tracks by stream ordinal (0 desktop, 1 microphone). Each
@@ -123,23 +142,31 @@ struct Exporter {
         }
     }
     void encode_video(AVFrame* frame) {
-        // The encoder's input is NV12 or YUV420P at the export size; convert
-        // whatever the decoder produced.
         AVFrame* picture = frame;
-        if (frame->format == AV_PIX_FMT_D3D11) { av_frame_unref(cpu); av_check(av_hwframe_transfer_data(cpu, frame, 0), "Download decoded frame"); picture = cpu; }
-        if (picture->width != venc->width || picture->height != venc->height || picture->format != venc->pix_fmt) {
-            if (!sws || sws_src_w != picture->width || sws_src_h != picture->height || sws_fmt != picture->format) {
-                sws.reset(sws_getContext(picture->width, picture->height, (AVPixelFormat)picture->format, venc->width, venc->height, venc->pix_fmt, SWS_BICUBIC, nullptr, nullptr, nullptr));
-                if (!sws) throw std::runtime_error("Cannot scale decoded frame");
-                sws_src_w = picture->width; sws_src_h = picture->height; sws_fmt = picture->format;
+        if (venc->pix_fmt == AV_PIX_FMT_D3D11) {
+            auto* pool = frame->hw_frames_ctx ? reinterpret_cast<AVHWFramesContext*>(frame->hw_frames_ctx->data) : nullptr;
+            auto* initial = reinterpret_cast<AVHWFramesContext*>(venc->hw_frames_ctx->data);
+            if (frame->format != AV_PIX_FMT_D3D11 || frame->width != venc->width || frame->height != venc->height ||
+                !pool || pool != initial || pool->sw_format != AV_PIX_FMT_NV12) throw HwInputFailure{};
+        } else {
+            // Scaling and software encoders keep the existing CPU input path.
+            if (frame->format == AV_PIX_FMT_D3D11) { av_frame_unref(cpu); av_check(av_hwframe_transfer_data(cpu, frame, 0), "Download decoded frame"); picture = cpu; }
+            if (picture->width != venc->width || picture->height != venc->height || picture->format != venc->pix_fmt) {
+                if (!sws || sws_src_w != picture->width || sws_src_h != picture->height || sws_fmt != picture->format) {
+                    sws.reset(sws_getContext(picture->width, picture->height, (AVPixelFormat)picture->format, venc->width, venc->height, venc->pix_fmt, SWS_BICUBIC, nullptr, nullptr, nullptr));
+                    if (!sws) throw std::runtime_error("Cannot scale decoded frame");
+                    sws_src_w = picture->width; sws_src_h = picture->height; sws_fmt = picture->format;
+                }
+                if (!scaled->data[0]) { scaled->width = venc->width; scaled->height = venc->height; scaled->format = venc->pix_fmt; av_check(av_frame_get_buffer(scaled, 32), "Allocate frame"); }
+                av_check(av_frame_make_writable(scaled), "Prepare frame");
+                sws_scale(sws, picture->data, picture->linesize, 0, picture->height, scaled->data, scaled->linesize);
+                picture = scaled;
             }
-            if (!scaled->data[0]) { scaled->width = venc->width; scaled->height = venc->height; scaled->format = venc->pix_fmt; av_check(av_frame_get_buffer(scaled, 32), "Allocate frame"); }
-            av_check(av_frame_make_writable(scaled), "Prepare frame");
-            sws_scale(sws, picture->data, picture->linesize, 0, picture->height, scaled->data, scaled->linesize);
-            picture = scaled;
         }
         picture->pts = frames_out; picture->color_range = AVCOL_RANGE_MPEG;
-        av_check(avcodec_send_frame(venc, picture), "Encode video"); write(venc, vstream);
+        int sent = avcodec_send_frame(venc, picture);
+        if (sent < 0 && venc->pix_fmt == AV_PIX_FMT_D3D11) throw HwInputFailure{};
+        av_check(sent, "Encode video"); write(venc, vstream);
         if (progress) *progress = std::clamp((double)++frames_out / (double)total_frames, 0.0, 1.0);
         else ++frames_out;
         if (frames_out >= total_frames) video_done = true;
@@ -218,7 +245,7 @@ struct Exporter {
         mix_encode(src, false);
     }
     void open(Source& src, const Span& span, bool hardware) {
-        src.fmt.reset(); src.video.reset(); src.audio.clear(); src.vindex = -1;
+        src.fmt.reset(); src.audio.clear(); src.vindex = -1;
         AVFormatContext* fmt = nullptr;
         if (!open_without_probe(&fmt, span.path)) throw std::runtime_error("Cannot open " + path_text(span.path));
         src.fmt.reset(fmt); src.span = span;
@@ -230,13 +257,28 @@ struct Exporter {
         }
         if (src.vindex < 0) throw std::runtime_error("No video stream: " + path_text(span.path));
         auto* vpar = fmt->streams[src.vindex]->codecpar;
-        src.hardware = hardware && hw != nullptr;
+        bool use_hw = hardware && hw != nullptr;
+        bool reuse = src.video && src.hardware == use_hw && src.video->codec_id == vpar->codec_id &&
+            src.video->width == vpar->width && src.video->height == vpar->height &&
+            src.video->extradata_size == vpar->extradata_size &&
+            (!vpar->extradata_size || std::memcmp(src.video->extradata, vpar->extradata, vpar->extradata_size) == 0);
+        if (!reuse && venc && venc->pix_fmt == AV_PIX_FMT_D3D11) throw HwInputFailure{};
+        src.hardware = use_hw;
         const AVCodec* vcodec = pick_decoder(vpar->codec_id, src.hardware);
         if (!vcodec) throw std::runtime_error("No decoder for the recording's video codec");
-        src.video.reset(avcodec_alloc_context3(vcodec)); av_check(avcodec_parameters_to_context(src.video, vpar), "Configure decoder");
-        src.video->thread_count = src.hardware ? 1 : 0;
-        if (src.hardware) { src.binding = {hw, false, 8}; src.video->opaque = &src.binding; src.video->get_format = hw_get_format; }
-        av_check(avcodec_open2(src.video, vcodec, nullptr), "Open decoder");
+        // Matching segments reuse the decoder and its texture pool. NVENC's
+        // pool reference stays valid without retaining one pool per segment.
+        if (reuse) avcodec_flush_buffers(src.video);
+        else {
+            src.video.reset(avcodec_alloc_context3(vcodec)); av_check(avcodec_parameters_to_context(src.video, vpar), "Configure decoder");
+            src.video->thread_count = src.hardware ? 1 : 0;
+            if (src.hardware) {
+                bool same_size = (r.height & ~1) == vpar->height && !(vpar->width & 1);
+                src.binding = {hw, false, !force_cpu_input && same_size ? GpuInputExtraFrames : 8};
+                src.video->opaque = &src.binding; src.video->get_format = hw_get_format;
+            }
+            av_check(avcodec_open2(src.video, vcodec, nullptr), "Open decoder");
+        }
         decoder_name = std::string(vcodec->name) + (src.hardware ? " (D3D11VA)" : " (software)");
         src.audio.resize(tracks.size());
         for (size_t k = 0; k < tracks.size(); ++k) {
@@ -252,9 +294,9 @@ struct Exporter {
             dec.swr.reset(swr); dec.index = audio_streams[ordinal];
         }
     }
-    void begin_output(int src_w, int src_h) {
+    void begin_output(AVFrame* frame) {
         av_check(avformat_alloc_output_context2(&out, nullptr, "mp4", path_text(temp_path).c_str()), "Create clip");
-        venc.reset(open_video_encoder(r, src_w, src_h, encoder_name));
+        venc.reset(open_video_encoder(r, frame->width, frame->height, encoder_name, force_cpu_input ? nullptr : frame));
         vstream = avformat_new_stream(out, nullptr); if (!vstream) throw std::bad_alloc();
         av_check(avcodec_parameters_from_context(vstream->codecpar, venc), "Describe video"); vstream->time_base = venc->time_base; vstream->avg_frame_rate = venc->framerate;
         if (aenc) {
@@ -276,16 +318,24 @@ struct Exporter {
             std::int64_t pts = f->best_effort_timestamp == AV_NOPTS_VALUE ? f->pts : f->best_effort_timestamp;
             if (pts == AV_NOPTS_VALUE) return;
             std::int64_t t = src.span.start_ms * 1000 + av_rescale_q(pts, vstream_in->time_base, AVRational{1, Million});
-            if (!out) begin_output(f->width, f->height);
+            if (!out) begin_output(f);
             // Emit this picture for every output slot it covers; a source
             // frame ahead of the next slot is dropped (60 to 30 fps).
             while (!video_done && due_us(frames_out) <= t + 1000) encode_video(f);
+        };
+        auto check_decode = [&](int result, const char* message) {
+            // Pool exhaustion can occur after successful frames when NVENC is
+            // holding decoder slices. Retry once through CPU input; corrupted
+            // packets and other decode errors keep their normal failure path.
+            if (result == AVERROR(ENOMEM) && venc && venc->pix_fmt == AV_PIX_FMT_D3D11) throw HwInputFailure{};
+            if (src.hardware && !frames_seen) throw HwFailure{};
+            av_check(result, message);
         };
         auto drain_video = [&] {
             while (true) {
                 int result = avcodec_receive_frame(src.video, decoded);
                 if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) return;
-                if (result < 0) { if (src.hardware && !frames_seen) throw HwFailure{}; av_check(result, "Decode"); }
+                if (result < 0) check_decode(result, "Decode");
                 video_frame(decoded); av_frame_unref(decoded);
             }
         };
@@ -304,13 +354,16 @@ struct Exporter {
             if (result < 0) {
                 if (result != AVERROR_EOF) av_check(result, "Read segment");
                 if (eof) break;
-                eof = true; avcodec_send_packet(src.video, nullptr); drain_video();
+                eof = true;
+                int sent = avcodec_send_packet(src.video, nullptr);
+                if (sent < 0 && sent != AVERROR(EAGAIN) && sent != AVERROR_EOF) check_decode(sent, "Drain decoder");
+                drain_video();
                 for (size_t k = 0; k < src.audio.size(); ++k) if (src.audio[k].ctx) { avcodec_send_packet(src.audio[k].ctx, nullptr); drain_audio(k); }
                 break;
             }
             if (packet->stream_index == src.vindex) {
                 int sent = avcodec_send_packet(src.video, packet); av_packet_unref(packet);
-                if (sent < 0 && sent != AVERROR(EAGAIN)) { if (src.hardware && !frames_seen) throw HwFailure{}; av_check(sent, "Decode video"); }
+                if (sent < 0 && sent != AVERROR(EAGAIN)) check_decode(sent, "Decode video");
                 drain_video();
             } else {
                 bool used = false;
@@ -329,7 +382,7 @@ struct Exporter {
 };
 }
 
-ExportResult export_clip(const std::vector<Span>& sources, const ExportRequest& request, const fs::path& output, std::atomic<double>* progress) {
+static ExportResult export_clip_impl(const std::vector<Span>& sources, const ExportRequest& request, const fs::path& output, std::atomic<double>* progress, bool force_cpu_input) {
     if (sources.empty()) throw std::runtime_error("No footage in the marked range");
     if (request.end_ms - request.start_ms < 100) throw std::runtime_error("Mark a range of at least 0.1 s.");
     if (request.fps <= 0 || request.height <= 0 || request.bitrate_kbps <= 0) throw std::runtime_error("Invalid export settings");
@@ -337,10 +390,11 @@ ExportResult export_clip(const std::vector<Span>& sources, const ExportRequest& 
     fs::path temp = output; temp += L".partial";
     auto hw = hw_device(nullptr);
     ExportResult result;
-    for (bool hardware : {true, false}) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        bool hardware = attempt < 2;
         if (hardware && !hw) continue;
         std::error_code ec; fs::remove(temp, ec);
-        Exporter exporter(request, progress); exporter.hw = hw; exporter.temp_path = temp;
+        Exporter exporter(request, progress); exporter.hw = hw; exporter.temp_path = temp; exporter.force_cpu_input = force_cpu_input || attempt > 0;
         try {
             Source src;
             for (auto& span : sources) {
@@ -349,12 +403,15 @@ ExportResult export_clip(const std::vector<Span>& sources, const ExportRequest& 
                 if (!exporter.run_source(src)) break;
             }
             exporter.finish(src);
-            result.video_encoder = exporter.encoder_name; result.decoder = exporter.decoder_name; result.frames = exporter.frames_out;
+            result.video_encoder = exporter.encoder_name; result.decoder = exporter.decoder_name; result.frames = exporter.frames_out; result.gpu_input = exporter.venc->pix_fmt == AV_PIX_FMT_D3D11;
             break;
+        } catch (const HwInputFailure&) {
+            if (attempt != 0 || force_cpu_input) throw std::runtime_error("Cannot submit hardware frames to the encoder");
+            continue; // Redo the whole temporary output using CPU encoder input.
         } catch (const HwFailure&) {
             // The device cannot decode this stream: redo the export in software.
             if (!hardware) throw std::runtime_error("Cannot decode the recording");
-            continue;
+            attempt = 1; continue;
         }
     }
     inspect_media(temp);
@@ -364,32 +421,57 @@ ExportResult export_clip(const std::vector<Span>& sources, const ExportRequest& 
     return result;
 }
 
+ExportResult export_clip(const std::vector<Span>& sources, const ExportRequest& request, const fs::path& output, std::atomic<double>* progress) {
+    return export_clip_impl(sources, request, output, progress, false);
+}
+
 int export_test(const fs::path& buffer_root, int seconds) {
     std::string report; int failures = 0;
     auto map = scan_buffer(buffer_root);
     report += "segments: " + std::to_string(map.spans.size()) + "\n";
-    // The range straddles the last exact seam so both segment hand-off and
-    // in-segment trimming are exercised.
-    size_t seam = map.spans.size();
-    for (size_t i = map.spans.size(); i > 1; --i) if (map.spans[i - 1].start_ms == map.spans[i - 2].end_ms) { seam = i - 1; break; }
-    if (seam >= map.spans.size()) { atomic_write(app_dir() / "export-test.txt", report + "No contiguous segment pair\n"); return 1; }
-    ExportRequest request; request.start_ms = map.spans[seam].start_ms - 1500; request.end_ms = request.start_ms + seconds * 1000;
-    request.height = 720; request.bitrate_kbps = 8000; request.mic = map.spans[seam].coarse.size() > 1;
-    for (const char* codec : {"h264", "av1"}) for (int fps : {60, 30}) {
-        request.codec = codec; request.fps = fps;
-        auto sources = spans_in_range(map.spans, request.start_ms, request.end_ms);
-        auto output = app_dir() / ("export-test-" + std::string(codec) + "-" + std::to_string(fps) + ".mp4");
-        auto began = now_ms();
+    if (map.spans.empty()) { atomic_write(app_dir() / "export-test.txt", report + "No closed segments\n"); return 1; }
+    // Prefer a seam, but a single short segment is also a useful input.
+    size_t seam = map.spans.size() - 1;
+    for (size_t i = map.spans.size(); i > 1; --i)
+        if (map.spans[i - 1].start_ms == map.spans[i - 2].end_ms && map.spans[i - 1].session == map.spans[i - 2].session) { seam = i - 1; break; }
+    bool pair = seam > 0 && map.spans[seam].start_ms == map.spans[seam - 1].end_ms && map.spans[seam].session == map.spans[seam - 1].session;
+    ExportRequest request;
+    request.start_ms = pair ? std::max(map.spans[seam - 1].start_ms, map.spans[seam].start_ms - 1500) : map.spans[seam].start_ms;
+    auto available_end = map.spans[seam].end_ms;
+    for (size_t i = seam + 1; i < map.spans.size() && map.spans[i].start_ms == available_end &&
+        map.spans[i].session == map.spans[seam].session; ++i) available_end = map.spans[i].end_ms;
+    request.end_ms = std::min(available_end, request.start_ms + std::max<std::int64_t>(100, (std::int64_t)seconds * 1000));
+    if (request.end_ms - request.start_ms < 100) { atomic_write(app_dir() / "export-test.txt", report + "Less than 100 ms available\n"); return 1; }
+    auto sources = spans_in_range(map.spans, request.start_ms, request.end_ms);
+    if (sources.empty()) { atomic_write(app_dir() / "export-test.txt", report + "No contiguous footage in test range\n"); return 1; }
+    MediaInfo source_info;
+    try { source_info = inspect_media(sources.front().path); }
+    catch (const std::exception& e) { atomic_write(app_dir() / "export-test.txt", report + e.what() + "\n"); return 1; }
+    request.bitrate_kbps = 8000; request.mic = map.spans[seam].coarse.size() > 1;
+    double duration = (request.end_ms - request.start_ms) / 1000.0;
+    auto run = [&](const char* codec, int fps, int height, bool force_cpu, const std::string& label) {
+        request.codec = codec; request.fps = fps; request.height = height;
+        auto output = app_dir() / ("export-test-" + label + ".mp4");
+        auto began = steady_ms();
         try {
-            auto result = export_clip(sources, request, output);
+            auto result = export_clip_impl(sources, request, output, nullptr, force_cpu);
             auto info = inspect_media(output); auto video = probe_video(output);
-            std::int64_t expected = (std::int64_t)seconds * fps;
-            bool ok = std::abs(info.seconds - seconds) < 0.06 && video.frames == expected && info.height == 720 && info.audio;
-            report += std::string(codec) + " " + std::to_string(fps) + " fps: " + std::to_string(now_ms() - began) + " ms, " + std::to_string(video.frames) + "/" +
+            std::int64_t expected = (request.end_ms - request.start_ms) * fps / 1000;
+            int expected_height = height & ~1;
+            int expected_width = ((int)std::lround((double)source_info.width * expected_height / std::max(1, source_info.height)) + 1) & ~1;
+            bool ok = std::abs(info.seconds - duration) < 0.06 && video.frames == expected && result.frames == expected &&
+                info.height == expected_height && info.width == expected_width && info.audio == source_info.audio && (!force_cpu || !result.gpu_input);
+            report += label + ": " + std::to_string(steady_ms() - began) + " ms, " + std::to_string(video.frames) + "/" +
                 std::to_string(expected) + " frames, " + std::to_string(info.seconds) + " s, " + std::to_string(info.width) + "x" + std::to_string(info.height) +
-                ", audio " + (info.audio ? "yes" : "no") + (request.mic ? " (with microphone)" : "") + ", " + result.video_encoder + " from " + result.decoder + (ok ? "" : "  MISMATCH") + "\n";
+                ", audio " + (info.audio ? "yes" : "no") + (request.mic ? " (with microphone)" : "") + ", " + result.video_encoder + " from " + result.decoder +
+                ", GPU input " + (result.gpu_input ? "active" : force_cpu ? "forced off" : "inactive/fallback") + (ok ? "" : "  MISMATCH") + "\n";
             if (!ok) ++failures;
-        } catch (const std::exception& e) { report += std::string(codec) + " " + std::to_string(fps) + " fps failed: " + e.what() + "\n"; ++failures; }
+        } catch (const std::exception& e) { report += label + " failed: " + e.what() + "\n"; ++failures; }
+    };
+    for (const char* codec : {"h264", "av1"}) {
+        for (int fps : {60, 30}) run(codec, fps, 720, false, std::string(codec) + "-" + std::to_string(fps));
+        run(codec, 60, source_info.height, false, std::string(codec) + "-same-60-gpu");
+        run(codec, 60, source_info.height, true, std::string(codec) + "-same-60-cpu");
     }
     report += failures ? "FAIL\n" : "PASS\n";
     atomic_write(app_dir() / "export-test.txt", report);

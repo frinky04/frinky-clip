@@ -1,5 +1,6 @@
 #include "buffer.hpp"
 #include "timeline.hpp"
+#include "waveform.hpp"
 #include <shellapi.h>
 #include <iostream>
 #include <stdexcept>
@@ -70,6 +71,33 @@ int main() {
         require(!read_index(index_dir / "missing.json"), "Missing index reports absence");
         fs::remove_all(index_dir);
         require(clip_name(0).starts_with("clip-19") && local_time(3600000 * 5 + 61234, true).ends_with(":01.234"), "Clip names and times use local wall-clock");
+        wchar_t fixture[32768]{};
+        if (GetEnvironmentVariableW(L"FRINKY_CLIP_TEST_SEGMENT", fixture, 32768)) {
+            Config measured_config; measured_config.storage = fs::temp_directory_path() / ("FrinkyClipMeasure-" + unique_id());
+            Buffer buffer(measured_config);
+            auto segment = buffer.root() / "session-measure" / "segment-000000.mkv";
+            fs::create_directories(segment.parent_path()); fs::copy_file(fs::path(fixture), segment);
+            buffer.anchor("session-measure", 1000000);
+            require(buffer.finalize(segment), "Closed segment is published before audio measurement");
+            require(buffer.segments().size() == 1 && !buffer.segments()[0].measured && buffer.segments()[0].audio.empty(), "Finalization leaves audio pending");
+            auto before = scan_buffer(buffer.root());
+            require(before.spans.size() == 1 && before.spans[0].coarse.empty(), "Pending waveform does not hide closed footage");
+            auto levels = audio_levels(segment); require(!levels.empty(), "Measurement fixture carries audio");
+            buffer.set_levels(segment, std::move(levels));
+            auto after = scan_buffer(buffer.root());
+            require(buffer.segments()[0].measured && !after.spans[0].coarse.empty() && after.last_end_ms == before.last_end_ms, "Background measurement preserves the footage extent");
+            {
+                Waveforms waves; waves.retain({segment}); waves.levels(segment);
+                waves.retain({}); waves.retain({segment});
+                const std::vector<AudioLevels>* fine = nullptr;
+                const auto deadline = steady_ms() + 2000;
+                while (!fine && steady_ms() < deadline) { fine = waves.levels(segment); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+                require(fine && !fine->empty() && !fine->front().empty(), "Fine waveforms load after expiry and re-request");
+                const auto revision = waves.revision();
+                require(waves.levels(segment) == fine && waves.revision() == revision, "Published fine waveforms stay immutable without repeated loads");
+            }
+            fs::remove_all(measured_config.storage);
+        }
         std::cout << "Passed buffer retention, pinning, session boundaries, validation, Windows argument escaping, and atomic writes.\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

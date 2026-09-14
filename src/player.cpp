@@ -46,7 +46,7 @@ std::shared_ptr<AVFrame> hold(AVFrame* frame) {
 // converted to it with swresample.
 struct Player::Audio {
     IAudioClient* client = nullptr; IAudioRenderClient* render = nullptr; WAVEFORMATEX* format = nullptr;
-    UINT32 buffer_frames = 0; bool started = false, running = false, is_float = false; std::int64_t written = 0, media_start = -1;
+    UINT32 buffer_frames = 0; bool started = false, running = false, is_float = false, failed = false; std::int64_t written = 0, media_start = -1;
     bool init() {
         IMMDeviceEnumerator* devices = nullptr; IMMDevice* device = nullptr;
         if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&devices))) return false;
@@ -60,24 +60,28 @@ struct Player::Audio {
         if (device) device->Release(); if (devices) devices->Release();
         return ok;
     }
-    void reset() { if (client) { client->Stop(); client->Reset(); } started = running = false; written = 0; media_start = -1; }
-    void suspend() { if (client && running) client->Stop(); running = false; }
-    void resume() { if (client && started && !running) { client->Start(); running = true; } }
+    bool accept(HRESULT result) { if (FAILED(result)) failed = true; return !failed; }
+    void reset() { if (client && !failed) { accept(client->Stop()); if (!failed) accept(client->Reset()); } started = running = false; written = 0; media_start = -1; }
+    void suspend() { if (client && running && !failed) accept(client->Stop()); running = false; }
+    void resume() { if (client && started && !running && !failed) { running = accept(client->Start()); } }
+    void start_tail() { if (client && !started && written > 0 && !failed) { started = running = accept(client->Start()); } }
     // Frames of the pending block that fit now; 0 when the device buffer is full.
     UINT32 write(const std::uint8_t* data, UINT32 frames) {
-        UINT32 padding = 0; if (FAILED(client->GetCurrentPadding(&padding))) return 0;
+        UINT32 padding = 0; if (failed || !accept(client->GetCurrentPadding(&padding))) return 0;
+        if (padding > buffer_frames) { failed = true; return 0; }
         UINT32 n = std::min(frames, buffer_frames - padding); if (!n) return 0;
-        BYTE* out = nullptr; if (FAILED(render->GetBuffer(n, &out))) return 0;
-        memcpy(out, data, (size_t)n * format->nBlockAlign); render->ReleaseBuffer(n, 0); written += n;
-        if (!started && written >= (std::int64_t)buffer_frames / 4) { client->Start(); started = running = true; }
+        BYTE* out = nullptr; if (!accept(render->GetBuffer(n, &out))) return 0;
+        memcpy(out, data, (size_t)n * format->nBlockAlign); if (!accept(render->ReleaseBuffer(n, 0))) return 0; written += n;
+        if (!started && written >= (std::int64_t)buffer_frames / 4) { started = running = accept(client->Start()); }
         return n;
     }
-    std::int64_t played_ms() const {
-        if (!started || media_start < 0) return -1;
-        UINT32 padding = 0; client->GetCurrentPadding(&padding);
+    std::int64_t played_ms() {
+        if (failed || !started || media_start < 0) return -1;
+        UINT32 padding = 0; if (!accept(client->GetCurrentPadding(&padding))) return -1;
         return media_start + (written - (std::int64_t)padding) * 1000 / format->nSamplesPerSec;
     }
-    ~Audio() { if (client) client->Stop(); if (render) render->Release(); if (client) client->Release(); if (format) CoTaskMemFree(format); }
+    void close() { if (client) client->Stop(); if (render) render->Release(); if (client) client->Release(); if (format) CoTaskMemFree(format); render = nullptr; client = nullptr; format = nullptr; }
+    ~Audio() { close(); }
 };
 
 struct Player::Source {
@@ -124,16 +128,38 @@ Player::~Player() {
     ready_.clear(); shown_.reset();
     for (IUnknown* object : {(IUnknown*)view_, (IUnknown*)target_, (IUnknown*)texture_, (IUnknown*)vs_, (IUnknown*)ps_, (IUnknown*)sampler_}) if (object) object->Release();
 }
-void Player::set_spans(std::vector<Span> spans) { std::lock_guard lock(mutex_); spans_ = std::move(spans); }
+void Player::set_spans(std::vector<Span> spans) { std::lock_guard lock(mutex_); spans_ = std::make_shared<const std::vector<Span>>(std::move(spans)); }
+std::int64_t Player::playback_end() const {
+    auto end = end_ms_.load(), out = range_end_.load();
+    return out && end ? std::min(end, out) : out ? out : end;
+}
+void Player::set_range(std::int64_t in, std::int64_t out) {
+    if (!in || out <= in) in = out = 0;
+    std::lock_guard lock(mutex_);
+    if (range_start_ == in && range_end_ == out) return;
+    // Editing changes the next playback, never the user's inspection position.
+    if (playing_) { position_ = position(); playing_ = false; }
+    range_start_ = in; range_end_ = out; restart_decoder_ = true;
+    space_.notify_all(); wake_.notify_all();
+}
 void Player::seek(std::int64_t ms) {
+    std::lock_guard lock(mutex_);
+    request_seek(ms);
+}
+void Player::request_seek(std::int64_t ms) {
     // The playhead moves now; the picture catches up. Like netcode: the
     // UI state is authoritative and the decoder converges on it. Playback
     // continues from the new position when it was playing.
-    seek_target_ = ms; position_ = ms; pending_seek_ = true; seeking_ = true; resumable_ = false; ++generation_;
+    seek_target_ = ms; position_ = ms; pending_seek_ = true; seeking_ = true; resumable_ = false;
+    drain_end_ms_ = 0; restart_decoder_ = false; ++generation_;
     wake_.notify_all(); space_.notify_all();
 }
 void Player::play() {
+    std::lock_guard lock(mutex_);
     if (playing_) return;
+    auto at = position_.load(), in = range_start_.load(), out = range_end_.load();
+    if (out && (at < in || at >= out)) request_seek(in);
+    else if (restart_decoder_) request_seek(at);
     clock_media_ = position_.load(); clock_wall_ = steady_ms();
     // A clean pause left the decoder and queue in place: continue from there.
     if (!resumable_) { seek_target_ = position_.load(); pending_seek_ = true; }
@@ -141,14 +167,17 @@ void Player::play() {
     wake_.notify_all(); space_.notify_all();
 }
 void Player::pause() {
+    std::lock_guard lock(mutex_);
     if (!playing_) return;
     position_ = position(); playing_ = false; space_.notify_all(); wake_.notify_all();
 }
 std::int64_t Player::position() const {
     if (pending_seek_) return seek_target_;
     if (!playing_) return position_;
-    if (audio_) { auto ms = audio_->played_ms(); if (ms >= 0) return ms; }
-    return clock_media_ + (steady_ms() - clock_wall_);
+    auto wall = clock_media_ + (steady_ms() - clock_wall_);
+    std::lock_guard lock(audio_clock_mutex_);
+    if (audio_time_ >= 0) return drain_end_ms_ ? std::max(audio_time_, wall) : audio_time_;
+    return wall;
 }
 bool Player::reposition(Source& src, std::int64_t offset_ms) {
     auto target = av_rescale_q(std::max<std::int64_t>(0, offset_ms), AVRational{1, 1000}, src.fmt->streams[src.vindex]->time_base);
@@ -173,7 +202,7 @@ bool Player::open(Source& src, const Span& span, std::int64_t offset_ms) {
     auto* vpar = fmt->streams[vindex]->codecpar;
     bool reuse = src.video && src.video_hw == hardware && src.video->codec_id == vpar->codec_id && src.video->width == vpar->width && src.video->height == vpar->height &&
         src.video->extradata_size == vpar->extradata_size && (vpar->extradata_size == 0 || memcmp(src.video->extradata, vpar->extradata, vpar->extradata_size) == 0);
-    src.close(reuse); src.span = span; src.fmt = fmt; src.vindex = vindex;
+    src.close(reuse); src.span.path = span.path; src.span.session = span.session; src.span.start_ms = span.start_ms; src.span.end_ms = span.end_ms; src.fmt = fmt; src.vindex = vindex;
     auto make = [&](int index, AVCodecContext*& ctx, bool video) {
         auto* par = src.fmt->streams[index]->codecpar; const AVCodec* codec = pick_decoder(par->codec_id, video && hardware);
         if (!codec || !(ctx = avcodec_alloc_context3(codec)) || avcodec_parameters_to_context(ctx, par) < 0) return false;
@@ -302,24 +331,47 @@ bool Player::step(Source& src, Decoded* out_video, bool want_audio) {
     }
 }
 void Player::work() {
-    Audio audio; if (audio.init()) audio_ = &audio;
-    Source src; bool open_ok = false; size_t index = 0; std::vector<Span> spans;
+    struct ComScope {
+        HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        ~ComScope() { if (SUCCEEDED(result)) CoUninitialize(); }
+    } com; // Declared first so every WASAPI object is released before COM.
+    Audio audio; if (SUCCEEDED(com.result) && audio.init()) audio_ = &audio;
+    Source src; bool open_ok = false; size_t index = 0;
+    std::shared_ptr<const std::vector<Span>> snapshot;
+    auto publish_audio = [&] {
+        if (fail_audio_for_test_.exchange(false) && audio_) audio_->failed = true;
+        auto current = audio_ ? audio_->played_ms() : -1;
+        if (audio_ && audio_->failed) {
+            // Preserve the last published playhead; permanently use silence after
+            // endpoint failure, so a pending device block cannot wedge decoding.
+            auto at = position();
+            clock_media_ = at; clock_wall_ = steady_ms();
+            audio_->close(); audio_ = nullptr; src.reset_audio();
+        }
+        std::lock_guard clock_lock(audio_clock_mutex_);
+        audio_time_ = audio_ ? current : -1;
+    };
     std::unique_lock lock(mutex_);
     while (!stop_) {
+        publish_audio();
         if (pending_seek_) {
-            pending_seek_ = false; auto target = seek_target_.load(); auto gen = generation_.load(); spans = spans_;
+            pending_seek_ = false; auto target = seek_target_.load(); auto gen = generation_.load(); snapshot = spans_;
+            const auto& spans = *snapshot;
             bool resume = playing_;
             // A frame already decoded ahead satisfies short forward steps at once.
             auto queued = std::find_if(ready_.begin(), ready_.end(), [&](auto& f) { return std::llabs(f.ms - target) < 9; });
-            if (queued != ready_.end()) {
+            if (!resume && queued != ready_.end()) {
                 ready_.erase(ready_.begin(), queued); position_ = ready_.front().ms; seek_result_ = true; error_.clear();
                 if (audio_) audio_->reset();
-                if (resume) { clock_media_ = position_.load(); clock_wall_ = steady_ms(); }
+                { std::lock_guard clock_lock(audio_clock_mutex_); audio_time_ = -1; }
+                restart_decoder_ = true; // Video can step from cache; audio must restart at this frame on Play.
                 if (generation_ == gen) seeking_ = false;
                 continue;
             }
+            if (resume) ready_.clear();
             lock.unlock();
             if (audio_) audio_->reset();
+            { std::lock_guard clock_lock(audio_clock_mutex_); audio_time_ = -1; }
             auto it = std::find_if(spans.begin(), spans.end(), [&](auto& s) { return target < s.end_ms; });
             std::string problem;
             if (it == spans.end() || target < it->start_ms - 1) problem = "No footage at the playhead.";
@@ -328,6 +380,7 @@ void Player::work() {
                 // Continue decoding forward when the target is just ahead; reopen otherwise.
                 bool same_file = open_ok && src.span.path == it->path;
                 bool forward = same_file && src.last_video_ms >= 0 && target >= src.last_video_ms && target - src.last_video_ms < 3000;
+                if (forward) src.reset_audio();
                 // Same segment: seek in place and flush; another segment: reopen.
                 if (!forward) open_ok = same_file ? reposition(src, target - it->start_ms) : open(src, *it, target - it->start_ms);
                 if (!open_ok) problem = "Cannot decode this segment.";
@@ -338,55 +391,83 @@ void Player::work() {
                             if (frame.ms + 8 >= target) { have = true; break; }
                             // Show the frames on the way when paused, so the
                             // seek reads as motion toward the target.
-                            if (!resume && frame.ms >= 0) { std::lock_guard guard(mutex_); ready_.clear(); ready_.push_back(std::move(frame)); seek_result_ = true; frame = Decoded(); }
+                            if (!resume && frame.ms >= 0) { std::lock_guard guard(mutex_); if (generation_ != gen) break; ready_.clear(); ready_.push_back(std::move(frame)); seek_result_ = true; frame = Decoded(); }
                         }
                         // The native decoder could not use the device: reopen in software, once.
                         if (!have && src.failed && hw_ok_) { hw_ok_ = false; open_ok = open(src, *it, target - it->start_ms); if (!open_ok) break; } else break;
                     }
-                    if (have) { std::lock_guard guard(mutex_); ready_.clear(); ready_.push_back(std::move(frame)); position_ = ready_.back().ms; seek_result_ = true; }
+                    if (have) { std::lock_guard guard(mutex_); if (generation_ == gen) { ready_.clear(); ready_.push_back(std::move(frame)); position_ = ready_.back().ms; seek_result_ = true; } }
                     else if (generation_ == gen) problem = "No frame at the playhead.";
                 }
             }
             lock.lock();
+            if (generation_ != gen) continue;
             if (!problem.empty()) { error_ = problem; playing_ = false; position_ = seek_target_.load(); ready_.clear(); open_ok = false; } else error_.clear();
             if (resume && generation_ == gen && problem.empty()) { clock_media_ = position_.load(); clock_wall_ = steady_ms(); }
             if (generation_ == gen) seeking_ = false;
             continue;
         }
+        const auto& spans = snapshot ? *snapshot : *spans_;
         if (!playing_) {
             if (audio_) audio_->suspend();
+            publish_audio();
             resumable_ = open_ok && error_.empty();
             wake_.wait(lock); continue;
         }
         if (!open_ok) { playing_ = false; continue; }
         if (audio_) audio_->resume();
+        publish_audio();
+        if (drain_end_ms_ && src.pending.empty()) {
+            if (audio_) audio_->start_tail();
+            publish_audio();
+            if (position() >= drain_end_ms_) {
+                // Finish even when the window is hidden. Keep the last queued
+                // picture for presentation when the viewport next repaints.
+                while (ready_.size() > 1) ready_.pop_front();
+                seek_result_ = !ready_.empty(); position_ = drain_end_ms_.load(); playing_ = false;
+                if (audio_) audio_->suspend();
+                continue;
+            }
+            space_.wait_for(lock, std::chrono::milliseconds(5)); continue;
+        }
         // Playing: keep the video queue and the audio device fed. Both block
-        // when full, which paces decoding at real time.
+        // when full, which paces decoding at real time. A hidden or slow
+        // viewport can miss pictures without stalling audio or the end stop.
+        while (ready_.size() >= QueueFrames && ready_[1].ms <= position()) ready_.pop_front();
         if (ready_.size() >= QueueFrames) { space_.wait_for(lock, std::chrono::milliseconds(5)); continue; }
-        auto gen = generation_.load(); auto end_limit = end_ms_.load(); lock.unlock();
+        auto gen = generation_.load(); auto end_limit = playback_end(); lock.unlock();
         bool progressed = false;
         if (audio_ && src.pending.size() > src.pending_offset) {
             UINT32 frames = (UINT32)((src.pending.size() - src.pending_offset) / audio_->format->nBlockAlign);
+            // The device queue must never contain sound beyond the exclusive Out.
+            if (end_limit && audio_->media_start >= 0) {
+                auto remaining = av_rescale(end_limit - audio_->media_start, audio_->format->nSamplesPerSec, 1000) - audio_->written;
+                frames = (UINT32)std::min<std::int64_t>(frames, std::max<std::int64_t>(0, remaining));
+            }
             UINT32 n = audio_->write(src.pending.data() + src.pending_offset, frames);
             src.pending_offset += (size_t)n * audio_->format->nBlockAlign;
-            if (src.pending_offset >= src.pending.size()) { src.pending.clear(); src.pending_offset = 0; }
-            if (!n) { std::this_thread::sleep_for(std::chrono::milliseconds(3)); lock.lock(); continue; }
+            if (!frames || src.pending_offset >= src.pending.size()) { src.pending.clear(); src.pending_offset = 0; }
+            if (frames && !n) { std::this_thread::sleep_for(std::chrono::milliseconds(3)); lock.lock(); continue; }
             progressed = true;
         }
+        if (drain_end_ms_) { lock.lock(); continue; }
+        auto drain = [&](std::int64_t end) {
+            clock_media_ = position(); clock_wall_ = steady_ms(); drain_end_ms_ = end;
+        };
         Decoded frame;
         if (src.pending.empty() && step(src, &frame, true)) {
-            if (end_limit && frame.ms >= end_limit) { lock.lock(); playing_ = false; position_ = frame.ms; continue; }
+            if (end_limit && frame.ms >= end_limit) { lock.lock(); if (generation_ == gen) drain(end_limit); continue; }
             lock.lock(); if (generation_ == gen) ready_.push_back(std::move(frame)); continue;
         } else if (src.pending.empty() && src.failed) {
             if (hw_ok_) { hw_ok_ = false; auto at = std::max<std::int64_t>(0, src.last_video_ms - src.span.start_ms); open_ok = open(src, src.span, at); lock.lock(); continue; }
             lock.lock(); error_ = "Cannot decode this segment."; playing_ = false; continue;
         } else if (src.pending.empty()) {
             // End of this segment: continue into the next one when contiguous.
-            if (index + 1 < spans.size() && std::llabs(spans[index + 1].start_ms - src.span.end_ms) <= 1) {
+            if ((!end_limit || src.span.end_ms < end_limit) && index + 1 < spans.size() && std::llabs(spans[index + 1].start_ms - src.span.end_ms) <= 1) {
                 ++index; open_ok = open(src, spans[index], 0);
                 lock.lock(); if (!open_ok) { error_ = "Cannot decode the next segment."; playing_ = false; } continue;
             }
-            lock.lock(); playing_ = false; position_ = src.last_video_ms > 0 ? src.last_video_ms : position_.load(); continue;
+            lock.lock(); if (generation_ == gen) drain(end_limit ? std::min(end_limit, src.span.end_ms) : src.span.end_ms); continue;
         }
         if (!progressed) std::this_thread::sleep_for(std::chrono::milliseconds(2));
         lock.lock();
@@ -459,9 +540,9 @@ Player::Picture Player::tick() {
         // Paused: only a seek result replaces the picture; queued frames stay for resume.
         if (seek_result_ && !ready_.empty()) { next = ready_.front(); seek_result_ = false; }
     } else {
-        auto now = position();
-        while (!ready_.empty() && ready_.front().ms <= now) { next = std::move(ready_.front()); ready_.pop_front(); }
-        if (next && !(audio_ && audio_->played_ms() >= 0)) { clock_media_ = next->ms; clock_wall_ = steady_ms(); }
+        auto now = position(), end = playback_end();
+        while (!ready_.empty() && ready_.front().ms <= now && (!end || ready_.front().ms < end)) { next = std::move(ready_.front()); ready_.pop_front(); }
+        if (next) seek_result_ = false;
     }
     lock.unlock(); space_.notify_all();
     if (next) { present(*next); next->hw.reset(); next->rgba.clear(); shown_ = std::move(next); }
@@ -497,7 +578,7 @@ int player_test(const fs::path& buffer_root, int play_seconds) {
         auto hw = hw_device(device);
         report << "thumbnail device: " << (hw ? "D3D11VA on " + adapter_name(*hw) : "software") << "\n";
         Decoder decoder(hw);
-        for (int i = 0; i < 3; ++i) {
+        for (size_t i = 0; i < std::min<size_t>(3, map.spans.size() - pick); ++i) {
             auto t = ms(); decoder.decode(map.spans[pick + i].path, 1500, 320, true); auto key = ms() - t;
             t = ms(); decoder.decode(map.spans[pick + i].path, 1500, 320, false); auto exact = ms() - t;
             report << "decode keyframe " << key << " ms, exact frame at +1.5 s " << exact << " ms" << (i == 0 ? " (first call includes decoder setup)" : "") << "\n";
@@ -543,7 +624,7 @@ int player_test(const fs::path& buffer_root, int play_seconds) {
             // timeout. Frames shown on the way do not count.
             while (ms() - t < 10000) {
                 picture = player.tick();
-                if (!player.seeking() && picture.texture && picture.ms != previous_ms) break;
+                if (!player.seeking() && picture.texture && std::llabs(picture.ms - target) < 9) break;
                 if (!player.busy() && !player.error().empty()) { picture = {}; break; }
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -570,6 +651,107 @@ int player_test(const fs::path& buffer_root, int play_seconds) {
         auto [back_ms, back] = wait_seek(at - 1000);
         report << "seek back one second to " << local_time(at - 1000, true) << ": " << back_ms << " ms, frame " << (back.texture ? local_time(back.ms, true) : "none") << "\n";
         if (!stepped.texture || !back.texture) ++failures;
+        // Exercise the real decoder, presentation clock and device queue at
+        // clip boundaries, including a one-frame clip and a segment seam.
+        auto check = [&](bool ok, const char* name) { report << (ok ? "PASS " : "FAIL ") << name << '\n'; if (!ok) ++failures; };
+        auto run_range = [&](std::int64_t in, std::int64_t out, std::int64_t from, const char* name) {
+            player.pause(); player.set_range(in, out); wait_seek(from);
+            auto began = ms(); player.play();
+            bool within = true; std::int64_t first = 0; Player::Picture final;
+            while (player.busy() && ms() - began < 5000) {
+                final = player.tick();
+                if (!player.seeking() && final.texture) {
+                    if (!first) first = final.ms;
+                    within &= final.ms >= in && final.ms < out;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            final = player.tick();
+            auto expected_start = from < in || from >= out ? in : from;
+            auto elapsed = ms() - began;
+            report << name << ": elapsed " << elapsed << " ms, first " << first - in << ", last " << final.ms - out << " ms from Out\n";
+            check(!player.playing() && player.error().empty() && within && first >= expected_start && first < expected_start + 100 &&
+                final.texture && final.ms < out && final.ms >= out - 18 && player.position() == out && elapsed >= out - expected_start - 50, name);
+        };
+        // Supersede both queued and in-flight seeks; only the final request may land.
+        player.pause(); player.set_range(0, 0);
+        for (int i = 0; i < 24; ++i) {
+            player.seek(last.start_ms + 500 + (i % 5) * 170);
+            if (i % 3 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        auto [superseded_ms, superseded] = wait_seek(last.start_ms + 1250);
+        check(!player.seeking() && superseded.texture && std::llabs(superseded.ms - (last.start_ms + 1250)) < 9 &&
+            std::llabs(player.position() - (last.start_ms + 1250)) < 9, "superseding seeks publish only the final target");
+        auto clip_in = last.start_ms + 1000, clip_out = clip_in + 1000;
+        run_range(clip_in, clip_out, clip_in - 500, "play before In restarts at In and drains to Out");
+        run_range(clip_in, clip_out, clip_out + 500, "play after Out restarts at In");
+        run_range(clip_in, clip_out, clip_in + 500, "play inside resumes to Out");
+        // Replay directly from the stopped boundary, without a seek.
+        player.play(); check(player.playing() && std::llabs(player.position() - clip_in) < 100, "Play at Out restarts the clip");
+        auto range_began = ms(); while (player.seeking() && ms() - range_began < 5000) { player.tick(); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+        player.pause(); auto parked = player.position();
+        player.set_range(clip_in + 100, clip_out - 100);
+        check(player.position() == parked && !player.playing(), "editing the range preserves the playhead");
+        auto [outside_ms, outside] = wait_seek(clip_out + 500);
+        check(outside.texture && std::llabs(player.position() - (clip_out + 500)) < 9, "inspection can seek outside the range");
+        player.set_range(clip_in, 0); player.play();
+        check(player.position() > clip_out, "an incomplete range leaves buffer playback unrestricted"); player.pause();
+        player.set_range(0, clip_out); player.play();
+        check(player.position() > clip_out, "Out alone leaves buffer playback unrestricted"); player.pause();
+        run_range(clip_in, clip_in + 17, clip_in - 500, "one-frame clip holds its only included frame");
+        player.set_range(clip_in, clip_out); wait_seek(clip_in); player.play();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        auto hidden_tail = player.tick();
+        check(!player.playing() && player.position() == clip_out && hidden_tail.ms >= clip_out - 18 && hidden_tail.ms < clip_out, "clip drains to its last frame without viewport ticks");
+        run_range(last.end_ms - 500, last.end_ms, last.end_ms - 500, "Out at a segment seam excludes the next segment");
+        if (pick + 1 < map.spans.size() && std::llabs(map.spans[pick + 1].start_ms - last.end_ms) <= 1)
+            run_range(last.end_ms - 500, last.end_ms + 500, last.end_ms - 500, "clip plays across a segment seam");
+        player.set_range(0, 0); wait_seek(clip_in); player.play();
+        range_began = ms(); while (player.playing() && player.position() <= clip_out + 150 && ms() - range_began < 3000) { player.tick(); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+        check(player.playing() && player.position() > clip_out, "Clear restores playback beyond the old Out"); player.pause();
+        player.set_range(0, 0); wait_seek(map.last_end_ms - 500); player.play();
+        range_began = ms(); while (player.busy() && ms() - range_began < 3000) { player.tick(); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+        auto tail = player.tick();
+        check(!player.playing() && tail.texture && tail.ms >= map.last_end_ms - 18 && tail.ms < map.last_end_ms, "buffer playback drains the last closed segment");
+        auto first_cut = decoder.decode(last.path, clip_in - last.start_ms, 320, false);
+        auto last_cut = decoder.decode(last.path, last.end_ms - last.start_ms - 1, 320, false);
+        check(std::llabs(first_cut.pts_ms - (clip_in - last.start_ms)) < 1 && last_cut.pts_ms < last.end_ms - last.start_ms &&
+            last_cut.pts_ms >= last.end_ms - last.start_ms - 18, "trim previews decode In and the last included frame before Out");
+        // Inject the same sticky error state used for failed WASAPI calls.
+        player.set_range(clip_in, clip_out); wait_seek(clip_in); player.play();
+        auto failure_began = ms();
+        while (player.seeking() && ms() - failure_began < 3000) {
+            player.tick(); std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        failure_began = ms();
+        while (player.playing() && ms() - failure_began < 200) {
+            player.tick(); std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        bool had_audio_clock = false;
+        {
+            std::lock_guard clock_lock(player.audio_clock_mutex_);
+            had_audio_clock = player.audio_time_ >= 0;
+            report << "endpoint failure injection: " << (player.audio_time_ >= 0 ? "active audio clock" : "audio unavailable or not started; silent path only") << '\n';
+        }
+        auto before_failure = player.position();
+        player.fail_audio_for_test_ = true;
+        bool continuous = true; auto observed = before_failure;
+        failure_began = ms();
+        while (player.playing() && ms() - failure_began < 3000) {
+            auto current = player.position();
+            continuous &= current >= observed - 20; observed = current;
+            player.tick(); std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (had_audio_clock) {
+            bool fell_back;
+            { std::lock_guard clock_lock(player.audio_clock_mutex_); fell_back = player.audio_time_ < 0; }
+            check(fell_back && continuous && !player.playing() && player.position() == clip_out && player.error().empty(),
+                "endpoint failure switches to continuous silent playback and drains");
+        } else report << "SKIP endpoint failure recovery: no active audio endpoint\n";
+        player.set_range(0, 0);
+        auto thumbnail_failure = thumbnail_test(device, last.path);
+        check(thumbnail_failure.empty(), "thumbnail cancellation, ownership and memory bounds");
+        if (!thumbnail_failure.empty()) report << thumbnail_failure << '\n';
         // Thumbnail cache: tiles at two spacings over three segments resolve
         // to the same keyframes, so the second pass must decode nothing.
         {

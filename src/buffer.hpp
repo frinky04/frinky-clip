@@ -31,8 +31,7 @@ public:
     // first segment closes; segments of that session chain from it.
     void anchor(const std::string& session, std::int64_t start_ms);
     bool finalize(const fs::path& path);
-    // Segments recorded before loudness was stored are measured in the
-    // background: the next one to do, and where to put the result.
+    // New and recovered segments are measured in the background.
     void set_levels(const fs::path& path, std::vector<AudioLevels> levels);
     // Apply new retention/budget settings. The storage folder must be unchanged.
     void configure(const Config& config);

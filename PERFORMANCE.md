@@ -34,3 +34,55 @@ Sampling uses Windows performance counters and has its own overhead; it is only 
 - Repeat with the GPU close to full load. NVENC hardware encoding still involves capture, compositing, memory bandwidth, and disk work.
 
 No controlled in-game A/B performance claim has been established yet. A synthetic recording or desktop-only sample verifies plumbing, not game performance.
+
+## Editor and export checks
+
+`--player-test <buffer> 2` exercises playback, range boundaries, superseding seeks,
+audio failure fallback, thumbnail cancellation, retained textures, and cache budgets.
+The audio failure check explicitly skips when no audio clock became active. It
+injects the error state; it does not replace testing a physical endpoint change.
+
+Build the optional real-window harness with
+`cmake --build build --config Release --target editor-bench --parallel`, then run
+`build/bin/Release/editor-bench.exe <segment.mkv> 6 12` and repeat with `1800`.
+Use a segment with at least two seconds of video. This harness links the real
+editor to a test-only app controller: it never starts recording, registers a tray
+icon, or touches an existing recorder. It creates private fixture hardlinks and
+metadata, exercises playback/range controls, resize, and hide/restore, and exits.
+The 1,800-segment case models a two-hour index when using four-second footage;
+it repeats the fixture's content and is not a two-hour recording soak test.
+`test-output/editor-bench-last.txt` identifies the retained directory containing
+`ui.csv`, `phases.csv`, and `result.txt` (or `error.txt`).
+
+For a normal editor session, set `FRINKY_CLIP_UI_PERF` to an output CSV path before
+launch. Samples include frame intervals, UI thread CPU time, Present duration,
+picture timestamps, and thumbnail count. Logging is disabled by default and
+buffered until normal exit. Separate steady playback from idle, seeking, resize,
+and hidden intervals when comparing p95/p99; a hidden interval is deliberately
+long. Also inspect memory and recording lag under the same workload.
+
+`--export-test <buffer> 2` checks both codecs at 720p/30/60 and compares source-size
+GPU input against forced CPU input at 60 fps. Every output is checked for frame
+count, duration, dimensions, and audio presence. Confirm `GPU input active` before
+attributing a result to the GPU path. Alternate several runs for throughput claims;
+the CPU-input comparison still uses hardware decoding and NVENC. Downscaled
+exports retain CPU scaling. Set `FRINKY_CLIP_TEST_SEGMENT` to an audio-bearing MKV
+when running `ctest` to additionally verify publishing footage before waveform
+measurement and adding the waveform without changing segment timing.
+
+### Short validation on 2026-09-15
+
+Release builds, the core tests with an audio fixture, and player checks on AV1
+desktop footage, silent footage, and portrait H.264 footage passed. The real
+editor harness completed with 6 and 1,800 segments, including resize/hide/restore.
+In the 1,800-segment runs on an RTX 4080 SUPER, intervals with consecutive
+advancing pictures had a baseline median/p95 of 16.50/31.87 ms and a final
+median/p95 of 16.62/17.18 ms. These short scripted samples include transport
+transitions and do not establish in-game performance or long-session stability.
+
+For a two-second 1440p60 export across a seam, GPU versus forced CPU input took
+1,156 versus 1,336 ms for H.264 and 1,032 versus 1,245 ms for AV1 (about 13% and
+17% shorter). Both paths produced 120 frames with audio; all four outputs also
+decoded completely without errors. These are single paired measurements, not
+general speedup guarantees. Reports and baseline source snapshots are retained
+under `test-output/perf-implementation`; editor CSV paths are recorded there.

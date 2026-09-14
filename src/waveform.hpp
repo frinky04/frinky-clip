@@ -1,6 +1,7 @@
 #pragma once
 #include "media.hpp"
 #include <condition_variable>
+#include <atomic>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -18,13 +19,18 @@ public:
     Waveforms(const Waveforms&) = delete;
     Waveforms& operator=(const Waveforms&) = delete;
     // Fine levels for a segment, or nullptr until read. The pointer stays
-    // valid for the lifetime of this object; an unmeasured segment is empty.
+    // valid until the next retain() call on the main thread. Published nonempty
+    // vectors are immutable; an unmeasured segment returns nullptr.
     const std::vector<AudioLevels>* levels(const fs::path& segment);
+    void retain(const std::vector<fs::path>& paths);
+    std::uint64_t revision() const { return revision_.load(); }
 private:
-    struct Entry { std::vector<AudioLevels> levels; bool ready = false, queued = false; std::int64_t read_ms = 0; };
+    struct Entry { std::vector<AudioLevels> levels; bool ready = false, queued = false; std::int64_t read_ms = 0; std::uint64_t generation = 0; };
     void work();
     std::map<std::wstring, Entry> cache_;
-    std::deque<std::wstring> queue_;
+    std::deque<std::pair<std::wstring, std::uint64_t>> queue_;
+    std::uint64_t generation_ = 0;
+    std::atomic<std::uint64_t> revision_{0};
     std::mutex mutex_;
     std::condition_variable wake_;
     std::thread worker_;

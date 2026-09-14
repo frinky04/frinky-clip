@@ -10,6 +10,8 @@ Interaction thesis: immediate hover and keyboard-focus feedback; direct numeric 
 
 ## Design decisions
 
+- A complete In/Out range scopes Play, Space, and clicking the viewport. Play resumes inside the range, starts at In from outside, and pauses at the exclusive Out while holding the last included picture. Play at Out restarts at In. An incomplete range leaves playback unrestricted. Timeline inspection pauses and can move anywhere; range edits pause without seeking. While dragging an In or Out handle, the viewport temporarily shows the exact first or last included frame, then returns to the playhead on release. Clear restores buffer playback. No automatic looping.
+
 - Use regular buttons throughout, including the footer. Avoid `SmallButton`; align adjacent text to the standard frame padding.
 
 - Default to a window whose 16:9 viewport fills the content width, about 776 × 777 at 100% scaling, with the native title bar supplying the app name. The minimum keeps the viewport at its smallest usable height so nothing scrolls. The lanes have fixed heights and the viewport takes the spare height; the footer strip is one row, and grows a second only while an error or notice is open.

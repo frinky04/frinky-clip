@@ -53,9 +53,16 @@ target_compile_options(frinky-clip PRIVATE /W4 /utf-8 /EHsc)
 add_custom_command(TARGET frinky-clip POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/NotoSansMono-Medium.ttf" "$<TARGET_FILE_DIR:frinky-clip>/NotoSansMono-Medium.ttf")
 enable_testing()
-add_executable(clip-tests tests/core_tests.cpp)
+add_executable(clip-tests tests/core_tests.cpp src/waveform.cpp)
 target_link_libraries(clip-tests PRIVATE clip_core)
 add_test(NAME clip-core COMMAND clip-tests)
+# Opt-in real editor benchmark. Its test-only App never owns a recorder or tray.
+add_executable(editor-bench EXCLUDE_FROM_ALL WIN32 tests/editor_bench.cpp src/ui.cpp src/player.cpp src/thumbs.cpp src/waveform.cpp
+  "${DEPS}/imgui/imgui.cpp" "${DEPS}/imgui/imgui_draw.cpp" "${DEPS}/imgui/imgui_tables.cpp" "${DEPS}/imgui/imgui_widgets.cpp"
+  "${DEPS}/imgui/backends/imgui_impl_win32.cpp" "${DEPS}/imgui/backends/imgui_impl_dx11.cpp")
+target_include_directories(editor-bench PRIVATE "${DEPS}/imgui" "${DEPS}/imgui/backends")
+target_compile_options(editor-bench PRIVATE /W4 /utf-8 /EHsc)
+target_link_libraries(editor-bench PRIVATE clip_core d3d11 dxgi d3dcompiler dwmapi comctl32)
 # Release layout: everything the app loads at runtime is staged beside the
 # executable (see cmake/stage.cmake), so a copy of the output folder runs on a
 # machine with only the NVIDIA driver. The OBS installation is a build input.

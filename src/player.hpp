@@ -23,7 +23,8 @@ public:
     Player(const Player&) = delete;
     Player& operator=(const Player&) = delete;
     void set_spans(std::vector<Span> spans); // Closed segments in time order.
-    void seek(std::int64_t epoch_ms);        // Show this frame, paused.
+    void seek(std::int64_t epoch_ms);        // Show this frame; preserve playback state.
+    void set_range(std::int64_t in_ms, std::int64_t out_ms); // Incomplete/zero clears it; edits pause without seeking.
     void play();
     void pause();
     void toggle() { playing() ? pause() : play(); }
@@ -40,6 +41,10 @@ public:
     bool hardware() const { return hardware_; }
     std::string error() const { std::lock_guard lock(mutex_); return error_; }
 private:
+    friend int player_test(const fs::path&, int);
+    std::atomic<bool> fail_audio_for_test_{false};
+    void request_seek(std::int64_t ms); // Caller holds mutex_.
+    std::int64_t playback_end() const;
     struct Decoded { std::int64_t ms = 0; int width = 0, height = 0; std::vector<std::uint8_t> rgba; std::shared_ptr<AVFrame> hw; };
     struct Source;
     void work();
@@ -57,7 +62,7 @@ private:
     ID3D11Texture2D* texture_ = nullptr; ID3D11ShaderResourceView* view_ = nullptr; ID3D11RenderTargetView* target_ = nullptr;
     int tex_w_ = 0, tex_h_ = 0; bool tex_dynamic_ = false;
     ID3D11VertexShader* vs_ = nullptr; ID3D11PixelShader* ps_ = nullptr; ID3D11SamplerState* sampler_ = nullptr; bool convert_ready_ = false;
-    std::vector<Span> spans_;
+    std::shared_ptr<const std::vector<Span>> spans_ = std::make_shared<const std::vector<Span>>();
     std::deque<Decoded> ready_;
     std::optional<Decoded> shown_;
     mutable std::mutex mutex_;
@@ -68,10 +73,14 @@ private:
     std::atomic<int> width_{640};
     std::atomic<float> gains_[2]{1.f, 1.f};
     std::atomic<std::int64_t> position_{0}, end_ms_{0}, seek_target_{0};
+    std::atomic<std::int64_t> range_start_{0}, range_end_{0}, drain_end_ms_{0};
+    bool restart_decoder_ = false; // Range edits and cached seeks invalidate queued audio.
     std::atomic<std::uint64_t> generation_{0};
     // Playback clock: media time at the moment audio (or wall time) started.
     std::atomic<std::int64_t> clock_media_{0}, clock_wall_{0};
     std::string error_;
-    struct Audio; Audio* audio_ = nullptr;
+    mutable std::mutex audio_clock_mutex_;
+    std::int64_t audio_time_ = -1; // Published by worker; never exposes WASAPI to the UI.
+    struct Audio; Audio* audio_ = nullptr; // Worker thread only.
 };
 }

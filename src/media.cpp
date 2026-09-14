@@ -337,16 +337,25 @@ struct Decoder::State {
 Decoder::Decoder(std::shared_ptr<HwDevice> hw) : s_(new State) { s_->hw = std::move(hw); }
 Decoder::~Decoder() { delete s_; }
 struct HwFailure {};
-Frame decode_with(Decoder::State* s, const fs::path& p, std::int64_t offset_ms, int width, bool keyframe_only);
-Frame Decoder::decode(const fs::path& p, std::int64_t offset_ms, int width, bool keyframe_only) {
-    try { return decode_with(s_, p, offset_ms, width, keyframe_only); }
+Frame decode_with(Decoder::State* s, const fs::path& p, std::int64_t offset_ms, int width, bool keyframe_only, const std::function<bool()>& cancelled);
+Frame Decoder::decode(const fs::path& p, std::int64_t offset_ms, int width, bool keyframe_only, const std::function<bool()>& cancelled) {
+    try { return decode_with(s_, p, offset_ms, width, keyframe_only, cancelled); }
     catch (const HwFailure&) {
         // The native decoder could not use the device: fall back to software for good.
+        if (cancelled && cancelled()) throw std::runtime_error("Decode cancelled");
         s_->hw_failed = true; avcodec_free_context(&s_->ctx);
-        return decode_with(s_, p, offset_ms, width, keyframe_only);
+        return decode_with(s_, p, offset_ms, width, keyframe_only, cancelled);
     }
 }
-Frame decode_with(Decoder::State* s_, const fs::path& p, std::int64_t offset_ms, int width, bool keyframe_only) {
+Frame decode_with(Decoder::State* s_, const fs::path& p, std::int64_t offset_ms, int width, bool keyframe_only, const std::function<bool()>& cancelled) {
+    // Every exit releases per-request packet/frame references, including cancellation
+    // during hardware fallback, transfer failure, and a thrown scaling error.
+    struct ReleaseFrames {
+        Decoder::State* state;
+        ~ReleaseFrames() { av_packet_unref(state->packet); av_frame_unref(state->frame); av_frame_unref(state->best); av_frame_unref(state->cpu); }
+    } release{s_};
+    auto check_cancel = [&] { if (cancelled && cancelled()) throw std::runtime_error("Decode cancelled"); };
+    check_cancel();
     Input in(p, false); int index = -1;
     for (unsigned i = 0; i < in.value->nb_streams; ++i) if (in.value->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { index = (int)i; break; }
     if (index < 0) throw std::runtime_error("No video stream: " + path_text(p));
@@ -365,6 +374,7 @@ Frame decode_with(Decoder::State* s_, const fs::path& p, std::int64_t offset_ms,
     };
     bool hardware = s_->hw && !s_->hw_failed;
     while (!done) {
+        check_cancel();
         int r = av_read_frame(in.value, packet);
         int sent = 0;
         if (r < 0) { avcodec_send_packet(ctx, nullptr); }
@@ -372,6 +382,7 @@ Frame decode_with(Decoder::State* s_, const fs::path& p, std::int64_t offset_ms,
         else { sent = avcodec_send_packet(ctx, packet); av_packet_unref(packet); }
         if (sent < 0 && sent != AVERROR(EAGAIN) && hardware && !have) throw HwFailure{};
         while (!done) {
+            check_cancel();
             int rr = avcodec_receive_frame(ctx, frame);
             if (rr == AVERROR(EAGAIN)) break;
             if (rr == AVERROR_EOF) { done = true; break; }
@@ -381,6 +392,7 @@ Frame decode_with(Decoder::State* s_, const fs::path& p, std::int64_t offset_ms,
         if (r < 0) break;
     }
     if (!have) throw std::runtime_error("No decodable frame at that position");
+    check_cancel();
     AVFrame* picture = best;
     if (best->format == AV_PIX_FMT_D3D11) { av_frame_unref(s_->cpu); av_check(av_hwframe_transfer_data(s_->cpu, best, 0), "Download decoded frame"); picture = s_->cpu; }
     int height = std::max(1, (int)std::lround((double)picture->height * width / std::max(1, picture->width)));

@@ -71,9 +71,8 @@ bool Buffer::finalize(const fs::path& p) {
         end = std::max(start + 1, chained_ms(chain.anchor_ms, chain.frames, chain.fps_num, chain.fps_den));
         obs_data_set_int(d.get(), "start_ms", start); obs_data_set_int(d.get(), "end_ms", end);
         obs_data_set_int(d.get(), "frames", video.frames); obs_data_set_double(d.get(), "seconds", (end - start) / 1000.0);
-        // Loudness for the editor's audio lane; a failure here is not a reason to lose the segment.
-        try { segment.audio = audio_levels(p); segment.measured = true; } catch (...) {}
-        if (segment.measured) write_levels(d.get(), segment.audio);
+        // Publish closed footage immediately. The recorder measures audio on
+        // its background worker and adds the peak file when it is ready.
         write_json(metadata, d.get());
     } else if (obs_data_has_user_value(d.get(), "audio_peak")) {
         segment.audio = read_levels(d.get()); segment.measured = true;
