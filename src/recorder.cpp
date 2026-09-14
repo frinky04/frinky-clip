@@ -1,6 +1,7 @@
 #include "recorder.hpp"
 #include "buffer.hpp"
 #include "timeline.hpp"
+#include "app.hpp"
 #include <shellapi.h>
 #include <future>
 #include <mutex>
@@ -47,6 +48,7 @@ public:
     // refreshed. An export additionally hard-links its sources.
     std::int64_t pin_start = 0, pin_end = 0, pin_at = 0;
     size_t indexed_count = (size_t)-1; std::int64_t indexed_end = -1; // Last published segment index.
+    HWND controls = nullptr; // The tray app's control window, told when status changes.
     fs::path export_progress_file; std::int64_t export_duration_ms = 0; double export_fraction = -1;
 
     ~Recorder() {
@@ -181,12 +183,16 @@ public:
         if (!output) throw std::runtime_error("Recording output unavailable");
         obs_output_set_video_encoder(output, video_encoder); if (audio_encoder) obs_output_set_audio_encoder(output, audio_encoder, 0);
         auto* signals = obs_output_get_signal_handler(output);
+        // Callbacks run on OBS threads: record the event, then wake the message
+        // loop so the tick runs now rather than at the next 250 ms timer.
         signal_handler_connect(signals, "file_changed", [](void* p, calldata_t* cd) {
-            auto* self = static_cast<Recorder*>(p); std::lock_guard lock(self->events_mutex);
-            self->changes.emplace_back(wide(calldata_string(cd, "next_file")));
+            auto* self = static_cast<Recorder*>(p);
+            { std::lock_guard lock(self->events_mutex); self->changes.emplace_back(wide(calldata_string(cd, "next_file"))); }
+            PostMessageW(self->window, WakeMessage, 0, 0);
         }, this);
         signal_handler_connect(signals, "stop", [](void* p, calldata_t* cd) {
-            static_cast<Recorder*>(p)->stopped_code = (int)calldata_int(cd, "code");
+            auto* self = static_cast<Recorder*>(p); self->stopped_code = (int)calldata_int(cd, "code");
+            PostMessageW(self->window, WakeMessage, 0, 0);
         }, this);
         if (!obs_output_start(output)) {
             auto* reason = obs_output_get_last_error(output);
@@ -348,7 +354,12 @@ public:
         obs_data_set_double(d.get(), "fps", recording() ? obs_get_active_fps() : 0);
         obs_data_set_double(d.get(), "export_progress", export_fraction);
         obs_data_set_int(d.get(), "recovered", buffer.recovered); obs_data_set_int(d.get(), "quarantined", buffer.quarantined);
-        write_json(app_dir() / "status.json", d.get()); last_status = now_ms();
+        // A transient write failure must not abort recording or a save.
+        try { write_json_fast(app_dir() / "status.json", d.get()); } catch (...) {}
+        last_status = now_ms();
+        // Tell the controls at once instead of waiting for their poll.
+        if (!controls || !IsWindow(controls)) controls = FindWindowW(AppWindowClass, nullptr);
+        if (controls) PostMessageW(controls, StatusMessage, 0, 0);
     }
     void tick() {
         {
@@ -439,14 +450,14 @@ LRESULT CALLBACK recorder_proc(HWND window, UINT msg, WPARAM w, LPARAM l) {
     if (msg == WM_NCCREATE) { r = static_cast<Recorder*>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams); SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(r)); }
     if (!r) return DefWindowProcW(window, msg, w, l);
     try {
-        if (msg == SaveMessage || msg == WM_HOTKEY) { r->request_save(msg == WM_HOTKEY ? r->cfg.save_seconds : (int)w); return 0; }
+        if (msg == SaveMessage || msg == WM_HOTKEY) { r->request_save(msg == WM_HOTKEY ? r->cfg.save_seconds : (int)w); r->status(); return 0; }
         if (msg == StopMessage) { r->stop(); r->status(); return 0; }
         if (msg == ResumeMessage) { r->resume(); r->status(); return 0; }
         if (msg == ExitMessage || msg == WM_CLOSE || msg == WM_ENDSESSION) { r->exit(); r->status(); return 0; }
         if (msg == ShareMessage) { r->share(); return 0; }
         if (msg == PinMessage) { r->pin((std::int64_t)w, (std::int64_t)l); return 0; }
         if (msg == ExportMessage) { r->export_clip(); r->status(); return 0; }
-        if (msg == WM_TIMER) { r->tick(); return 0; }
+        if (msg == WM_TIMER || msg == WakeMessage) { r->tick(); return 0; }
     } catch (const std::exception& e) { r->failure = e.what(); r->waiting_save = false; r->pinned.clear(); r->stop(); }
     return DefWindowProcW(window, msg, w, l);
 }

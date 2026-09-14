@@ -57,6 +57,10 @@ constexpr UINT ResumeMessage = WM_APP + 7; // Recorder: start a capture session 
 constexpr UINT ExitMessage = WM_APP + 8;   // Recorder: stop capture, finish saves, and exit.
 constexpr UINT PinMessage = WM_APP + 9;    // Recorder: protect footage in [wParam, lParam] epoch ms from expiry; (0, 0) releases.
 constexpr UINT ExportMessage = WM_APP + 10; // Recorder: export the clip described by export-request.json.
+constexpr UINT StatusMessage = WM_APP + 11; // Controls: status.json was just rewritten; read it now.
+constexpr UINT WakeMessage = WM_APP + 12;   // Recorder: an OBS callback fired; run the tick without waiting for the timer.
+void plain_write(const fs::path& path, const std::string& text); // Atomic rename without the disk flush, for transient files.
+void write_json_fast(const fs::path& path, obs_data_t* value);
 HWND recorder_window();
 struct Monitor { std::string id, label; int width, height; bool primary; };
 std::vector<Monitor> monitors();

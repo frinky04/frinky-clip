@@ -50,8 +50,8 @@ void write_index(const fs::path& path, const BufferMap& map) {
         obs_data_array_push_back(array, item.get());
     }
     obs_data_set_array(d.get(), "segments", array); obs_data_array_release(array);
-    obs_data_set_int(d.get(), "updated_ms", now_ms());
-    write_json(path, d.get());
+    obs_data_set_int(d.get(), "updated_ms", now_ms()); // Index is transient: no flush.
+    write_json_fast(path, d.get());
 }
 std::vector<Span> spans_in_range(const std::vector<Span>& spans, std::int64_t start_ms, std::int64_t end_ms) {
     std::vector<Span> result;

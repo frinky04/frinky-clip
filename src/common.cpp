@@ -30,7 +30,25 @@ fs::path app_dir() {
 }
 std::int64_t now_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
 std::string unique_id() { GUID id; CoCreateGuid(&id); wchar_t s[40]; StringFromGUID2(id, s, 40); return std::to_string(now_ms()) + "-" + utf8(s).substr(1, 8); }
-std::string read_text(const fs::path& p) { std::ifstream in(p, std::ios::binary); return {std::istreambuf_iterator<char>(in), {}}; }
+std::string read_text(const fs::path& p) {
+    // Share delete as well, so a writer can rename a new version into place
+    // while this read is in progress.
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    std::string text; char chunk[65536]; DWORD got = 0;
+    while (ReadFile(h, chunk, sizeof(chunk), &got, nullptr) && got) text.append(chunk, got);
+    CloseHandle(h); return text;
+}
+// Rename with a short retry: a reader without delete sharing can block it for a moment.
+static bool replace_file(const fs::path& tmp, const fs::path& p, DWORD flags) {
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        if (MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | flags)) return true;
+        auto error = GetLastError();
+        if (error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED && error != ERROR_LOCK_VIOLATION) return false;
+        Sleep(2);
+    }
+    return false;
+}
 void atomic_write(const fs::path& p, const std::string& text) {
     fs::create_directories(p.parent_path());
     fs::path tmp = p; tmp += L".tmp";
@@ -39,9 +57,21 @@ void atomic_write(const fs::path& p, const std::string& text) {
     DWORD written = 0;
     bool ok = WriteFile(h, text.data(), (DWORD)text.size(), &written, nullptr) && written == text.size() && FlushFileBuffers(h);
     CloseHandle(h);
-    if (!ok || !MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    if (!ok || !replace_file(tmp, p, MOVEFILE_WRITE_THROUGH))
         throw std::runtime_error("Cannot commit " + path_text(p));
 }
+void plain_write(const fs::path& p, const std::string& text) {
+    // Readers still see either the old or the new file, but nothing waits for
+    // the disk: status and index files are rewritten every second.
+    fs::create_directories(p.parent_path());
+    fs::path tmp = p; tmp += L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("Cannot write " + path_text(tmp));
+    DWORD written = 0; bool ok = WriteFile(h, text.data(), (DWORD)text.size(), &written, nullptr) && written == text.size();
+    CloseHandle(h);
+    if (!ok || !replace_file(tmp, p, 0)) throw std::runtime_error("Cannot commit " + path_text(p));
+}
+void write_json_fast(const fs::path& p, obs_data_t* d) { plain_write(p, obs_data_get_json(d)); }
 bool flush_closed(const fs::path& p) {
     HANDLE h = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;

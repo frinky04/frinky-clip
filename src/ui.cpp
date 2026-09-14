@@ -209,7 +209,8 @@ int run_ui() {
         if (app.tick()) break;
         if (app.start_requested) { app.start_requested = false; start_recording(); }
         HWND recorder = app.recorder();
-        if (now_ms() - last_read > 500) { status = read_json(app_dir() / "status.json"); last_read = now_ms(); }
+        // The recorder announces each rewrite; the short poll only covers a lost message.
+        if (app.status_changed || now_ms() - last_read > 100) { status = read_json(app_dir() / "status.json"); last_read = now_ms(); app.status_changed = false; }
         bool current = obs_data_get_int(status.get(), "pid") == app.recorder_pid();
         std::int64_t updated_ms = obs_data_get_int(status.get(), "updated_ms");
         bool fresh = current && now_ms() - updated_ms < 5000;
