@@ -12,7 +12,7 @@ Interaction thesis: immediate hover and keyboard-focus feedback; direct numeric 
 
 - Use regular buttons throughout, including the footer. Avoid `SmallButton`; align adjacent text to the standard frame padding.
 
-- Default to a window whose 16:9 viewport fills the content width, about 776 × 780 at 100% scaling, with the native title bar supplying the app name. The minimum keeps the viewport at its smallest usable height so nothing scrolls. The lanes have fixed heights and the viewport takes the spare height; the footer strip is one row, and grows a second only while an error or notice is open.
+- Default to a window whose 16:9 viewport fills the content width, about 776 × 765 at 100% scaling, with the native title bar supplying the app name. The minimum keeps the viewport at its smallest usable height so nothing scrolls. The lanes have fixed heights and the viewport takes the spare height; the footer strip is one row, and grows a second only while an error or notice is open.
 
 - Use a two-column property table with stable widget IDs inside the Settings overlay rather than a stack of wide cards. Export resolution, frame rate, and bitrate sit on the editor's export row because they are chosen per clip.
 

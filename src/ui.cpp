@@ -55,7 +55,7 @@ void theme(float dpi) {
 // and its message line. The default window makes the 16:9 viewport fill the
 // content width; the minimum keeps the viewport at its smallest usable
 // height so nothing scrolls off the bottom.
-constexpr int DefaultClientWidth = 760, MinClientWidth = 720, ChromeHeight = 332, MinPreviewHeight = 96, SidePadding = 14;
+constexpr int DefaultClientWidth = 760, MinClientWidth = 720, ChromeHeight = 317, MinPreviewHeight = 96, SidePadding = 14;
 RECT window_rect(int client_w, int client_h, UINT dpi) {
     float scale = dpi / 96.f; RECT rect{0, 0, (LONG)(client_w * scale), (LONG)(client_h * scale)};
     AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi); return rect;
@@ -337,7 +337,7 @@ int run_ui() {
         float row_h = ImGui::GetFrameHeightWithSpacing();
         // Two clip rows, then the recorder strip: a padded action row, plus a
         // second row only while an error or notice is open.
-        float below_h = 2 * dpi + style.ItemSpacing.y + row_h * 2 + 6 * dpi + style.ItemSpacing.y + 8 * dpi * 2 + ImGui::GetFrameHeight() + style.WindowPadding.y
+        float below_h = 2 * dpi + style.ItemSpacing.y + row_h * 2 + 6 * dpi + style.ItemSpacing.y + style.WindowPadding.y + ImGui::GetFrameHeight() + 1 * dpi
             + (line_open ? ImGui::GetFrameHeightWithSpacing() : 0);
         // Fixed lane heights; whatever is left above them previews the cut frames.
         float audio_h = 30 * dpi, video_h = 96 * dpi, ruler_h = ImGui::GetTextLineHeight() + 4 * dpi;
@@ -683,7 +683,7 @@ int run_ui() {
         // State and buffer on the leading side, actions on the trailing side,
         // one message line beneath. Its height never changes.
         {
-            float pad = 8 * dpi, frame_h = ImGui::GetFrameHeight();
+            float pad = style.WindowPadding.y, frame_h = ImGui::GetFrameHeight(); // The window's bottom padding is the strip's bottom inset; the top matches it.
             ImGui::Dummy(ImVec2(0, 6 * dpi));
             ImVec2 top = ImGui::GetCursorScreenPos(), win = ImGui::GetWindowPos(), win_size = ImGui::GetWindowSize();
             draw->AddRectFilled(ImVec2(win.x, top.y), ImVec2(win.x + win_size.x, win.y + win_size.y), track_u32);
