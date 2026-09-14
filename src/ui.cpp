@@ -264,7 +264,7 @@ int run_ui() {
         thumbs.tick();
         ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
         ImGui::SetNextWindowPos(ImVec2(0, 0)); ImGui::SetNextWindowSize(io.DisplaySize);
-        ImGui::Begin("Frinky Clip", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+        ImGui::Begin("Frinky Clip", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse);
         ImGui::BeginDisabled(app.quitting());
         auto& state = app.state(); auto& style = ImGui::GetStyle();
         auto* draw = ImGui::GetWindowDrawList();
@@ -337,7 +337,7 @@ int run_ui() {
         float row_h = ImGui::GetFrameHeightWithSpacing();
         // Two clip rows, then the recorder strip: a padded action row, plus a
         // second row only while an error or notice is open.
-        float below_h = 2 * dpi + style.ItemSpacing.y + row_h * 2 + 6 * dpi + style.ItemSpacing.y + style.WindowPadding.y + ImGui::GetFrameHeight() + 1 * dpi
+        float below_h = 2 * dpi + style.ItemSpacing.y + row_h * 2 + 6 * dpi + style.ItemSpacing.y + style.WindowPadding.y + ImGui::GetFrameHeight() + style.ItemSpacing.y
             + (line_open ? ImGui::GetFrameHeightWithSpacing() : 0);
         // Fixed lane heights; whatever is left above them previews the cut frames.
         float audio_h = 30 * dpi, video_h = 96 * dpi, ruler_h = ImGui::GetTextLineHeight() + 4 * dpi;

@@ -30,7 +30,7 @@ Interaction thesis: immediate hover and keyboard-focus feedback; direct numeric 
 
 - Hide optional explanations in tooltips. Do not add marketing copy to this operating surface.
 
-- Scale fonts and spacing together on DPI changes. Allow vertical scrolling on smaller windows.
+- Scale fonts and spacing together on DPI changes. The minimum window size fits the whole layout, so the main window never scrolls.
 
 ## References
 
