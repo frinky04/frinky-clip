@@ -312,7 +312,7 @@ public:
         if (busy()) { message = "A save or export is already in progress."; return; }
         auto request = read_export_request(app_dir() / "export-request.json");
         if (request.end_ms - request.start_ms < 100) { message = "Mark a range of at least 0.1 s."; return; }
-        auto sources = spans_in_range(spans(), request.start_ms, request.end_ms);
+        auto sources = export_sources(spans(), request);
         if (sources.empty()) { message = "The range has no closed footage, or crosses a Stop/Record boundary."; return; }
         auto id = "export-" + unique_id(); auto folder = cfg.storage / "pending" / id;
         std::vector<fs::path> paths; for (auto& s : sources) paths.push_back(s.path);

@@ -42,20 +42,25 @@ public:
     std::string error() const { std::lock_guard lock(mutex_); return error_; }
 private:
     friend int player_test(const fs::path&, int);
+#ifdef FRINKY_CLIP_TESTING
+    friend std::vector<float> player_audio_samples_for_test(const std::vector<Span>&, int, float, float, bool);
+    Player() = default; // Offline decoder/mixer test; no worker or audio endpoint.
+#endif
     std::atomic<bool> fail_audio_for_test_{false};
     void request_seek(std::int64_t ms); // Caller holds mutex_.
     std::int64_t playback_end() const;
     struct Decoded { std::int64_t ms = 0; int width = 0, height = 0; std::vector<std::uint8_t> rgba; std::shared_ptr<AVFrame> hw; };
     struct Source;
     void work();
-    bool open(Source& src, const Span& span, std::int64_t offset_ms);
+    bool open(Source& src, const Span& span, std::int64_t offset_ms, bool continuous = false);
     bool reposition(Source& src, std::int64_t offset_ms); // Seek within the open segment.
     bool step(Source& src, Decoded* out_video, bool want_audio);
     void push_audio(Source& src, size_t track, void* frame);
     void mix_audio(Source& src, bool flush); // Sum the tracks in step onto the device queue.
+    bool finish_audio(Source& src); // Drain only at a playback end, never at a file seam.
     bool convert_setup();
     void present(const Decoded& frame);
-    ID3D11Device* device_; ID3D11DeviceContext* context_;
+    ID3D11Device* device_ = nullptr; ID3D11DeviceContext* context_ = nullptr;
     std::shared_ptr<HwDevice> hw_;
     // Presentation resources: an RGBA target the NV12 shader renders into, or
     // a dynamic texture for software frames.
@@ -83,4 +88,7 @@ private:
     std::int64_t audio_time_ = -1; // Published by worker; never exposes WASAPI to the UI.
     struct Audio; Audio* audio_ = nullptr; // Worker thread only.
 };
+#ifdef FRINKY_CLIP_TESTING
+std::vector<float> player_audio_samples_for_test(const std::vector<Span>& spans, int rate, float desktop, float mic, bool seek_again = false);
+#endif
 }

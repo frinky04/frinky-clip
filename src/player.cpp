@@ -6,6 +6,7 @@ extern "C" {
 #include <libswresample/swresample.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/intreadwrite.h>
 }
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
@@ -88,25 +89,38 @@ struct Player::Source {
     AVFormatContext* fmt = nullptr; AVCodecContext* video = nullptr;
     AVPacket* packet = av_packet_alloc(); AVFrame* frame = av_frame_alloc();
     SwsContext* sws = nullptr; int sws_w = 0, sws_h = 0, sws_src_w = 0, sws_src_h = 0, sws_fmt = -1;
-    int vindex = -1; Span span; bool eof = false, drained = false, failed = false;
+    int vindex = -1; Span span; bool eof = false, drained = false, failed = false, packet_pending = false;
     std::int64_t last_video_ms = -1;
     HwBinding binding;
     // Audio tracks (desktop, then microphone), each decoded and converted to
     // the device's rate and channels as interleaved floats. `start` is the
-    // grid index (device-rate samples from the segment start) of the queue's
-    // first sample; the mix walks the grid in step across tracks.
-    struct Track { int index = -1; AVCodecContext* ctx = nullptr; SwrContext* swr = nullptr; std::vector<float> queue; std::int64_t start = -1; bool done = false; };
+    // grid index (device-rate samples from audio_origin_ms) of the queue's
+    // first sample. Decoder overlap, resampling and the sample grid survive
+    // file seams because OBS keeps its audio encoders running across splits.
+    struct Track { int index = -1; AVCodecContext* ctx = nullptr; SwrContext* swr = nullptr; std::vector<float> queue; std::int64_t start = -1; bool continued = false, first_packet = true; };
     std::vector<Track> tracks; std::int64_t mixed = -1; std::vector<float> mixbuf;
+    std::int64_t audio_origin_ms = 0;
+    bool audio_finished = false;
     std::vector<std::uint8_t> pending; // Mixed audio in the device format, not yet accepted by the device.
     size_t pending_offset = 0;
     bool video_hw = false; // Whether the kept video decoder is the hardware one.
-    void reset_audio() { for (auto& t : tracks) { t.queue.clear(); t.start = -1; t.done = false; } mixed = -1; pending.clear(); pending_offset = 0; }
-    void close(bool keep_video = false) {
+    void reset_audio() {
+        for (auto& t : tracks) {
+            t.queue.clear(); t.start = -1; t.continued = false; t.first_packet = true;
+            if (t.swr && swr_init(t.swr) < 0) failed = true; // Discard delayed samples from before the seek.
+        }
+        audio_origin_ms = span.start_ms; audio_finished = false; mixed = -1; pending.clear(); pending_offset = 0;
+    }
+    void close(bool keep_video = false, bool keep_audio = false) {
         sws_freeContext(sws); sws = nullptr;
         if (!keep_video) avcodec_free_context(&video);
-        for (auto& t : tracks) { swr_free(&t.swr); avcodec_free_context(&t.ctx); }
-        tracks.clear(); avformat_close_input(&fmt);
-        vindex = -1; eof = drained = failed = false; last_video_ms = -1; reset_audio();
+        if (!keep_audio) {
+            for (auto& t : tracks) { swr_free(&t.swr); avcodec_free_context(&t.ctx); }
+            tracks.clear(); reset_audio();
+        }
+        avformat_close_input(&fmt);
+        av_packet_unref(packet); packet_pending = false;
+        vindex = -1; eof = drained = failed = false; last_video_ms = -1;
     }
     ~Source() { close(); av_packet_free(&packet); av_frame_free(&frame); }
     std::int64_t ms(AVFrame* f, int index) const {
@@ -124,7 +138,7 @@ Player::Player(ID3D11Device* device, ID3D11DeviceContext* context) : device_(dev
     worker_ = std::thread([this] { work(); });
 }
 Player::~Player() {
-    stop_ = true; wake_.notify_all(); space_.notify_all(); worker_.join();
+    stop_ = true; wake_.notify_all(); space_.notify_all(); if (worker_.joinable()) worker_.join();
     ready_.clear(); shown_.reset();
     for (IUnknown* object : {(IUnknown*)view_, (IUnknown*)target_, (IUnknown*)texture_, (IUnknown*)vs_, (IUnknown*)ps_, (IUnknown*)sampler_}) if (object) object->Release();
 }
@@ -183,10 +197,11 @@ bool Player::reposition(Source& src, std::int64_t offset_ms) {
     auto target = av_rescale_q(std::max<std::int64_t>(0, offset_ms), AVRational{1, 1000}, src.fmt->streams[src.vindex]->time_base);
     if (av_seek_frame(src.fmt, src.vindex, target, AVSEEK_FLAG_BACKWARD) < 0) return false;
     avcodec_flush_buffers(src.video); for (auto& t : src.tracks) if (t.ctx) avcodec_flush_buffers(t.ctx);
+    av_packet_unref(src.packet); src.packet_pending = false;
     src.eof = src.drained = src.failed = false; src.last_video_ms = -1; src.reset_audio();
-    return true;
+    return !src.failed;
 }
-bool Player::open(Source& src, const Span& span, std::int64_t offset_ms) {
+bool Player::open(Source& src, const Span& span, std::int64_t offset_ms, bool continuous) {
     AVFormatContext* fmt = nullptr; int vindex = -1; std::vector<int> audio_streams;
     if (!open_without_probe(&fmt, span.path)) { src.close(); return false; }
     for (unsigned i = 0; i < fmt->nb_streams; ++i) {
@@ -202,11 +217,27 @@ bool Player::open(Source& src, const Span& span, std::int64_t offset_ms) {
     auto* vpar = fmt->streams[vindex]->codecpar;
     bool reuse = src.video && src.video_hw == hardware && src.video->codec_id == vpar->codec_id && src.video->width == vpar->width && src.video->height == vpar->height &&
         src.video->extradata_size == vpar->extradata_size && (vpar->extradata_size == 0 || memcmp(src.video->extradata, vpar->extradata, vpar->extradata_size) == 0);
-    src.close(reuse); src.span.path = span.path; src.span.session = span.session; src.span.start_ms = span.start_ms; src.span.end_ms = span.end_ms; src.fmt = fmt; src.vindex = vindex;
+    bool keep_audio = continuous && !offset_ms && !src.audio_finished && src.span.session == span.session && src.span.end_ms == span.start_ms;
+    if (keep_audio && audio_) {
+        // A changed layout is not a continuation of the same encoder stream.
+        // Fail explicitly rather than silently replace samples with a click.
+        bool compatible = src.tracks.size() == std::min<size_t>(2, audio_streams.size());
+        for (size_t k = 0; compatible && k < src.tracks.size(); ++k) {
+            auto* ctx = src.tracks[k].ctx; auto* par = fmt->streams[audio_streams[k]]->codecpar;
+            compatible = ctx && ctx->codec_id == par->codec_id && ctx->sample_rate == par->sample_rate &&
+                ctx->ch_layout.nb_channels == par->ch_layout.nb_channels &&
+                (par->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC || !av_channel_layout_compare(&ctx->ch_layout, &par->ch_layout)) &&
+                ctx->extradata_size == par->extradata_size && (!par->extradata_size || !memcmp(ctx->extradata, par->extradata, par->extradata_size));
+        }
+        if (!compatible) { avformat_close_input(&fmt); src.failed = true; return false; }
+    }
+    src.close(reuse, keep_audio); src.span = span; src.fmt = fmt; src.vindex = vindex;
+    if (!keep_audio) src.audio_origin_ms = span.start_ms;
     auto make = [&](int index, AVCodecContext*& ctx, bool video) {
         auto* par = src.fmt->streams[index]->codecpar; const AVCodec* codec = pick_decoder(par->codec_id, video && hardware);
         if (!codec || !(ctx = avcodec_alloc_context3(codec)) || avcodec_parameters_to_context(ctx, par) < 0) return false;
         ctx->thread_count = (video && hardware) ? 1 : 0;
+        ctx->pkt_timebase = src.fmt->streams[index]->time_base;
         if (video && hardware) { src.binding = {hw_, true, (int)QueueFrames + 16}; ctx->opaque = &src.binding; ctx->get_format = hw_get_format; }
         return avcodec_open2(ctx, codec, nullptr) >= 0;
     };
@@ -215,19 +246,23 @@ bool Player::open(Source& src, const Span& span, std::int64_t offset_ms) {
     src.video_hw = hardware;
     // Up to two audio tracks, desktop then microphone, each converted to
     // interleaved float at the device's rate and channels for the mix.
-    if (audio_) for (size_t k = 0; k < std::min<size_t>(2, audio_streams.size()); ++k) {
+    if (keep_audio) for (size_t k = 0; k < src.tracks.size(); ++k) {
+        auto& track = src.tracks[k]; track.index = audio_streams[k]; track.continued = true; track.first_packet = true;
+        track.ctx->pkt_timebase = src.fmt->streams[track.index]->time_base;
+    }
+    else if (audio_) for (size_t k = 0; k < std::min<size_t>(2, audio_streams.size()); ++k) {
         Source::Track track; track.index = audio_streams[k];
-        if (!make(track.index, track.ctx, false)) { avcodec_free_context(&track.ctx); continue; }
+        if (!make(track.index, track.ctx, false)) { avcodec_free_context(&track.ctx); return false; }
         AVChannelLayout out{}; av_channel_layout_default(&out, audio_->format->nChannels);
         bool ok = swr_alloc_set_opts2(&track.swr, &out, AV_SAMPLE_FMT_FLT, (int)audio_->format->nSamplesPerSec,
             &track.ctx->ch_layout, (AVSampleFormat)track.ctx->sample_fmt, track.ctx->sample_rate, 0, nullptr) >= 0 && swr_init(track.swr) >= 0;
         av_channel_layout_uninit(&out);
-        if (!ok) { swr_free(&track.swr); avcodec_free_context(&track.ctx); continue; }
+        if (!ok) { swr_free(&track.swr); avcodec_free_context(&track.ctx); return false; }
         src.tracks.push_back(track);
     }
     if (offset_ms > 0) {
         auto target = av_rescale_q(offset_ms, AVRational{1, 1000}, src.fmt->streams[src.vindex]->time_base);
-        av_seek_frame(src.fmt, src.vindex, target, AVSEEK_FLAG_BACKWARD);
+        if (av_seek_frame(src.fmt, src.vindex, target, AVSEEK_FLAG_BACKWARD) < 0) return false;
     }
     return true;
 }
@@ -235,14 +270,18 @@ void Player::push_audio(Source& src, size_t k, void* f) {
     auto* frame = static_cast<AVFrame*>(f); auto& track = src.tracks[k];
     int channels = audio_->format->nChannels, rate = (int)audio_->format->nSamplesPerSec;
     if (track.start < 0) {
+        if (!frame) return;
         std::int64_t pts = frame->best_effort_timestamp == AV_NOPTS_VALUE ? frame->pts : frame->best_effort_timestamp;
         if (pts == AV_NOPTS_VALUE) return;
-        track.start = av_rescale_q(pts, src.fmt->streams[track.index]->time_base, AVRational{1, rate});
+        track.start = av_rescale(src.span.start_ms - src.audio_origin_ms, rate, 1000) +
+            av_rescale_q(pts, src.fmt->streams[track.index]->time_base, AVRational{1, rate});
     }
-    int out_samples = swr_get_out_samples(track.swr, frame->nb_samples); if (out_samples <= 0) return;
+    int out_samples = swr_get_out_samples(track.swr, frame ? frame->nb_samples : 0);
+    if (out_samples < 0) { src.failed = true; return; } if (!out_samples) return;
     size_t old = track.queue.size(); track.queue.resize(old + (size_t)out_samples * channels);
     std::uint8_t* out = reinterpret_cast<std::uint8_t*>(track.queue.data() + old);
-    int got = swr_convert(track.swr, &out, out_samples, (const std::uint8_t**)frame->data, frame->nb_samples);
+    int got = swr_convert(track.swr, &out, out_samples, frame ? (const std::uint8_t**)frame->extended_data : nullptr, frame ? frame->nb_samples : 0);
+    if (got < 0) src.failed = true;
     track.queue.resize(old + (size_t)std::max(0, got) * channels);
     mix_audio(src, false);
 }
@@ -255,7 +294,7 @@ void Player::mix_audio(Source& src, bool flush) {
         std::int64_t first = -1;
         for (auto& t : src.tracks) if (t.start >= 0 && (first < 0 || t.start < first)) first = t.start;
         if (first < 0) return;
-        src.mixed = first; if (audio_->media_start < 0) audio_->media_start = src.span.start_ms + av_rescale(first, 1000, rate);
+        src.mixed = first; if (audio_->media_start < 0) audio_->media_start = src.audio_origin_ms + av_rescale(first, 1000, rate);
     }
     std::int64_t n = flush ? 0 : INT64_MAX;
     for (auto& t : src.tracks) {
@@ -280,6 +319,23 @@ void Player::mix_audio(Source& src, bool flush) {
     if (audio_->is_float) { auto* out = reinterpret_cast<float*>(src.pending.data() + old); for (size_t i = 0; i < src.mixbuf.size(); ++i) out[i] = std::clamp(src.mixbuf[i], -1.f, 1.f); }
     else { auto* out = reinterpret_cast<std::int16_t*>(src.pending.data() + old); for (size_t i = 0; i < src.mixbuf.size(); ++i) out[i] = (std::int16_t)std::lround(std::clamp(src.mixbuf[i], -1.f, 1.f) * 32767.f); }
 }
+bool Player::finish_audio(Source& src) {
+    if (!audio_ || src.audio_finished) return !src.failed;
+    src.audio_finished = true;
+    for (size_t k = 0; k < src.tracks.size(); ++k) {
+        auto& t = src.tracks[k]; if (!t.ctx) continue;
+        int sent = avcodec_send_packet(t.ctx, nullptr);
+        if (sent < 0 && sent != AVERROR_EOF) { src.failed = true; return false; }
+        while (true) {
+            int result = avcodec_receive_frame(t.ctx, src.frame);
+            if (result == AVERROR_EOF || result == AVERROR(EAGAIN)) break;
+            if (result < 0) { src.failed = true; return false; }
+            push_audio(src, k, src.frame); av_frame_unref(src.frame);
+        }
+        push_audio(src, k, nullptr); // Drain the resampler's delayed tail once.
+    }
+    mix_audio(src, true); return !src.failed;
+}
 // Decode until one video frame is produced (returned in out_video) or the
 // file ends. Audio frames are converted and queued along the way.
 bool Player::step(Source& src, Decoded* out_video, bool want_audio) {
@@ -290,12 +346,7 @@ bool Player::step(Source& src, Decoded* out_video, bool want_audio) {
             int r = avcodec_receive_frame(ctx, src.frame);
             if (r < 0) {
                 if (r == AVERROR_EOF && ctx == src.video) src.drained = true;
-                else if (r == AVERROR_EOF) {
-                    // A track ran dry at the segment's end: once all have, flush the mix.
-                    src.tracks[slot - 1].done = true;
-                    if (want_audio && audio_ && std::all_of(src.tracks.begin(), src.tracks.end(), [](auto& t) { return !t.ctx || t.done; })) mix_audio(src, true);
-                }
-                else if (r != AVERROR(EAGAIN) && ctx == src.video) { src.failed = true; return false; }
+                else if (r != AVERROR(EAGAIN) && r != AVERROR_EOF) { src.failed = true; return false; }
                 continue;
             }
             if (ctx == src.video) {
@@ -318,16 +369,38 @@ bool Player::step(Source& src, Decoded* out_video, bool want_audio) {
             }
             if (want_audio && audio_) push_audio(src, slot - 1, src.frame);
             av_frame_unref(src.frame);
+            if (src.failed) return false;
         }
         if (src.drained) return false;
-        if (src.eof) { avcodec_send_packet(src.video, nullptr); for (auto& t : src.tracks) if (t.ctx) avcodec_send_packet(t.ctx, nullptr); src.eof = false; src.drained = false; continue; }
-        int r = av_read_frame(src.fmt, src.packet);
-        if (r < 0) { src.eof = true; continue; }
+        if (src.eof) { avcodec_send_packet(src.video, nullptr); src.eof = false; src.drained = false; continue; }
+        if (!src.packet_pending) {
+            int r = av_read_frame(src.fmt, src.packet);
+            if (r < 0) { if (r != AVERROR_EOF) { src.failed = true; return false; } src.eof = true; continue; }
+            src.packet_pending = true;
+        }
         int sent = 0;
         if (src.packet->stream_index == src.vindex) sent = avcodec_send_packet(src.video, src.packet);
-        else for (auto& t : src.tracks) if (t.ctx && src.packet->stream_index == t.index) { avcodec_send_packet(t.ctx, src.packet); break; }
-        av_packet_unref(src.packet);
-        if (sent < 0 && sent != AVERROR(EAGAIN)) { src.failed = true; return false; }
+        else for (auto& t : src.tracks) if (t.ctx && src.packet->stream_index == t.index) {
+            if (t.first_packet) {
+                size_t size = 0; auto* skip = av_packet_get_side_data(src.packet, AV_PKT_DATA_SKIP_SAMPLES, &size);
+                if (t.continued) {
+                    if (skip && size >= 10) std::memset(skip, 0, 4); // Repeated MKV priming is not a new encoder start.
+                } else if (!skip && src.packet->pts == 0) {
+                    // Seeking resets the demuxer's one-time skip counter. A
+                    // cold decode from the file's beginning still needs it.
+                    auto padding = src.fmt->streams[t.index]->codecpar->initial_padding;
+                    if (padding > 0) {
+                        skip = av_packet_new_side_data(src.packet, AV_PKT_DATA_SKIP_SAMPLES, 10);
+                        if (!skip) { src.failed = true; return false; }
+                        std::memset(skip, 0, 10); AV_WL32(skip, padding);
+                    }
+                }
+            }
+            t.first_packet = false; sent = avcodec_send_packet(t.ctx, src.packet); break;
+        }
+        if (sent == AVERROR(EAGAIN)) continue; // Drain and retry this packet; never drop audio under backpressure.
+        av_packet_unref(src.packet); src.packet_pending = false;
+        if (sent < 0) { src.failed = true; return false; }
     }
 }
 void Player::work() {
@@ -463,10 +536,11 @@ void Player::work() {
             lock.lock(); error_ = "Cannot decode this segment."; playing_ = false; continue;
         } else if (src.pending.empty()) {
             // End of this segment: continue into the next one when contiguous.
-            if ((!end_limit || src.span.end_ms < end_limit) && index + 1 < spans.size() && std::llabs(spans[index + 1].start_ms - src.span.end_ms) <= 1) {
-                ++index; open_ok = open(src, spans[index], 0);
+            if ((!end_limit || src.span.end_ms < end_limit) && index + 1 < spans.size() && spans[index + 1].session == src.span.session && spans[index + 1].start_ms == src.span.end_ms) {
+                ++index; open_ok = open(src, spans[index], 0, true);
                 lock.lock(); if (!open_ok) { error_ = "Cannot decode the next segment."; playing_ = false; } continue;
             }
+            if (!finish_audio(src)) { lock.lock(); error_ = "Cannot decode audio."; playing_ = false; continue; }
             lock.lock(); if (generation_ == gen) drain(end_limit ? std::min(end_limit, src.span.end_ms) : src.span.end_ms); continue;
         }
         if (!progressed) std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -549,6 +623,38 @@ Player::Picture Player::tick() {
     if (!shown_ || !view_) return {};
     return {(ImTextureID)view_, tex_w_, tex_h_, shown_->ms};
 }
+#ifdef FRINKY_CLIP_TESTING
+// Exercise the actual playback decoder, resampler and mixer without a sound
+// device or wall-clock pacing. The generated samples are the WASAPI payload.
+std::vector<float> player_audio_samples_for_test(const std::vector<Span>& spans, int rate, float desktop, float mic, bool seek_again) {
+    Player player; Player::Audio audio; Player::Source src;
+    audio.format = static_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEX)));
+    if (!audio.format) throw std::bad_alloc();
+    *audio.format = {}; audio.format->nChannels = 2; audio.format->nSamplesPerSec = rate;
+    audio.format->nBlockAlign = 2 * sizeof(float); audio.is_float = true;
+    player.audio_ = &audio; player.hw_ok_ = false; player.width_ = 64; player.set_gains(desktop, mic);
+    std::vector<float> samples;
+    auto collect = [&] {
+        auto* begin = reinterpret_cast<const float*>(src.pending.data());
+        if (!src.pending.empty()) samples.insert(samples.end(), begin, begin + src.pending.size() / sizeof(float));
+        src.pending.clear(); src.pending_offset = 0;
+    };
+    for (size_t i = 0; i < spans.size(); ++i) {
+        if (!player.open(src, spans[i], 0, i > 0)) throw std::runtime_error("Cannot open playback fixture");
+        if (!i && seek_again) {
+            Player::Decoded picture;
+            for (int n = 0; n < 70; ++n) if (!player.step(src, &picture, true)) break;
+            if (!player.reposition(src, 0)) throw std::runtime_error("Cannot seek playback fixture");
+            audio.media_start = -1;
+        }
+        Player::Decoded picture;
+        while (player.step(src, &picture, true)) collect();
+        collect(); if (src.failed) throw std::runtime_error("Cannot decode playback fixture");
+    }
+    if (!player.finish_audio(src)) throw std::runtime_error("Cannot drain playback fixture");
+    collect(); player.audio_ = nullptr; return samples;
+}
+#endif
 }
 
 #include "thumbs.hpp"

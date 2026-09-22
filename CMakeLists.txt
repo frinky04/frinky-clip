@@ -79,6 +79,11 @@ enable_testing()
 add_executable(clip-tests tests/core_tests.cpp src/waveform.cpp)
 target_link_libraries(clip-tests PRIVATE clip_core)
 add_test(NAME clip-core COMMAND clip-tests)
+add_executable(audio-export-tests tests/audio_export_tests.cpp src/player.cpp src/thumbs.cpp)
+target_include_directories(audio-export-tests PRIVATE "${DEPS}/imgui")
+target_compile_definitions(audio-export-tests PRIVATE FRINKY_CLIP_TESTING)
+target_link_libraries(audio-export-tests PRIVATE clip_core d3d11 dxgi d3dcompiler)
+add_test(NAME audio-export-continuity COMMAND audio-export-tests)
 # Opt-in real editor benchmark. Its test-only App never owns a recorder or tray.
 add_executable(editor-bench EXCLUDE_FROM_ALL WIN32 tests/editor_bench.cpp src/ui.cpp src/updates.cpp src/player.cpp src/thumbs.cpp src/waveform.cpp "${CMAKE_BINARY_DIR}/version.rc"
   "${DEPS}/imgui/imgui.cpp" "${DEPS}/imgui/imgui_draw.cpp" "${DEPS}/imgui/imgui_tables.cpp" "${DEPS}/imgui/imgui_widgets.cpp"
@@ -102,7 +107,7 @@ function(add_runtime_stage target destination)
   add_custom_target(${target} ${ARGN}
     COMMAND ${CMAKE_COMMAND} "-DOBS_ROOT=${OBS_ROOT}" "-DDEST=${destination}" "-DDLLS=${OBS_RUNTIME_DLLS}" "-DEXES=${OBS_RUNTIME_EXES}"
       "-DPLUGINS=${OBS_PLUGINS}" "-DCRT=${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}" -P "${CMAKE_SOURCE_DIR}/cmake/stage.cmake"
-    DEPENDS frinky-clip clip-tests COMMENT "Staging runtime files")
+    DEPENDS frinky-clip clip-tests audio-export-tests COMMENT "Staging runtime files")
 endfunction()
 add_runtime_stage(stage "$<TARGET_FILE_DIR:frinky-clip>" ALL)
 # Packaging uses the same runtime inventory in a fresh directory, retaining the
